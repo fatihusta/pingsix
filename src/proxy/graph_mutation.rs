@@ -1372,7 +1372,7 @@ mod pure_graph_tests {
 
         // IDs come from the storage key, never the JSON body.
         assert_eq!(set.upstreams.get("u1").unwrap().id, "u1");
-        assert_eq!(set.upstreams["u1"].nodes.get("127.0.0.1:80"), Some(&1));
+        assert!(set.upstreams["u1"].nodes.contains_addr("127.0.0.1:80"));
         assert!(set.routes.contains_key("r1"));
         assert!(set.services.contains_key("s1"));
         assert!(set.global_rules.contains_key("g1"));
@@ -2546,7 +2546,7 @@ mod worker_tests {
         assert!(snap.upstreams["u1"]
             .inner
             .nodes
-            .contains_key("127.0.0.1:81"));
+            .contains_addr("127.0.0.1:81"));
         assert_eq!(snap.routes["r1"].inner.uri.as_deref(), Some("/v2"));
         graph.shutdown().await;
     }

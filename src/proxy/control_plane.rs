@@ -518,7 +518,7 @@ fn prepare_static_plugin_upstreams(
 mod tests {
     use super::*;
     use crate::config::{
-        SelectionType, Upstream, UpstreamHashOn, UpstreamPassHost, UpstreamScheme,
+        Nodes, SelectionType, Upstream, UpstreamHashOn, UpstreamPassHost, UpstreamScheme,
     };
     use std::collections::HashMap as StdHashMap;
 
@@ -531,7 +531,7 @@ mod tests {
             retries: None,
             retry_timeout: None,
             timeout: None,
-            nodes,
+            nodes: Nodes::from_map(nodes),
             r#type: SelectionType::RoundRobin,
             checks: None,
             hash_on: UpstreamHashOn::VARS,
@@ -830,8 +830,6 @@ mod tests {
     // ---------------------------------------------------------------------
 
     fn route_with_inline(id: &str, uri: &str, node: &str) -> crate::config::Route {
-        let mut nodes = StdHashMap::new();
-        nodes.insert(node.to_string(), 1);
         crate::config::Route {
             id: id.into(),
             name: None,
