@@ -18,6 +18,7 @@ use pingora_load_balancing::{
 };
 use regex::Regex;
 
+use crate::proxy::upstream::selection::{insert_backend, set_backend_priority};
 use crate::{
     config::{self, Upstream, UpstreamPassHost, UpstreamScheme, UpstreamTls},
     core::{ProxyError, ProxyResult},
@@ -108,6 +109,7 @@ pub struct DnsDiscovery {
     port: u16,
     scheme: UpstreamScheme,
     weight: u32,
+    priority: i8,
     client_cert_key: Option<Arc<CertKey>>,
     /// TLS SNI, computed with the same pass-host rule as literal-IP backends.
     sni: String,
@@ -120,6 +122,7 @@ impl DnsDiscovery {
         port: u16,
         scheme: UpstreamScheme,
         weight: u32,
+        priority: i8,
         resolver: Arc<TokioResolver>,
         client_cert_key: Option<Arc<CertKey>>,
         sni: String,
@@ -130,6 +133,7 @@ impl DnsDiscovery {
             port,
             scheme,
             weight,
+            priority,
             client_cert_key,
             sni,
         }
@@ -183,6 +187,9 @@ impl ServiceDiscovery for DnsDiscovery {
                 ));
             }
 
+            set_backend_priority(&mut backend, self.priority);
+            // Every backend here carries `self.priority`, so plain set semantics
+            // are enough; cross-node collisions are resolved by the caller.
             backends.insert(backend);
         }
 
@@ -313,7 +320,9 @@ impl ServiceDiscovery for HybridDiscovery {
         for result in results.into_iter() {
             match result {
                 Ok((part_backends, part_health_checks)) => {
-                    backends.extend(part_backends);
+                    for backend in part_backends {
+                        insert_backend(&mut backends, backend);
+                    }
                     health_checks.extend(part_health_checks);
                 }
                 Err(e) => {
@@ -356,21 +365,23 @@ impl TryFrom<Upstream> for HybridDiscovery {
         // once so both the IP peer and DnsDiscovery see the same values.
         let pass_host = upstream.pass_host.clone();
         let upstream_host = upstream.upstream_host.clone();
-        for (addr, weight) in upstream.nodes.iter() {
-            let (host, port) = parse_host_and_port(addr)?;
-            let port = port.unwrap_or(match upstream.scheme {
-                UpstreamScheme::HTTPS | UpstreamScheme::GRPCS => 443,
-                _ => 80,
-            });
-
-            // Strip brackets from IPv6 for parsing, then add them back for SocketAddr
-            let host_for_parse = if host.starts_with('[') && host.ends_with(']') {
-                &host[1..host.len() - 1]
+        for node in upstream.nodes.iter() {
+            // Weight 0 means the node is configured but disabled for selection.
+            if !node.is_enabled() {
+                continue;
+            }
+            let port = if node.port == 0 {
+                match upstream.scheme {
+                    UpstreamScheme::HTTPS | UpstreamScheme::GRPCS => 443,
+                    _ => 80,
+                }
             } else {
-                host.as_str()
+                node.port
             };
+            let weight = node.weight;
+            let host = node.bare_host();
 
-            if let Ok(ip_addr) = host_for_parse.parse::<IpAddr>() {
+            if let Ok(ip_addr) = host.parse::<IpAddr>() {
                 // It's an IP address
                 // Handle backend creation for IP addresses - add brackets for IPv6
                 let addr_str = if ip_addr.is_ipv6() {
@@ -379,13 +390,13 @@ impl TryFrom<Upstream> for HybridDiscovery {
                     format!("{ip_addr}:{port}")
                 };
                 let mut backend =
-                    Backend::new_with_weight(&addr_str, *weight as _).map_err(|e| {
+                    Backend::new_with_weight(&addr_str, weight as usize).map_err(|e| {
                         ProxyError::Configuration(format!(
                             "Failed to create backend for {addr_str}: {e}"
                         ))
                     })?;
 
-                let sni = compute_peer_sni(&host, &pass_host, upstream_host.as_deref());
+                let sni = compute_peer_sni(host, &pass_host, upstream_host.as_deref());
                 let peer = build_peer(&addr_str, upstream.scheme, sni, client_cert_key.as_ref());
 
                 // A metadata collision is an invariant violation: reject the
@@ -397,17 +408,19 @@ impl TryFrom<Upstream> for HybridDiscovery {
                     )));
                 }
 
-                backends.insert(backend);
+                set_backend_priority(&mut backend, node.priority);
+                insert_backend(&mut backends, backend);
             } else {
                 // It's a domain name
                 // Handle DNS discovery for domain names
                 let resolver = get_global_resolver()?;
-                let sni = compute_peer_sni(&host, &pass_host, upstream_host.as_deref());
+                let sni = compute_peer_sni(host, &pass_host, upstream_host.as_deref());
                 let discovery = DnsDiscovery::new(
-                    host,
+                    host.to_string(),
                     port,
                     upstream.scheme,
-                    *weight,
+                    weight,
+                    node.priority,
                     resolver,
                     client_cert_key.clone(),
                     sni,
@@ -697,7 +710,7 @@ mod tests {
         // The full TryFrom path must surface a configuration error (not a
         // panic) when the mTLS material is invalid.
         use crate::config::{
-            SelectionType, Upstream, UpstreamHashOn, UpstreamPassHost, UpstreamScheme,
+            Nodes, SelectionType, Upstream, UpstreamHashOn, UpstreamPassHost, UpstreamScheme,
         };
         let upstream = Upstream {
             id: "u1".into(),
@@ -705,7 +718,7 @@ mod tests {
             retries: None,
             retry_timeout: None,
             timeout: None,
-            nodes: [("127.0.0.1:80".to_string(), 1)].into_iter().collect(),
+            nodes: Nodes::from_map([("127.0.0.1:80".to_string(), 1)].into_iter().collect()),
             r#type: SelectionType::RoundRobin,
             checks: None,
             hash_on: UpstreamHashOn::VARS,
