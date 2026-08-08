@@ -99,42 +99,39 @@ pub(crate) fn validate_client_tls_material(tls_config: &UpstreamTls) -> ProxyRes
     load_client_cert_key(tls_config).map(|_| ())
 }
 
-/// DNS-based service discovery.
+/// One DNS-backed upstream node: address, load-balancing metadata, and TLS SNI.
 ///
-/// Resolves DNS names to IP addresses and creates backends for each resolved IP.
-pub struct DnsDiscovery {
-    resolver: Arc<TokioResolver>,
+/// Separated from shared discovery infrastructure (`resolver`, client cert) so
+/// [`DnsDiscovery::new`] stays under Clippy's argument limit.
+struct DnsNode {
     domain: String,
     port: u16,
     scheme: UpstreamScheme,
     weight: u32,
     priority: i8,
-    client_cert_key: Option<Arc<CertKey>>,
     /// TLS SNI, computed with the same pass-host rule as literal-IP backends.
     sni: String,
 }
 
+/// DNS-based service discovery.
+///
+/// Resolves DNS names to IP addresses and creates backends for each resolved IP.
+pub struct DnsDiscovery {
+    resolver: Arc<TokioResolver>,
+    node: DnsNode,
+    client_cert_key: Option<Arc<CertKey>>,
+}
+
 impl DnsDiscovery {
-    /// Creates a new `DnsDiscovery` instance.
-    pub fn new(
-        domain: String,
-        port: u16,
-        scheme: UpstreamScheme,
-        weight: u32,
-        priority: i8,
+    fn new(
+        node: DnsNode,
         resolver: Arc<TokioResolver>,
         client_cert_key: Option<Arc<CertKey>>,
-        sni: String,
     ) -> Self {
         Self {
             resolver,
-            domain,
-            port,
-            scheme,
-            weight,
-            priority,
+            node,
             client_cert_key,
-            sni,
         }
     }
 }
@@ -143,7 +140,7 @@ impl DnsDiscovery {
 impl ServiceDiscovery for DnsDiscovery {
     /// Discovers backends by resolving DNS names to IP addresses.
     async fn discover(&self) -> Result<(BTreeSet<Backend>, HashMap<u64, bool>)> {
-        let domain = self.domain.as_str();
+        let domain = self.node.domain.as_str();
         log::debug!("Resolving DNS for domain: {domain}");
 
         let ips = self.resolver.lookup_ip(domain).await.map_err(|e| {
@@ -157,10 +154,10 @@ impl ServiceDiscovery for DnsDiscovery {
 
         let mut backends = BTreeSet::new();
         for ip in ips.iter() {
-            let addr = SocketAddr::new(ip, self.port).to_string();
+            let addr = SocketAddr::new(ip, self.node.port).to_string();
 
             // Creating backend
-            let mut backend = match Backend::new_with_weight(&addr, self.weight as _) {
+            let mut backend = match Backend::new_with_weight(&addr, self.node.weight as _) {
                 Ok(b) => b,
                 Err(e) => {
                     log::error!("Failed to create backend for {addr}: {e}");
@@ -170,8 +167,8 @@ impl ServiceDiscovery for DnsDiscovery {
 
             let peer = build_peer(
                 &addr,
-                self.scheme,
-                self.sni.clone(),
+                self.node.scheme,
+                self.node.sni.clone(),
                 self.client_cert_key.as_ref(),
             );
 
@@ -186,9 +183,10 @@ impl ServiceDiscovery for DnsDiscovery {
                 ));
             }
 
-            set_backend_priority(&mut backend, self.priority);
-            // Every backend here carries `self.priority`, so plain set semantics
-            // are enough; cross-node collisions are resolved by the caller.
+            set_backend_priority(&mut backend, self.node.priority);
+            // Every backend here carries `self.node.priority`, so plain set
+            // semantics are enough; cross-node collisions are resolved by the
+            // caller.
             backends.insert(backend);
         }
 
@@ -408,14 +406,16 @@ impl TryFrom<Upstream> for HybridDiscovery {
                 let resolver = get_global_resolver()?;
                 let sni = compute_peer_sni(host, &pass_host, upstream_host.as_deref());
                 let discovery = DnsDiscovery::new(
-                    host.to_string(),
-                    port,
-                    upstream.scheme,
-                    weight,
-                    node.priority,
+                    DnsNode {
+                        domain: host.to_string(),
+                        port,
+                        scheme: upstream.scheme,
+                        weight,
+                        priority: node.priority,
+                        sni,
+                    },
                     resolver,
                     client_cert_key.clone(),
-                    sni,
                 );
                 this.discoveries.push(Box::new(discovery));
             }
