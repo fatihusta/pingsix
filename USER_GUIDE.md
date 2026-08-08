@@ -1149,13 +1149,13 @@ upstreams:
 **Priority selection (with health checks):**
 1. Group enabled nodes (`weight > 0`) by `priority`.
 2. Prefer the highest priority group that still has at least one ready (healthy) backend.
-3. Inside that group, use the upstream `type` algorithm (roundrobin, random, fnv, ketama) and weights.
+3. Inside that group, use the upstream `type` algorithm (roundrobin, random, fnv, ketama) and weights. Each group is balanced independently, so weights and `fnv`/`ketama` key mappings among the primary nodes do not change when you add, remove, or fail over a lower-priority group.
 4. If a higher group becomes healthy again, the next request uses it.
-5. If no group has a ready backend, selection falls back to the configured algorithm across all enabled nodes (health ignored). Without health checks, all nodes are treated as ready, so traffic stays on the highest priority.
+5. If no group has a ready backend, selection retries in the same priority order while ignoring health. Without health checks, all nodes are treated as ready, so traffic stays on the highest priority.
 
 **Constraints:**
-- Each enabled node must have a unique `host`+`port` (Pingora backends are keyed by address; duplicate addresses cannot carry different priorities).
-- DNS-resolved IPs inherit the parent node's priority.
+- Each enabled node must resolve to a unique address, because Pingora backends are keyed by address and duplicates cannot carry different priorities. The comparison uses the *effective* port, so over `scheme: http` a node without `port` collides with an explicit `port: 80`.
+- DNS-resolved IPs inherit the parent node's priority, and DNS refreshes rebuild the priority groups.
 
 
 
@@ -2119,7 +2119,7 @@ curl -X PUT http://127.0.0.1:9181/apisix/admin/upstreams/2 \
   }'
 ```
 
-Selection uses the highest priority group that still has a ready backend (see [Basic Upstream Configuration](#basic-upstream-configuration)). Enable `checks` so lower-priority nodes are used only after higher ones fail health checks. Do not reuse the same `host`+`port` with different priorities.
+Selection uses the highest priority group that still has a ready backend, balancing each group independently (see [Basic Upstream Configuration](#basic-upstream-configuration)). Enable `checks` so lower-priority nodes are used only after higher ones fail health checks. Two enabled nodes must not resolve to the same address; the check compares effective ports, so omitting `port` over `http` conflicts with an explicit `80`.
 
 **List All Upstreams**:
 ```bash

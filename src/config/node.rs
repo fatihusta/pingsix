@@ -1,7 +1,7 @@
 //! Upstream node configuration: address parsing, validation and wire forms.
 
 use std::{
-    collections::{HashMap, HashSet},
+    collections::HashMap,
     fmt,
     net::{Ipv4Addr, Ipv6Addr},
     str::FromStr,
@@ -11,6 +11,8 @@ use once_cell::sync::Lazy;
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 use validator::{Validate, ValidationError, ValidationErrors};
+
+use super::UpstreamScheme;
 
 /// `host` / `host:port` / `[ipv6]:port`.
 static HOST_PORT_REGEX: Lazy<Regex> = Lazy::new(|| {
@@ -142,6 +144,26 @@ impl Node {
         self.to_string()
     }
 
+    /// Port actually dialed: the configured one, or the scheme default when the
+    /// node omits it. Must stay in sync with backend construction in discovery.
+    pub fn effective_port(&self, scheme: &UpstreamScheme) -> u16 {
+        if self.port != 0 {
+            return self.port;
+        }
+        match scheme {
+            UpstreamScheme::HTTPS | UpstreamScheme::GRPCS => 443,
+            UpstreamScheme::HTTP | UpstreamScheme::GRPC => 80,
+        }
+    }
+
+    /// Address key after applying the scheme default port, so `example.com` and
+    /// `example.com:80` over HTTP compare equal.
+    pub fn effective_addr_key(&self, scheme: &UpstreamScheme) -> String {
+        let mut key = String::new();
+        let _ = write_addr(&mut key, self.bare_host(), self.effective_port(scheme));
+        key
+    }
+
     /// Match a wire address (`host`, `host:port`, `[ipv6]:port`) without building
     /// an owned `addr_key` for this node.
     pub fn matches_addr(&self, addr: &str) -> bool {
@@ -152,14 +174,18 @@ impl Node {
     }
 }
 
+/// IPv6 hosts are re-bracketed so the result parses back as `host:port`.
+fn write_addr(out: &mut impl fmt::Write, host: &str, port: u16) -> fmt::Result {
+    if host.contains(':') {
+        write!(out, "[{host}]:{port}")
+    } else {
+        write!(out, "{host}:{port}")
+    }
+}
+
 impl fmt::Display for Node {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let host = self.bare_host();
-        if host.contains(':') {
-            write!(f, "[{host}]:{}", self.port)
-        } else {
-            write!(f, "{host}:{}", self.port)
-        }
+        write_addr(f, self.bare_host(), self.port)
     }
 }
 
@@ -255,18 +281,15 @@ impl Validate for Nodes {
             errors.add("nodes", ValidationError::new("nodes_all_disabled"));
         }
 
-        // Pingora backend identity is `addr` + `weight`, so two enabled nodes on
-        // the same address cannot be represented separately at runtime.
-        let mut seen = HashSet::new();
-        for node in self.iter().filter(|n| n.is_enabled()) {
-            if !seen.insert(node.addr_key()) {
-                errors.add("nodes", ValidationError::new("nodes_duplicate_address"));
-                break;
+        // Report per-node failures as errors of this field rather than nesting
+        // them: `ValidationErrors` panics when the same field is filled twice,
+        // which two invalid nodes (or one plus a field error above) would do.
+        for (index, node) in self.0.iter().enumerate() {
+            if let Err(mut err) = validate_node_host(&node.host) {
+                err.add_param("index".into(), &index);
+                err.add_param("host".into(), &node.host);
+                errors.add("nodes", err);
             }
-        }
-
-        for node in self.as_slice() {
-            errors.merge_self("nodes", node.validate());
         }
 
         if errors.is_empty() {
@@ -492,6 +515,56 @@ mod tests {
     }
 
     #[test]
+    fn nodes_validate_reports_every_invalid_node_without_panicking() {
+        let nodes = Nodes(vec![
+            node("not a host", 80, 1, 0),
+            node("also bad", 80, 1, 0),
+            node("example.com", 80, 1, 0),
+            node("999.999.999.999", 80, 1, 0),
+        ]);
+
+        let err = nodes
+            .validate()
+            .expect_err("invalid hosts must be rejected");
+        let field_errors = err.field_errors();
+        let reported = field_errors
+            .get("nodes")
+            .expect("errors must be attached to the nodes field");
+        assert_eq!(
+            reported.len(),
+            3,
+            "every invalid node must be reported: {reported:?}"
+        );
+    }
+
+    #[test]
+    fn nodes_validate_combines_field_error_with_invalid_node() {
+        // `nodes_all_disabled` plus a per-node error previously filled the same
+        // field twice, which panics inside `ValidationErrors`.
+        let nodes = Nodes(vec![node("not a host", 80, 0, 0)]);
+        assert!(nodes.validate().is_err());
+    }
+
+    #[test]
+    fn effective_port_applies_scheme_default_only_when_omitted() {
+        let omitted = node("example.com", 0, 1, 0);
+        assert_eq!(omitted.effective_port(&UpstreamScheme::HTTP), 80);
+        assert_eq!(omitted.effective_port(&UpstreamScheme::GRPC), 80);
+        assert_eq!(omitted.effective_port(&UpstreamScheme::HTTPS), 443);
+        assert_eq!(omitted.effective_port(&UpstreamScheme::GRPCS), 443);
+
+        let explicit = node("example.com", 8080, 1, 0);
+        assert_eq!(explicit.effective_port(&UpstreamScheme::HTTPS), 8080);
+
+        let v6 = node("::1", 0, 1, 0);
+        assert_eq!(
+            v6.effective_addr_key(&UpstreamScheme::HTTPS),
+            "[::1]:443",
+            "effective key must stay parseable for IPv6"
+        );
+    }
+
+    #[test]
     fn node_priority_is_i8() {
         let ok: Node = serde_json::from_value(serde_json::json!({
             "host": "127.0.0.1",
@@ -521,16 +594,6 @@ mod tests {
             "priority": -129
         }))
         .is_err());
-    }
-
-    #[test]
-    fn nodes_reject_duplicate_enabled_addresses() {
-        let dup = Nodes(vec![
-            node("127.0.0.1", 443, 1, -1),
-            node("127.0.0.1", 443, 1, 10),
-        ]);
-        let err = dup.validate().expect_err("duplicate host:port must fail");
-        assert!(err.to_string().contains("nodes_duplicate_address"));
     }
 
     #[test]

@@ -16,7 +16,6 @@ use pingora_load_balancing::{
     discovery::{ServiceDiscovery, Static},
     Backend,
 };
-use regex::Regex;
 
 use crate::proxy::upstream::selection::{insert_backend, set_backend_priority};
 use crate::{
@@ -370,14 +369,7 @@ impl TryFrom<Upstream> for HybridDiscovery {
             if !node.is_enabled() {
                 continue;
             }
-            let port = if node.port == 0 {
-                match upstream.scheme {
-                    UpstreamScheme::HTTPS | UpstreamScheme::GRPCS => 443,
-                    _ => 80,
-                }
-            } else {
-                node.port
-            };
+            let port = node.effective_port(&upstream.scheme);
             let weight = node.weight;
             let host = node.bare_host();
 
@@ -437,44 +429,6 @@ impl TryFrom<Upstream> for HybridDiscovery {
     }
 }
 
-/// Regular expression for parsing host and port from an address string.
-static HOST_PORT_REGEX: once_cell::sync::Lazy<Regex> = once_cell::sync::Lazy::new(|| {
-    Regex::new(r"^(?:\[(.+?)\]|([^:]+))(?::(\d+))?$").expect("Invalid HOST_PORT_REGEX pattern")
-});
-
-/// Parses a host and port from a string.
-///
-/// Supports IPv4, IPv6, and domain names, with optional port.
-/// Returns IPv6 addresses without square brackets; callers add them back when
-/// constructing `SocketAddr` strings. Ports are validated as `u16` so a value
-/// outside the socket range is rejected instead of silently wrapping.
-fn parse_host_and_port(addr: &str) -> ProxyResult<(String, Option<u16>)> {
-    let caps = HOST_PORT_REGEX
-        .captures(addr)
-        .ok_or_else(|| ProxyError::Configuration("Invalid address format".to_string()))?;
-
-    let host = caps
-        .get(1)
-        .or(caps.get(2))
-        .ok_or_else(|| {
-            ProxyError::Configuration("Failed to extract host from address".to_string())
-        })?
-        .as_str();
-
-    let port = if let Some(port_str) = caps.get(3).map(|p| p.as_str()) {
-        Some(
-            port_str
-                .parse::<u16>()
-                .map_err(|_| ProxyError::Configuration("Invalid port number".to_string()))?,
-        )
-    } else {
-        None
-    };
-
-    // Return host as-is without brackets - brackets will be added later when constructing SocketAddr
-    Ok((host.to_string(), port))
-}
-
 /// Compute the TLS SNI for a peer from the node host and pass-host policy.
 ///
 /// Shared by DNS and literal-IP backend construction so both paths apply the
@@ -515,7 +469,6 @@ fn build_peer(
 
 #[cfg(test)]
 mod tests {
-    use super::parse_host_and_port;
     use super::*;
 
     /// Stub `ServiceDiscovery` that returns a fixed set of backends or an error.
@@ -600,44 +553,6 @@ mod tests {
             .await
             .expect("expected Ok when all discoveries succeed");
         assert_eq!(backends.len(), 2);
-    }
-
-    #[test]
-    fn test_parse_upstream_node() {
-        let test_cases = [
-            ("127.0.0.1", ("127.0.0.1".to_string(), None)),
-            // IPv6 addresses are now returned without brackets (brackets added later for SocketAddr)
-            ("[::1]", ("::1".to_string(), None)),
-            ("example.com", ("example.com".to_string(), None)),
-            ("example.com:80", ("example.com".to_string(), Some(80))),
-            ("192.168.1.1:8080", ("192.168.1.1".to_string(), Some(8080))),
-            ("[::1]:80", ("::1".to_string(), Some(80))),
-            (
-                "[2001:db8:85a3::8a2e:370:7334]:8080",
-                ("2001:db8:85a3::8a2e:370:7334".to_string(), Some(8080)),
-            ),
-            // Maximum valid socket port parses; one past it must be rejected
-            // instead of wrapping around to zero.
-            ("127.0.0.1:65535", ("127.0.0.1".to_string(), Some(65535))),
-        ];
-
-        for (input, expected) in test_cases {
-            let result = parse_host_and_port(input).unwrap();
-            assert_eq!(result, expected, "Failed for input: {input}");
-        }
-
-        // Test invalid cases
-        assert!(parse_host_and_port("").is_err());
-        assert!(parse_host_and_port("invalid:port").is_err());
-        assert!(parse_host_and_port("127.0.0.1:invalid").is_err());
-        assert!(
-            parse_host_and_port("127.0.0.1:65536").is_err(),
-            "port above u16::MAX must be rejected, not wrapped"
-        );
-        assert!(
-            parse_host_and_port("[::1]:65536").is_err(),
-            "IPv6 port above u16::MAX must be rejected, not wrapped"
-        );
     }
 
     #[test]
