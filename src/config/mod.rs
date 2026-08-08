@@ -733,7 +733,7 @@ impl Route {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, Validate, EncryptFields)]
-#[validate(schema(function = "Upstream::validate_upstream_host"))]
+#[validate(schema(function = "Upstream::validate_scheme_dependent_fields"))]
 pub struct Upstream {
     #[serde(default)]
     pub id: String,
@@ -768,15 +768,32 @@ impl Upstream {
         "uri".to_string()
     }
 
-    fn validate_upstream_host(&self) -> Result<(), ValidationError> {
-        if self.pass_host == UpstreamPassHost::REWRITE {
-            self.upstream_host.as_ref().map_or_else(
-                || Err(ValidationError::new("upstream_host_required_for_rewrite")),
-                |_| Ok(()),
-            )
-        } else {
-            Ok(())
+    /// Checks that need fields validated together, including the scheme, which
+    /// decides the default port of nodes that omit one.
+    fn validate_scheme_dependent_fields(&self) -> Result<(), ValidationError> {
+        if self.pass_host == UpstreamPassHost::REWRITE && self.upstream_host.is_none() {
+            return Err(ValidationError::new("upstream_host_required_for_rewrite"));
         }
+
+        self.validate_unique_node_addresses()
+    }
+
+    /// Pingora backend identity is `addr` + `weight`, so two enabled nodes that
+    /// dial the same address cannot be represented separately at runtime. The
+    /// scheme default port makes `example.com` and `example.com:80` collide over
+    /// HTTP, so compare effective addresses rather than the configured ones.
+    fn validate_unique_node_addresses(&self) -> Result<(), ValidationError> {
+        let mut seen = HashSet::with_capacity(self.nodes.len());
+        for node in self.nodes.iter().filter(|node| node.is_enabled()) {
+            let addr = node.effective_addr_key(&self.scheme);
+            if !seen.insert(addr) {
+                let mut err = ValidationError::new("nodes_duplicate_address");
+                err.add_param("address".into(), &node.effective_addr_key(&self.scheme));
+                return Err(err);
+            }
+        }
+
+        Ok(())
     }
 }
 
@@ -2181,6 +2198,73 @@ nodes:
         assert!(
             serde_yml::from_str::<Upstream>(mixed_yaml).is_err(),
             "mixed map/list under nodes must not parse"
+        );
+    }
+
+    fn upstream_with_nodes(nodes: &str, scheme: &str) -> Upstream {
+        let yaml = format!("id: u1\nscheme: {scheme}\nnodes:\n{nodes}");
+        serde_yml::from_str(&yaml).expect("valid upstream yaml")
+    }
+
+    #[test]
+    fn upstream_rejects_duplicate_node_addresses() {
+        let dup = upstream_with_nodes(
+            "  - host: 127.0.0.1\n    port: 443\n    priority: -1\n  \
+             - host: 127.0.0.1\n    port: 443\n    priority: 10\n",
+            "https",
+        );
+        let err = dup.validate().expect_err("duplicate host:port must fail");
+        assert!(
+            err.to_string().contains("nodes_duplicate_address"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn upstream_rejects_omitted_port_colliding_with_scheme_default() {
+        // Over HTTP the portless node dials :80, so these are one endpoint and
+        // Pingora would collapse them into a single backend.
+        let http = upstream_with_nodes(
+            "  - host: example.com\n  - host: example.com\n    port: 80\n",
+            "http",
+        );
+        let err = http
+            .validate()
+            .expect_err("omitted port must collide with explicit :80 over http");
+        assert!(
+            err.to_string().contains("nodes_duplicate_address"),
+            "unexpected error: {err}"
+        );
+
+        // Over HTTPS the same pair dials :443 and :80, so they are distinct.
+        let https = upstream_with_nodes(
+            "  - host: example.com\n  - host: example.com\n    port: 80\n",
+            "https",
+        );
+        assert!(
+            https.validate().is_ok(),
+            "explicit :80 must not collide with the https default :443"
+        );
+
+        let grpcs = upstream_with_nodes(
+            "  - host: example.com\n  - host: example.com\n    port: 443\n",
+            "grpcs",
+        );
+        assert!(
+            grpcs.validate().is_err(),
+            "omitted port must collide with explicit :443 over grpcs"
+        );
+    }
+
+    #[test]
+    fn upstream_duplicate_check_ignores_disabled_nodes() {
+        let with_disabled = upstream_with_nodes(
+            "  - host: example.com\n    port: 80\n  - host: example.com\n    port: 80\n    weight: 0\n",
+            "http",
+        );
+        assert!(
+            with_disabled.validate().is_ok(),
+            "a weight 0 node never becomes a backend, so it cannot collide"
         );
     }
 }

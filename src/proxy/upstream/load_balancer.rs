@@ -251,10 +251,13 @@ impl SelectionLB {
     }
 }
 
-struct LB<BS: BackendSelection> {
-    upstreams: Arc<LoadBalancer<BS>>,
-    /// Distinct node priority levels, precomputed once at build time.
-    priority_levels: selection::PriorityLevels,
+/// `BS` is the configured algorithm; it is applied per priority group by
+/// [`selection::PriorityGrouped`].
+struct LB<BS: BackendSelection>
+where
+    BS::Iter: BackendIter,
+{
+    upstreams: Arc<LoadBalancer<selection::PriorityGrouped<BS>>>,
 }
 
 impl<BS> LB<BS>
@@ -264,19 +267,15 @@ where
 {
     /// Select a backend honouring node priority, then health.
     fn select(&self, key: &[u8]) -> Option<Backend> {
-        selection::select_backend(
-            &self.upstreams,
-            &self.priority_levels,
-            key,
-            MAX_LB_ITERATIONS,
-        )
+        selection::select_backend(&self.upstreams, key, MAX_LB_ITERATIONS)
     }
 
     fn from_prepared(upstream: config::Upstream, prepared: PreparedUpstream) -> ProxyResult<Self> {
-        let priority_levels = selection::PriorityLevels::from_backends(&prepared.backends);
         let refresh: HybridDiscovery = upstream.clone().try_into()?;
         let discovery = SeededDiscovery::new(prepared, refresh);
-        let mut upstreams = LoadBalancer::<BS>::from_backends(Backends::new(Box::new(discovery)));
+        let mut upstreams = LoadBalancer::<selection::PriorityGrouped<BS>>::from_backends(
+            Backends::new(Box::new(discovery)),
+        );
 
         if let Some(check) = upstream.checks {
             let health_check: Box<dyn HealthCheckTrait + Send + Sync + 'static> =
@@ -323,10 +322,7 @@ where
             ))
         })?;
 
-        Ok(Self {
-            upstreams,
-            priority_levels,
-        })
+        Ok(Self { upstreams })
     }
 }
 
@@ -724,28 +720,34 @@ mod tests {
         socket.listen(1024)
     }
 
-    async fn wait_for_selection(upstream: &ProxyUpstream, expect_some: bool, timeout: Duration) {
+    fn any_backend_ready(upstream: &ProxyUpstream) -> bool {
+        with_lb!(&upstream.lb, |lb| {
+            lb.upstreams
+                .backends()
+                .get_backend()
+                .iter()
+                .any(|b| lb.upstreams.backends().ready(b))
+        })
+    }
+
+    async fn wait_for_ready(upstream: &ProxyUpstream, expect_ready: bool, timeout: Duration) {
         let deadline = tokio::time::Instant::now() + timeout;
         loop {
-            let selected = upstream.select_backend_for_test().is_some();
-            if selected == expect_some {
+            if any_backend_ready(upstream) == expect_ready {
                 return;
             }
             assert!(
                 tokio::time::Instant::now() < deadline,
-                "selection did not become {} within {timeout:?}",
-                if expect_some {
-                    "available"
-                } else {
-                    "unavailable"
-                }
+                "backend readiness did not become {expect_ready} within {timeout:?}"
             );
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
     }
 
-    /// Real Pingora health probes against a live local backend: selection must
+    /// Real Pingora health probes against a live local backend: readiness must
     /// follow healthy → unhealthy (backend stopped) → healthy (backend back).
+    /// Selection itself still returns a backend when nothing is ready, via the
+    /// APISIX-compatible all-unready fallback.
     #[tokio::test]
     async fn active_health_check_failure_and_recovery() {
         let _ = env_logger::builder().is_test(true).try_init();
@@ -761,17 +763,24 @@ mod tests {
             service.start(shutdown_rx).await;
         });
 
-        // Backend up → probe succeeds → selectable.
-        wait_for_selection(&upstream, true, Duration::from_secs(10)).await;
+        // Backend up → probe succeeds → ready and selectable.
+        wait_for_ready(&upstream, true, Duration::from_secs(10)).await;
+        assert!(upstream.select_backend_for_test().is_some());
 
-        // Backend down → consecutive probe failure → no longer selectable.
+        // Backend down → consecutive probe failure → not ready, but the
+        // all-unready fallback still yields an enabled backend.
         backend.abort();
-        wait_for_selection(&upstream, false, Duration::from_secs(15)).await;
+        wait_for_ready(&upstream, false, Duration::from_secs(15)).await;
+        assert!(
+            upstream.select_backend_for_test().is_some(),
+            "all-unready fallback must still select an enabled backend"
+        );
 
-        // Backend restored on the same port → probe recovers → selectable again.
+        // Backend restored on the same port → probe recovers → ready again.
         let listener2 = bind_reusable(addr).expect("same port must be reusable");
         backend = tokio::spawn(serve_http(listener2));
-        wait_for_selection(&upstream, true, Duration::from_secs(15)).await;
+        wait_for_ready(&upstream, true, Duration::from_secs(15)).await;
+        assert!(upstream.select_backend_for_test().is_some());
 
         health_task.abort();
         backend.abort();
