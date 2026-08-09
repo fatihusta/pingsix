@@ -231,16 +231,14 @@ pub fn named_upstream_ids(cfg: &JsonValue) -> ProxyResult<Vec<String>> {
 /// Collect the inline upstream declarations embedded in a `traffic-split`
 /// plugin config as typed occurrences plus the raw upstream configs.
 ///
-/// Shared by the async and static preparation paths so the plugin's config
+/// Registered as the plugin's `upstream_jobs` capability so the async and
+/// static preparation paths stay generic over plugin names; the config
 /// schema stays owned here instead of being re-traversed by the compiler.
 pub(crate) fn inline_upstream_jobs(
     owner: TrafficSplitOwner,
-    plugins: &HashMap<String, JsonValue>,
+    cfg: &JsonValue,
 ) -> ProxyResult<Vec<(UpstreamOccurrence, Upstream)>> {
-    let Some(traffic_split) = plugins.get("traffic-split") else {
-        return Ok(Vec::new());
-    };
-    let rules = traffic_split
+    let rules = cfg
         .get("rules")
         .and_then(JsonValue::as_array)
         .ok_or_else(|| ProxyError::Configuration("Invalid traffic-split rules".into()))?;

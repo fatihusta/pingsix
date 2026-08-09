@@ -21,7 +21,6 @@ use validator::Validate;
 use crate::{
     config::{self, Config, GlobalRule, Identifiable, Route, Service, Upstream, SSL},
     core::{status, ProxyError, ProxyResult},
-    plugins::{build_plugin, traffic_split},
     proxy::{
         control_plane::{
             prepare_candidate, validate_config_set, CandidateSnapshot, ResourceConfigSet,
@@ -673,7 +672,8 @@ impl ConfigurationGraph {
                 prepare_candidate(&resources, &previous).await
             }
         })?;
-        let candidate = CandidateSnapshot::build_prepared(resources, &prepared, &previous)?;
+        let (plan, prepared) = prepared;
+        let candidate = CandidateSnapshot::build_prepared(resources, &plan, &prepared, &previous)?;
         let snapshot = RuntimeSnapshot::compile(candidate, 0)?;
         let published = RUNTIME.publish(snapshot)?;
         status::mark_ready(status::ConfigSource::Yaml);
@@ -859,7 +859,7 @@ impl ConfigurationGraph {
         let previous = RUNTIME.load();
         let prepared = tokio::select! {
             result = prepare_candidate(&logical, &previous) => match result {
-                Ok(prepared) => prepared,
+                Ok((plan, prepared)) => (plan, prepared),
                 Err(error) => return PrepareOutcome::Transient(error),
             },
             _ = cancellation.cancelled() => return PrepareOutcome::Settled,
@@ -882,8 +882,9 @@ impl ConfigurationGraph {
         if revision < RUNTIME.load().revision {
             return PrepareOutcome::Settled;
         }
+        let (plan, prepared) = prepared;
         let candidate =
-            match CandidateSnapshot::build_prepared(logical.clone(), &prepared, &previous) {
+            match CandidateSnapshot::build_prepared(logical.clone(), &plan, &prepared, &previous) {
                 Ok(candidate) => candidate,
                 Err(error) => return PrepareOutcome::Permanent(error),
             };
@@ -1122,17 +1123,13 @@ fn serialization_error(e: serde_json::Error) -> ProxyError {
 }
 
 /// Build every configured plugin to surface invalid plugin configuration.
-/// Traffic-split is validated structurally without resolving named upstreams;
-/// candidate publication owns reference resolution against the same graph.
+/// Validation is delegated to each plugin's declared capabilities: plain
+/// plugins are built (construction parses their config), dependency-aware
+/// plugins validate structurally without resolving named upstreams. Candidate
+/// publication owns reference resolution against the same graph.
 fn validate_plugins(plugins: &HashMap<String, serde_json::Value>) -> ProxyResult<()> {
     for (name, value) in plugins {
-        if name == traffic_split::PLUGIN_NAME {
-            traffic_split::validate_traffic_split_config(value).map_err(|e| {
-                ProxyError::Plugin(format!("Failed to validate plugin '{name}': {e}"))
-            })?;
-            continue;
-        }
-        build_plugin(name, value.clone())
+        crate::plugins::validate_plugin_config(name, value)
             .map_err(|e| ProxyError::Plugin(format!("Failed to validate plugin '{name}': {e}")))?;
     }
     Ok(())

@@ -26,8 +26,9 @@ use once_cell::sync::Lazy;
 use serde_json::Value as JsonValue;
 
 use crate::{
+    config::Upstream,
     core::{PluginCreateFn, ProxyError, ProxyPlugin, ProxyResult},
-    proxy::upstream::{PreparedUpstreams, ProxyUpstream, TrafficSplitOwner},
+    proxy::upstream::{PreparedUpstreams, ProxyUpstream, TrafficSplitOwner, UpstreamOccurrence},
 };
 
 /// Global registry mapping plugin names to their factory functions.
@@ -105,28 +106,95 @@ pub(crate) struct PluginBuildContext<'a> {
 type UpstreamPluginFactory =
     fn(JsonValue, &PluginBuildContext<'_>) -> ProxyResult<Arc<dyn ProxyPlugin>>;
 
-static PLUGIN_UPSTREAM_BUILDER_REGISTRY: Lazy<HashMap<&'static str, UpstreamPluginFactory>> =
+/// Deterministic structural validation of a plugin config (no graph context).
+type ValidatePluginFn = fn(&JsonValue) -> ProxyResult<()>;
+
+/// Named upstream id extraction for whole-graph reference checks.
+type PluginUpstreamRefsFn = fn(&JsonValue) -> ProxyResult<Vec<String>>;
+
+/// Inline upstream occurrence extraction for candidate preparation.
+type PluginUpstreamJobsFn =
+    fn(TrafficSplitOwner, &JsonValue) -> ProxyResult<Vec<(UpstreamOccurrence, Upstream)>>;
+
+/// Control-plane capabilities of a plugin that resolves other resources.
+///
+/// One registry entry replaces the former name-based special cases in graph
+/// validation and candidate preparation; a future dependency-aware plugin
+/// declares the capabilities it needs here and every consumer picks them up
+/// generically.
+pub(crate) struct PluginUpstreamCapabilities {
+    pub factory: UpstreamPluginFactory,
+    /// Deterministic structural validation (Admin pre-check, no graph context).
+    pub validate: Option<ValidatePluginFn>,
+    /// Named upstream ids referenced by the config (whole-graph reference check).
+    pub upstream_refs: Option<PluginUpstreamRefsFn>,
+    /// Inline upstream occurrences to prepare when the owning scope is rebuilt.
+    pub upstream_jobs: Option<PluginUpstreamJobsFn>,
+}
+
+static PLUGIN_UPSTREAM_CAPABILITIES: Lazy<HashMap<&'static str, PluginUpstreamCapabilities>> =
     Lazy::new(|| {
-        let entries: Vec<(&'static str, UpstreamPluginFactory)> = vec![(
+        HashMap::from([(
             traffic_split::PLUGIN_NAME,
-            traffic_split::create_traffic_split_plugin_with_context,
-        )];
-        entries.into_iter().collect()
+            PluginUpstreamCapabilities {
+                factory: traffic_split::create_traffic_split_plugin_with_context,
+                validate: Some(traffic_split::validate_traffic_split_config),
+                upstream_refs: Some(traffic_split::named_upstream_ids),
+                upstream_jobs: Some(traffic_split::inline_upstream_jobs),
+            },
+        )])
     });
 
-/// Plugin name → secret-field transform derived from `#[encrypt]` markers.
+/// Deterministic Admin pre-check for one plugin config.
 ///
-/// Used by admin (encrypt before etcd write) and control-plane (decrypt on load).
-pub(crate) static PLUGIN_ENCRYPT_FIELDS: Lazy<
-    HashMap<&'static str, crate::utils::encryption::PluginSecretsTransform>,
-> = Lazy::new(|| {
-    HashMap::from([
-        (basic_auth::PLUGIN_NAME, basic_auth::SECRETS_TRANSFORM),
-        (csrf::PLUGIN_NAME, csrf::SECRETS_TRANSFORM),
-        (key_auth::PLUGIN_NAME, key_auth::SECRETS_TRANSFORM),
-        (jwt_auth::PLUGIN_NAME, jwt_auth::SECRETS_TRANSFORM),
-    ])
-});
+/// Dependency-aware plugins (registered in [`PLUGIN_UPSTREAM_CAPABILITIES`])
+/// validate structurally through their declared `validate` capability — they
+/// cannot be built without upstream context. Plain plugins are built, which
+/// parses their typed config and surfaces configuration errors.
+pub(crate) fn validate_plugin_config(name: &str, cfg: &JsonValue) -> ProxyResult<()> {
+    match PLUGIN_UPSTREAM_CAPABILITIES.get(name) {
+        Some(cap) => match cap.validate {
+            Some(validate) => validate(cfg),
+            None => Ok(()),
+        },
+        None => {
+            build_plugin(name, cfg.clone())?;
+            Ok(())
+        }
+    }
+}
+
+/// Named upstream ids referenced by a plugin config, when the plugin declares
+/// any. Empty for plugins without graph references.
+pub(crate) fn plugin_upstream_refs(name: &str, cfg: &JsonValue) -> ProxyResult<Vec<String>> {
+    match PLUGIN_UPSTREAM_CAPABILITIES
+        .get(name)
+        .and_then(|cap| cap.upstream_refs)
+    {
+        Some(extract) => extract(cfg),
+        None => Ok(Vec::new()),
+    }
+}
+
+/// Inline upstream occurrences declared across a resource's plugin configs.
+///
+/// Only plugins registered with an `upstream_jobs` capability contribute;
+/// the owning scope's reuse decision is made by the caller.
+pub(crate) fn plugin_upstream_jobs(
+    owner: TrafficSplitOwner,
+    plugins: &HashMap<String, JsonValue>,
+) -> ProxyResult<Vec<(UpstreamOccurrence, Upstream)>> {
+    let mut jobs = Vec::new();
+    for (name, cfg) in plugins {
+        if let Some(collect) = PLUGIN_UPSTREAM_CAPABILITIES
+            .get(name.as_str())
+            .and_then(|cap| cap.upstream_jobs)
+        {
+            jobs.extend(collect(owner.clone(), cfg)?);
+        }
+    }
+    Ok(jobs)
+}
 
 /// Creates plugin instances from configuration using a factory pattern.
 ///
@@ -151,16 +219,30 @@ pub(crate) fn build_plugin_with_upstreams(
 ) -> ProxyResult<Arc<dyn ProxyPlugin>> {
     // Dependency-aware plugins register here; the lookup replaces the former
     // `name == traffic-split` special case with a declarative registry entry.
-    if let Some(factory) = PLUGIN_UPSTREAM_BUILDER_REGISTRY.get(name) {
+    if let Some(capabilities) = PLUGIN_UPSTREAM_CAPABILITIES.get(name) {
         let context = PluginBuildContext {
             upstreams,
             prepared,
             owner,
         };
-        return factory(cfg, &context);
+        return (capabilities.factory)(cfg, &context);
     }
     build_plugin(name, cfg)
 }
+
+/// Plugin name → secret-field transform derived from `#[encrypt]` markers.
+///
+/// Used by admin (encrypt before etcd write) and control-plane (decrypt on load).
+pub(crate) static PLUGIN_ENCRYPT_FIELDS: Lazy<
+    HashMap<&'static str, crate::utils::encryption::PluginSecretsTransform>,
+> = Lazy::new(|| {
+    HashMap::from([
+        (basic_auth::PLUGIN_NAME, basic_auth::SECRETS_TRANSFORM),
+        (csrf::PLUGIN_NAME, csrf::SECRETS_TRANSFORM),
+        (key_auth::PLUGIN_NAME, key_auth::SECRETS_TRANSFORM),
+        (jwt_auth::PLUGIN_NAME, jwt_auth::SECRETS_TRANSFORM),
+    ])
+});
 
 pub fn build_plugin(name: &str, cfg: JsonValue) -> ProxyResult<Arc<dyn ProxyPlugin>> {
     let builder = PLUGIN_BUILDER_REGISTRY
