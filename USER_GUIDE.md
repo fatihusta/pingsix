@@ -1139,25 +1139,24 @@ upstreams:
       - host: cold.example.com
         port: 443
         weight: 1
-        priority: -1          # i8 range: −128..127; lower than 0
+        priority: -1          # i8 range: -128..=127; lower than 0
 ```
 
 **Node fields:**
-- **`weight`**: Relative share inside a priority group. `0` keeps the node in config but excludes it from selection.
-- **`priority`**: Selection group (`i8`: -128..127, default `0`). Higher values win. Same priority = same group.
+- **`weight`**: Relative share inside a priority group. `0` keeps the node in config but excludes it from selection and from health checks (a `weight: 0` node never becomes a backend, so it is not probed either).
+- **`priority`**: Selection group (`i8`: -128..=127, default `0`). Higher values win. Same priority = same group.
+- **`port`**: Optional; when omitted the upstream scheme default is used (80 for `http`/`grpc`, 443 for `https`/`grpcs`). An explicit `0` is invalid — either omit the port or set it to a real one.
 
 **Priority selection (with health checks):**
 1. Group enabled nodes (`weight > 0`) by `priority`.
 2. Prefer the highest priority group that still has at least one ready (healthy) backend.
 3. Inside that group, use the upstream `type` algorithm (roundrobin, random, fnv, ketama) and weights. Each group is balanced independently, so weights and `fnv`/`ketama` key mappings among the primary nodes do not change when you add, remove, or fail over a lower-priority group.
 4. If a higher group becomes healthy again, the next request uses it.
-5. If no group has a ready backend, selection retries in the same priority order while ignoring health. Without health checks, all nodes are treated as ready, so traffic stays on the highest priority.
+5. If no group has a ready backend, selection retries in the same priority order while ignoring health. Without health checks, all nodes are treated as ready, so traffic stays on the highest priority. Note that this fallback still selects a (possibly dead) backend, so a fully down upstream costs connection attempts/retries instead of failing instantly.
 
 **Constraints:**
 - Each enabled node must resolve to a unique address, because Pingora backends are keyed by address and duplicates cannot carry different priorities. The comparison uses the *effective* port, so over `scheme: http` a node without `port` collides with an explicit `port: 80`.
 - DNS-resolved IPs inherit the parent node's priority, and DNS refreshes rebuild the priority groups.
-
-
 
 ### Load Balancing Algorithms
 

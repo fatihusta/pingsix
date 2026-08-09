@@ -75,12 +75,15 @@ pub(crate) fn cache_origin_fingerprint(upstream: &config::Upstream) -> u64 {
         timeout.read.hash(&mut hasher);
     }
     // HashMap wire order / list insertion order must not change the fingerprint
-    // for an otherwise identical node set. Sort by bare host + port.
+    // for an otherwise identical node set. Sort by the canonical node key, and
+    // hash the *effective* port so "no port" and an explicit scheme-default
+    // port (e.g. `example.com` vs `example.com:80` over http) are the same
+    // origin.
     let mut nodes: Vec<_> = upstream.nodes.iter().collect();
     nodes.sort_by_key(|n| n.sort_key());
     for node in nodes {
         node.bare_host().hash(&mut hasher);
-        node.port.hash(&mut hasher);
+        node.effective_port(&upstream.scheme).hash(&mut hasher);
         node.weight.hash(&mut hasher);
         node.priority.hash(&mut hasher);
     }
@@ -452,7 +455,8 @@ mod tests {
     fn node(host: &str, port: u16, priority: i8) -> config::Node {
         config::Node {
             host: host.into(),
-            port,
+            // Test convenience: 0 means "port omitted" (scheme default).
+            port: (port != 0).then_some(port),
             weight: 1,
             priority,
         }
@@ -605,6 +609,36 @@ mod tests {
         assert_eq!(prepared.backends.len(), 1);
         let only = prepared.backends.iter().next().unwrap();
         assert_eq!(selection::backend_priority(only), 10);
+    }
+
+    #[test]
+    fn cache_origin_fingerprint_canonicalizes_scheme_default_port() {
+        // An omitted port and an explicit scheme-default port dial the same
+        // origin, so they must share a cache namespace.
+        let no_port = config::Upstream {
+            nodes: Nodes(vec![node("example.com", 0, 0)]),
+            ..sample_upstream("u1", None)
+        };
+        let explicit = config::Upstream {
+            nodes: Nodes(vec![node("example.com", 80, 0)]),
+            ..sample_upstream("u1", None)
+        };
+        assert_eq!(
+            cache_origin_fingerprint(&no_port),
+            cache_origin_fingerprint(&explicit),
+            "omitted port and explicit scheme default are the same origin"
+        );
+
+        // But a genuinely different effective port must differ.
+        let other = config::Upstream {
+            nodes: Nodes(vec![node("example.com", 8080, 0)]),
+            ..sample_upstream("u1", None)
+        };
+        assert_ne!(
+            cache_origin_fingerprint(&no_port),
+            cache_origin_fingerprint(&other),
+            "different effective ports must not share a cache namespace"
+        );
     }
 
     /// A malformed health-check path or header must fail candidate build

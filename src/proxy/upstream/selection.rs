@@ -11,6 +11,14 @@
 //! backend, [`select_backend`] retries ignoring health, still in priority
 //! order.
 //!
+//! Within a group, failover keeps the inner algorithm's own semantics: the
+//! group's selector drives the candidate order (weights, hash rings, and
+//! round-robin state), so a down primary does not collapse the group onto the
+//! lexicographically smallest address. A bounded number of inner draws is
+//! followed by a deterministic enumeration of any member the inner phase
+//! missed, so a ready backend is never skipped over. Single-group upstreams
+//! bypass this bookkeeping entirely and behave exactly like plain Pingora.
+//!
 //! Because grouping happens inside the selector, Pingora rebuilds the groups
 //! atomically whenever service discovery replaces the backend set.
 
@@ -36,11 +44,14 @@ pub(crate) fn backend_priority(backend: &Backend) -> i8 {
 }
 
 /// Insert `backend` into `set`, keeping the higher priority when Pingora identity
-/// collides (same addr + weight; `ext` is ignored by `Backend` equality).
+/// collides (same addr **and** weight; `ext` is ignored by `Backend` equality).
 ///
 /// Config validation already rejects duplicate effective addresses among enabled
-/// nodes, so a collision here means two distinct hostnames resolved to the same
-/// address. Dropping the lower priority is the only representable outcome.
+/// nodes, so a full-identity collision here means two distinct hostnames resolved
+/// to the same address at the same weight. Dropping the lower priority is the
+/// only representable outcome. Note that two hostnames resolving to the same
+/// address at *different* weights are distinct Pingora backends and both stay in
+/// the set, mirroring Pingora's identity semantics.
 pub(crate) fn insert_backend(set: &mut BTreeSet<Backend>, backend: Backend) {
     let Some(existing) = set.get(&backend).cloned() else {
         set.insert(backend);
@@ -69,9 +80,9 @@ pub(crate) fn insert_backend(set: &mut BTreeSet<Backend>, backend: Backend) {
 struct PriorityGroup<BS> {
     priority: i8,
     selector: Arc<BS>,
-    /// Same members as `selector`, in [`Backend`] order. Used to enumerate the
-    /// rest of the group after the selector's own first choice, which bounds
-    /// each group to one pass before falling through to the next priority.
+    /// Same members as `selector`, in [`Backend`] order. Used to map inner
+    /// candidates back to stable indices (dedupe) and to enumerate any member
+    /// the inner phase missed, before falling through to the next priority.
     backends: Box<[Backend]>,
 }
 
@@ -143,8 +154,9 @@ where
                 key: key.into(),
                 group: 0,
                 inner: None,
-                first_choice: None,
-                next: None,
+                seen: Box::new([]),
+                drawn: 0,
+                next: 0,
             }),
         }
     }
@@ -164,11 +176,26 @@ pub(crate) struct GroupedCursor<BS: BackendSelection> {
     group: usize,
     /// Inner iterator of the current group, built on first use.
     inner: Option<BS::Iter>,
-    /// Index of the current group's algorithmic first choice, once yielded.
-    first_choice: Option<usize>,
-    /// Next index of the current group's enumeration; `None` while the first
-    /// choice has not been yielded yet.
-    next: Option<usize>,
+    /// Members of the current group already yielded, indexed by position in
+    /// [`PriorityGroup::backends`].
+    seen: Box<[bool]>,
+    /// Inner draws made for the current group. Bounds the inner phase so a
+    /// cycling iterator (weighted round robin, fnv) cannot spin forever.
+    drawn: usize,
+    /// Next position for the coverage-enumeration phase of the current group.
+    next: usize,
+}
+
+/// Maximum inner draws per group before the coverage enumeration kicks in.
+///
+/// The inner selectors need only a handful of draws to cover a typical group
+/// (round robin cycles in `len` draws; a ketama ring visits most members within
+/// a few positions). The budget is a loose multiple of the group size so the
+/// algorithm's own order dominates, while a hard floor keeps tiny groups from
+/// being starved by a long hash ring. Whatever the inner phase misses is
+/// enumerated afterwards, so the budget only affects *order*, never coverage.
+fn group_draw_budget(group_len: usize) -> usize {
+    group_len.saturating_mul(8).max(64)
 }
 
 impl<BS> BackendIter for PriorityGroupedIter<BS>
@@ -185,39 +212,51 @@ where
 
         loop {
             let group = cursor.grouped.groups.get(cursor.group)?;
-            let inner = cursor
-                .inner
-                .get_or_insert_with(|| group.selector.iter(&cursor.key));
 
-            match cursor.next {
-                // Let the group's own algorithm pick first, so weights and hash
-                // mappings are those of this group alone.
-                None => {
-                    let chosen = inner
-                        .next()
-                        .and_then(|backend| group.backends.binary_search(backend).ok());
-                    cursor.first_choice = chosen;
-                    cursor.next = Some(0);
-                    if let Some(index) = chosen {
+            // (Re)initialize per-group state on first entry.
+            if cursor.seen.len() != group.backends.len() {
+                cursor.seen = vec![false; group.backends.len()].into_boxed_slice();
+                cursor.drawn = 0;
+                cursor.next = 0;
+                cursor.inner = Some(group.selector.iter(&cursor.key));
+            }
+
+            // Phase 1: let the group's own algorithm drive the order, so
+            // weights, hash rings, and round-robin state are honored during
+            // failover too. Dedupe by index; the inner selector can repeat a
+            // candidate (weighted iterators cycle, a ketama ring walks many
+            // points per backend).
+            if cursor.drawn < group_draw_budget(group.backends.len()) {
+                let Some(backend) = cursor.inner.as_mut().and_then(BackendIter::next) else {
+                    // Inner exhausted (e.g. the ring walked end to end).
+                    cursor.drawn = group_draw_budget(group.backends.len());
+                    continue;
+                };
+                cursor.drawn += 1;
+                if let Ok(index) = group.backends.binary_search(backend) {
+                    if !cursor.seen[index] {
+                        cursor.seen[index] = true;
                         return group.backends.get(index);
                     }
                 }
-                // Then the remaining members once each, so an exhausted group
-                // falls through to the next priority instead of looping.
-                Some(index) => {
-                    if index >= group.backends.len() {
-                        cursor.group += 1;
-                        cursor.inner = None;
-                        cursor.first_choice = None;
-                        cursor.next = None;
-                        continue;
-                    }
-                    cursor.next = Some(index + 1);
-                    if Some(index) != cursor.first_choice {
-                        return group.backends.get(index);
-                    }
+                continue; // duplicate candidate; keep drawing
+            }
+
+            // Phase 2: cover any member the inner phase missed, in
+            // deterministic order, so a ready backend is never skipped over.
+            while cursor.next < group.backends.len() {
+                let index = cursor.next;
+                cursor.next += 1;
+                if !cursor.seen[index] {
+                    cursor.seen[index] = true;
+                    return group.backends.get(index);
                 }
             }
+
+            // Group exhausted: move to the next priority level.
+            cursor.group += 1;
+            cursor.inner = None;
+            cursor.seen = Box::new([]);
         }
     }
 }
@@ -257,7 +296,7 @@ where
 mod tests {
     use super::*;
 
-    use std::collections::HashMap;
+    use std::collections::{HashMap, HashSet};
     use std::sync::Mutex;
 
     use async_trait::async_trait;
@@ -514,6 +553,68 @@ mod tests {
     }
 
     #[test]
+    fn ketama_failover_within_group_follows_the_ring() {
+        let a = "127.0.0.1:18701";
+        let b = "127.0.0.1:18702";
+        let c = "127.0.0.1:18703";
+        let backup = "127.0.0.2:18704";
+        let key = b"ketama-failover-key";
+
+        // The primary group's ring on its own, as plain Pingora would see it.
+        let primary = backend_set(&[(a, 1, 10), (b, 1, 10), (c, 1, 10)]);
+        let selector = Arc::new(KetamaHashing::build(&primary));
+        let mut inner = selector.iter(key);
+        let first = inner.next().expect("ring is non-empty").addr.to_string();
+        let second = {
+            let mut seen = HashSet::new();
+            seen.insert(first.clone());
+            loop {
+                let addr = inner.next().expect("ring is non-empty").addr.to_string();
+                if seen.insert(addr.clone()) {
+                    break addr;
+                }
+            }
+        };
+
+        // The same primary group plus a lower-priority backup forces the
+        // grouped (non-flat) iterator path.
+        let mut members = primary.clone();
+        members.extend(backend_set(&[(backup, 1, 0)]));
+        let lb = lb_from_backends::<KetamaHashing>(members);
+        set_ready(&lb, &first, false);
+
+        assert_eq!(
+            pick_addr_keyed(&lb, key),
+            second,
+            "in-group failover must walk the ketama ring, not fall back to address order"
+        );
+    }
+
+    #[test]
+    fn round_robin_failover_within_group_reaches_the_healthy_member() {
+        let light = "127.0.0.1:18801";
+        let heavy = "127.0.0.1:18802";
+        let backup = "127.0.0.2:18803";
+        let lb = lb_from_backends::<RoundRobin>(backend_set(&[
+            (light, 1, 10),
+            (heavy, 9, 10),
+            (backup, 1, 0),
+        ]));
+        // The weighted first choice can be the light node (1 slot in 10); with
+        // it down, the group's own round-robin continuation must still land on
+        // the heavy node instead of skipping to the backup group.
+        set_ready(&lb, light, false);
+
+        for _ in 0..50 {
+            assert_eq!(
+                pick_addr(&lb),
+                heavy,
+                "every selection must reach the remaining ready member of the group"
+            );
+        }
+    }
+
+    #[test]
     fn insert_backend_keeps_higher_priority_on_addr_collision() {
         let mut set = BTreeSet::new();
         insert_backend(&mut set, backend("127.0.0.1:443", 1, -1));
@@ -521,6 +622,17 @@ mod tests {
 
         assert_eq!(set.len(), 1);
         assert_eq!(backend_priority(set.iter().next().unwrap()), 10);
+    }
+
+    #[test]
+    fn insert_backend_keeps_distinct_weights_at_the_same_addr() {
+        // Pingora identity includes weight, so same-addr different-weight
+        // backends are distinct and must both survive.
+        let mut set = BTreeSet::new();
+        insert_backend(&mut set, backend("127.0.0.1:443", 1, 10));
+        insert_backend(&mut set, backend("127.0.0.1:443", 2, 0));
+
+        assert_eq!(set.len(), 2);
     }
 
     #[test]

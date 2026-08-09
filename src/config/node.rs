@@ -26,7 +26,6 @@ static HOST_FQDN_REGEX: Lazy<Regex> = Lazy::new(|| {
 });
 
 fn validate_node_host(host: &str) -> Result<(), ValidationError> {
-    let host = host.trim();
     if host.is_empty() {
         return Err(ValidationError::new("invalid_host"));
     }
@@ -75,9 +74,11 @@ fn strip_ipv6_brackets(host: &str) -> &str {
     }
 }
 
-/// Split `host` / `host:port` / `[ipv6]:port`. A missing port yields `0`, meaning
-/// "use the upstream scheme default".
-fn split_host_port(addr: &str) -> Result<(&str, u16), ValidationError> {
+/// Split `host` / `host:port` / `[ipv6]:port`. A missing port yields `None`,
+/// meaning "use the upstream scheme default". An explicit `0` is rejected: the
+/// pre-PR validation treated it as invalid, and silently remapping it to the
+/// default would accept configurations that used to fail.
+fn split_host_port(addr: &str) -> Result<(&str, Option<u16>), ValidationError> {
     let caps = HOST_PORT_REGEX
         .captures(addr)
         .ok_or_else(|| ValidationError::new("invalid_address_format"))?;
@@ -90,29 +91,61 @@ fn split_host_port(addr: &str) -> Result<(&str, u16), ValidationError> {
     validate_node_host(host)?;
 
     let port = match caps.get(3) {
-        Some(p) => p
-            .as_str()
-            .parse::<u16>()
-            .map_err(|_| ValidationError::new("invalid_port"))?,
-        None => 0,
+        Some(p) => {
+            let port = p
+                .as_str()
+                .parse::<u16>()
+                .map_err(|_| ValidationError::new("invalid_port"))?;
+            if port == 0 {
+                return Err(ValidationError::new("invalid_port"));
+            }
+            Some(port)
+        }
+        None => None,
     };
 
     Ok((host, port))
+}
+
+/// Reject an explicit `0` on the list wire form: a port is either omitted
+/// (scheme default) or explicitly `1..=65535`. This keeps list-form semantics
+/// identical to the map form, where `"host:0"` is rejected by
+/// [`split_host_port`].
+fn deserialize_port<'de, D>(deserializer: D) -> Result<Option<u16>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let port = Option::<u16>::deserialize(deserializer)?;
+    if port == Some(0) {
+        return Err(serde::de::Error::custom(
+            "node port must be 1..=65535, or omitted to use the scheme default",
+        ));
+    }
+    Ok(port)
+}
+
+fn priority_is_default(priority: &i8) -> bool {
+    *priority == 0
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Validate)]
 pub struct Node {
     #[validate(custom(function = "validate_node_host"))]
     pub host: String,
-    /// `0` means "use the upstream scheme default" (80 / 443).
-    #[serde(default)]
-    pub port: u16,
+    /// Explicit port (`1..=65535`), or `None` to use the upstream scheme
+    /// default (80 for http/grpc, 443 for https/grpcs).
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_port"
+    )]
+    pub port: Option<u16>,
     /// Relative load-balancing weight. `0` keeps the node in the configuration
     /// but excludes it from backend selection.
     #[serde(default = "Node::default_weight")]
     pub weight: u32,
     /// Selection priority among nodes (`i8`: -128..=127). Higher wins.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "priority_is_default")]
     pub priority: i8,
 }
 
@@ -131,9 +164,16 @@ impl Node {
         strip_ipv6_brackets(&self.host)
     }
 
-    /// Sort / fingerprint key: `(bare_host, port)`.
-    pub fn sort_key(&self) -> (&str, u16) {
-        (self.bare_host(), self.port)
+    /// Sort / fingerprint key. Includes weight and priority so two nodes that
+    /// share a `(host, port)` pair (only possible when at least one is disabled)
+    /// still sort deterministically instead of depending on insertion order.
+    pub fn sort_key(&self) -> (&str, u16, u32, i8) {
+        (
+            self.bare_host(),
+            self.port.unwrap_or(0),
+            self.weight,
+            self.priority,
+        )
     }
 
     /// Canonical `host:port` / `[ipv6]:port` key used for lookups and display.
@@ -147,20 +187,21 @@ impl Node {
     /// Port actually dialed: the configured one, or the scheme default when the
     /// node omits it. Must stay in sync with backend construction in discovery.
     pub fn effective_port(&self, scheme: &UpstreamScheme) -> u16 {
-        if self.port != 0 {
-            return self.port;
-        }
-        match scheme {
+        self.port.unwrap_or(match scheme {
             UpstreamScheme::HTTPS | UpstreamScheme::GRPCS => 443,
             UpstreamScheme::HTTP | UpstreamScheme::GRPC => 80,
-        }
+        })
     }
 
     /// Address key after applying the scheme default port, so `example.com` and
     /// `example.com:80` over HTTP compare equal.
     pub fn effective_addr_key(&self, scheme: &UpstreamScheme) -> String {
         let mut key = String::new();
-        let _ = write_addr(&mut key, self.bare_host(), self.effective_port(scheme));
+        let _ = write_addr(
+            &mut key,
+            self.bare_host(),
+            Some(self.effective_port(scheme)),
+        );
         key
     }
 
@@ -175,12 +216,17 @@ impl Node {
 }
 
 /// IPv6 hosts are re-bracketed so the result parses back as `host:port`.
-fn write_addr(out: &mut impl fmt::Write, host: &str, port: u16) -> fmt::Result {
+/// A `None` port is omitted entirely (the scheme default applies).
+fn write_addr(out: &mut impl fmt::Write, host: &str, port: Option<u16>) -> fmt::Result {
     if host.contains(':') {
-        write!(out, "[{host}]:{port}")
+        write!(out, "[{host}]")?;
     } else {
-        write!(out, "{host}:{port}")
+        write!(out, "{host}")?;
     }
+    if let Some(port) = port {
+        write!(out, ":{port}")?;
+    }
+    Ok(())
 }
 
 impl fmt::Display for Node {
@@ -262,6 +308,11 @@ impl TryFrom<HashMap<String, u32>> for Nodes {
         }
 
         if errors.is_empty() {
+            // Canonicalize order: `HashMap` iteration order is random across
+            // runs, and node order decides discovery/insert order (e.g. which
+            // backend survives an equal-priority address collision). Sorting
+            // makes restarts and re-submissions deterministic.
+            nodes.sort_by(|a, b| a.sort_key().cmp(&b.sort_key()));
             Ok(Nodes(nodes))
         } else {
             Err(errors)
@@ -305,17 +356,42 @@ impl<'de> Deserialize<'de> for Nodes {
     where
         D: serde::Deserializer<'de>,
     {
-        #[derive(Deserialize)]
-        #[serde(untagged)]
-        enum RawNodes {
-            Map(HashMap<String, u32>),
-            List(Vec<Node>),
+        // Dispatched on the wire shape (map vs. list) instead of an untagged
+        // enum so that a bad entry reports its real error (e.g. `priority` out
+        // of range or a non-integer weight) rather than the generic "did not
+        // match any variant of untagged enum" message.
+        struct NodesVisitor;
+
+        impl<'de> serde::de::Visitor<'de> for NodesVisitor {
+            type Value = Nodes;
+
+            fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                f.write_str("a map of \"address:port\" to weight, or an array of node objects")
+            }
+
+            fn visit_seq<A>(self, mut seq: A) -> Result<Self::Value, A::Error>
+            where
+                A: serde::de::SeqAccess<'de>,
+            {
+                let mut nodes = Vec::with_capacity(seq.size_hint().unwrap_or(0));
+                while let Some(node) = seq.next_element::<Node>()? {
+                    nodes.push(node);
+                }
+                Ok(Nodes(nodes))
+            }
+
+            fn visit_map<A>(self, map: A) -> Result<Self::Value, A::Error>
+            where
+                A: serde::de::MapAccess<'de>,
+            {
+                let map = HashMap::<String, u32>::deserialize(
+                    serde::de::value::MapAccessDeserializer::new(map),
+                )?;
+                Nodes::try_from(map).map_err(serde::de::Error::custom)
+            }
         }
 
-        match RawNodes::deserialize(deserializer)? {
-            RawNodes::List(list) => Ok(Nodes(list)),
-            RawNodes::Map(map) => Nodes::try_from(map).map_err(serde::de::Error::custom),
-        }
+        deserializer.deserialize_any(NodesVisitor)
     }
 }
 
@@ -326,7 +402,10 @@ mod tests {
     fn node(host: &str, port: u16, weight: u32, priority: i8) -> Node {
         Node {
             host: host.into(),
-            port,
+            // Test convenience: 0 means "port omitted" (scheme default). An
+            // explicit 0 is rejected by deserialization and must never be
+            // constructed.
+            port: (port != 0).then_some(port),
             weight,
             priority,
         }
@@ -335,16 +414,19 @@ mod tests {
     #[test]
     fn split_host_port_parses_supported_forms() {
         let test_cases = [
-            ("127.0.0.1", ("127.0.0.1", 0)),
+            ("127.0.0.1", ("127.0.0.1", None)),
             // IPv6 without brackets; brackets are re-added for SocketAddr / addr keys.
-            ("[::1]", ("::1", 0)),
-            ("example.com", ("example.com", 0)),
-            ("example.com:80", ("example.com", 80)),
-            ("192.168.1.1:8080", ("192.168.1.1", 8080)),
+            ("[::1]", ("::1", None)),
+            ("example.com", ("example.com", None)),
+            ("example.com:80", ("example.com", Some(80))),
+            ("192.168.1.1:8080", ("192.168.1.1", Some(8080))),
             (
                 "[2001:db8:85a3::8a2e:370:7334]:8080",
-                ("2001:db8:85a3::8a2e:370:7334", 8080),
+                ("2001:db8:85a3::8a2e:370:7334", Some(8080)),
             ),
+            // Maximum valid socket port parses; one past it must be rejected
+            // instead of wrapping around to zero.
+            ("127.0.0.1:65535", ("127.0.0.1", Some(65535))),
         ];
 
         for (input, expected) in test_cases {
@@ -355,6 +437,18 @@ mod tests {
         assert!(split_host_port("").is_err());
         assert!(split_host_port("invalid:port").is_err());
         assert!(split_host_port("127.0.0.1:invalid").is_err());
+        assert!(
+            split_host_port("127.0.0.1:65536").is_err(),
+            "port above u16::MAX must be rejected, not wrapped"
+        );
+        assert!(
+            split_host_port("[::1]:65536").is_err(),
+            "IPv6 port above u16::MAX must be rejected, not wrapped"
+        );
+        assert!(
+            split_host_port("127.0.0.1:0").is_err(),
+            "explicit port 0 must be rejected, not remapped to the scheme default"
+        );
     }
 
     #[test]
@@ -367,7 +461,13 @@ mod tests {
 
     #[test]
     fn node_parses_from_addr_and_round_trips_through_display() {
-        for addr in ["127.0.0.1:18080", "[2001:db8::1]:443", "example.com:80"] {
+        for addr in [
+            "127.0.0.1:18080",
+            "[2001:db8::1]:443",
+            "example.com:80",
+            // A portless address round-trips without a port.
+            "example.com",
+        ] {
             let node: Node = addr.parse().unwrap();
             assert_eq!(node.to_string(), addr);
             assert_eq!(node.weight, 1);
@@ -375,6 +475,7 @@ mod tests {
         }
 
         assert!("not a host".parse::<Node>().is_err());
+        assert!("127.0.0.1:0".parse::<Node>().is_err());
     }
 
     #[test]
@@ -391,6 +492,10 @@ mod tests {
         let weights: HashMap<_, _> = nodes.iter().map(|n| (n.addr_key(), n.weight)).collect();
         assert_eq!(weights["127.0.0.1:18080"], 1);
         assert_eq!(weights["10.0.0.2:80"], 2);
+        // Map-derived nodes are canonically sorted, so the order is stable
+        // across restarts regardless of HashMap iteration order.
+        assert_eq!(nodes.as_slice()[0].addr_key(), "10.0.0.2:80");
+        assert_eq!(nodes.as_slice()[1].addr_key(), "127.0.0.1:18080");
     }
 
     #[test]
@@ -403,7 +508,7 @@ mod tests {
 
         assert_eq!(nodes.len(), 2);
         assert_eq!(nodes.as_slice()[0].host, "127.0.0.1");
-        assert_eq!(nodes.as_slice()[0].port, 18080);
+        assert_eq!(nodes.as_slice()[0].port, Some(18080));
         assert_eq!(nodes.as_slice()[1].weight, 2);
         assert_eq!(nodes.as_slice()[1].priority, 0); // serde default
     }
@@ -413,9 +518,70 @@ mod tests {
         let nodes: Nodes =
             serde_json::from_value(serde_json::json!([{"host": "example.com"}])).unwrap();
         let node = &nodes.as_slice()[0];
-        assert_eq!(node.port, 0);
+        assert!(node.port.is_none());
         assert_eq!(node.weight, 1);
         assert_eq!(node.priority, 0);
+    }
+
+    #[test]
+    fn nodes_serialize_omits_default_port_and_priority() {
+        let nodes = Nodes(vec![node("example.com", 0, 1, 0)]);
+        let value = serde_json::to_value(&nodes).unwrap();
+        let obj = &value.as_array().unwrap()[0];
+        assert!(
+            obj.get("port").is_none(),
+            "omitted port must not serialize as 0"
+        );
+        assert!(
+            obj.get("priority").is_none(),
+            "default priority must not serialize as 0"
+        );
+        assert_eq!(obj["host"], "example.com");
+        assert_eq!(obj["weight"], 1);
+    }
+
+    #[test]
+    fn explicit_zero_port_is_rejected_on_every_wire_form() {
+        // List form.
+        let list_err = serde_json::from_value::<Nodes>(serde_json::json!([{
+            "host": "127.0.0.1",
+            "port": 0
+        }]))
+        .unwrap_err();
+        assert!(
+            list_err.to_string().contains("1..=65535"),
+            "explicit 0 must fail with a specific message: {list_err}"
+        );
+
+        // Map form ("host:0" key) and FromStr share the same parser.
+        assert!(Nodes::try_from(HashMap::from([("127.0.0.1:0".to_string(), 1)])).is_err());
+        assert!("127.0.0.1:0".parse::<Node>().is_err());
+    }
+
+    #[test]
+    fn list_form_errors_keep_their_specific_message() {
+        // `priority: 128` overflows i8. The error must name the real cause
+        // instead of the generic untagged-enum fallback message.
+        let err = serde_json::from_value::<Nodes>(serde_json::json!([{
+            "host": "127.0.0.1",
+            "port": 80,
+            "priority": 128
+        }]))
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("expected i8"),
+            "priority overflow must surface its own error: {err}"
+        );
+
+        // Same for a non-integer weight in the map form.
+        let err = serde_json::from_value::<Nodes>(serde_json::json!({
+            "127.0.0.1:80": "one"
+        }))
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("expected u32"),
+            "bad map weight must surface its own error: {err}"
+        );
     }
 
     #[test]
@@ -494,6 +660,10 @@ mod tests {
             "example.com.",
             "-bad.example",
             "example..com",
+            // Validation must not trim: a whitespace-padded host would validate
+            // but then fail DNS resolution at runtime with a confusing error.
+            " example.com",
+            "example.com ",
         ] {
             assert!(
                 validate_node_host(host).is_err(),

@@ -91,8 +91,10 @@ fn health_check_fingerprint(upstream: &config::Upstream) -> HealthCheckFingerpri
 
 /// Stable fingerprint of upstream fields that affect health-check behavior.
 ///
-/// Includes scheme, node addresses (not weights), and `checks`. Excludes retries,
-/// pass_host, and similar LB-only fields so unrelated edits do not restart HC tasks.
+/// Includes scheme, node addresses (not weights or priorities), and `checks`.
+/// Excludes retries, pass_host, and similar LB-only fields so unrelated edits
+/// do not restart HC tasks. Ports are hashed at their *effective* value so an
+/// omitted port and an explicit scheme-default port probe the same targets.
 pub fn fingerprint_upstream_for_health_check(
     upstream: &config::Upstream,
 ) -> HealthCheckFingerprint {
@@ -105,7 +107,7 @@ pub fn fingerprint_upstream_for_health_check(
     nodes.sort_by_key(|n| n.sort_key());
     for node in nodes {
         node.bare_host().hash(&mut hasher);
-        node.port.hash(&mut hasher);
+        node.effective_port(&upstream.scheme).hash(&mut hasher);
     }
     if let Ok(bytes) = serde_json::to_vec(&upstream.checks) {
         bytes.hash(&mut hasher);

@@ -2267,4 +2267,35 @@ nodes:
             "a weight 0 node never becomes a backend, so it cannot collide"
         );
     }
+
+    #[test]
+    fn upstream_nested_nodes_validation_reports_invalid_host_without_panicking() {
+        // `#[validate(nested)]` wraps the manual `Nodes::validate` errors; the
+        // merged path must surface the specific error instead of panicking on
+        // duplicate field entries.
+        let up = upstream_with_nodes(
+            "  - host: 'not a host'\n    port: 80\n  - host: 'also bad'\n    port: 80\n",
+            "http",
+        );
+        let err = up
+            .validate()
+            .expect_err("invalid node hosts must fail upstream validation");
+        assert!(
+            err.to_string().contains("invalid_host"),
+            "nested error must name the real cause: {err}"
+        );
+    }
+
+    #[test]
+    fn upstream_rejects_explicit_zero_port_in_list_form() {
+        // An explicit `port: 0` must be a parse error (like `"host:0"` in the
+        // map form), never a silent remap to the scheme default.
+        let yaml = "id: u1\nscheme: http\nnodes:\n  - host: example.com\n    port: 0\n";
+        let err =
+            serde_yml::from_str::<Upstream>(yaml).expect_err("explicit port 0 must not parse");
+        assert!(
+            err.to_string().contains("1..=65535"),
+            "parse error must explain the port rule: {err}"
+        );
+    }
 }
