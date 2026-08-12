@@ -1225,7 +1225,26 @@ upstreams:
         unhealthy:
           http_failures: 3             # HTTP failures before marking unhealthy
           tcp_failures: 2              # TCP failures before marking unhealthy
+      passive:                         # Optional: real-traffic based checking
+        type: http
+        healthy:
+          http_statuses: [200, 201, 204, 302]  # Statuses counted as healthy
+          successes: 5                 # Consecutive healthy responses to restore
+        unhealthy:
+          http_statuses: [429, 500, 503]       # Statuses counted as unhealthy
+          http_failures: 5             # Consecutive HTTP failures to trip
+          tcp_failures: 2              # Consecutive TCP failures to trip
+          timeouts: 7                  # Consecutive timeouts to trip
 ```
+
+Passive checking observes real request outcomes (no probe traffic): after
+`unhealthy.*` consecutive failures a node is pulled from rotation, and after
+`healthy.successes` consecutive healthy responses it is restored. The three
+failure categories are counted independently.
+
+`active` is optional: a `checks` block may specify only `passive` to enable
+real-traffic health checking without any probe traffic. At least one of
+`active` or `passive` must be present.
 
 #### Shared Health Check Lifecycle
 
@@ -1484,7 +1503,7 @@ plugins:
 
 ### Rate Limiting
 
-#### Request Rate Limiting
+#### Request Rate Limiting (limit-count)
 ```yaml
 plugins:
   limit-count:
@@ -1498,6 +1517,44 @@ plugins:
     key_missing_policy: allow     # allow, deny, default
     scope: local                  # Only process-local scope is supported
 ```
+
+#### Leaky Bucket Rate Limiting (limit-req)
+```yaml
+plugins:
+  limit-req:
+    rate: 10                      # Max requests per second (bucket drain rate)
+    burst: 20                     # Requests allowed to be delayed above rate
+    key: remote_addr              # APISIX variable or combination, e.g. "$remote_addr $http_x_forwarded_for"
+    key_type: var                 # var, var_combination
+    rejected_code: 503            # HTTP status for rejected requests
+    rejected_msg: "Requests are too frequent"
+    nodelay: false                # true = serve burst without delay; further requests are rejected
+    policy: local                 # Only process-local is supported
+```
+
+Requests above `rate` but within `rate + burst` are delayed (queued); requests
+above `rate + burst` are rejected. With `nodelay: true` the burst is consumed
+at full speed (no delay), and subsequent requests are rejected until the
+bucket drains.
+
+#### Concurrency Limiting (limit-conn)
+```yaml
+plugins:
+  limit-conn:
+    conn: 2                       # Max concurrent requests
+    burst: 1                      # Extra requests allowed to be delayed
+    default_conn_delay: 0.1       # Delay (seconds) applied in the burst range
+    only_use_default_delay: false # false = adapt delay from observed request latency
+    key: remote_addr              # APISIX variable or combination
+    key_type: var
+    rejected_code: 503            # HTTP status for rejected requests
+    rejected_msg: "Too many concurrent requests"
+    policy: local                 # Only process-local is supported
+```
+
+Requests up to `conn` pass immediately; requests between `conn` and
+`conn + burst` are delayed before being allowed; requests above `conn + burst`
+are rejected.
 
 ### Traffic Management
 
@@ -1647,6 +1704,68 @@ plugins:
 
 **Common Use Cases:**
 - Chaos engineering and resilience testing
+
+#### Request Mirroring (proxy-mirror)
+```yaml
+plugins:
+  proxy-mirror:
+    host: http://127.0.0.1:9797    # Mirror target URL (http/https)
+    path: /shadow                  # Optional path rewrite
+    path_concat_mode: replace      # replace (default) or prefix
+    sample_ratio: 1.0              # Proportion of requests to mirror (0.00001 - 1)
+```
+
+A sampled portion of requests is asynchronously duplicated to the shadow
+upstream (headers + streaming body). Mirror failures never affect the primary
+request.
+
+#### Circuit Breaker (api-breaker)
+```yaml
+plugins:
+  api-breaker:
+    break_response_code: 502       # Response code while the circuit is open
+    break_response_body: "Service Unavailable"  # Optional body
+    break_response_headers:        # Optional headers (values support $vars)
+      - key: X-Client-Addr
+        value: "$remote_addr:$remote_port"
+    max_breaker_sec: 300           # Max breaker window (seconds, >= 3)
+    unhealthy:
+      http_statuses: [500, 503]    # Statuses counted as failures
+      failures: 3                  # Failures before tripping
+    healthy:
+      http_statuses: [200]         # Statuses counted as success
+      successes: 1                 # Consecutive successes to recover
+```
+
+Trips per-route after `unhealthy.failures` failures; while tripped, requests
+are answered with `break_response_code` for an exponentially backed-off window
+(2, 4, 8, ... seconds, capped at `max_breaker_sec`).
+
+#### Client Request Control (client-control)
+```yaml
+plugins:
+  client-control:
+    max_body_size: 1048576         # Max request body size in bytes (0 = unlimited)
+```
+
+Rejects requests whose body exceeds `max_body_size` with `413 Payload Too
+Large`. A declared `Content-Length` is rejected immediately; chunked or lying
+bodies are caught by counting streamed bytes.
+
+#### WebSocket Support (enable_websocket)
+```yaml
+routes:
+  - id: "ws-route"
+    uri: /ws/*
+    enable_websocket: true         # Keep upstream timeouts disabled for upgrades
+    upstream:
+      nodes:
+        "ws-backend.example.com:8080": 1
+```
+
+When enabled (or when a request carries an `Upgrade` header), upstream
+read/write timeouts are disabled so long-lived bidirectional WebSocket
+connections are not killed while idle.
 - Testing timeout handling and retry logic
 - Load testing under failure scenarios
 - Circuit breaker and fallback validation

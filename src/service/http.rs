@@ -21,16 +21,16 @@ use pingora_cache::{
     VarianceBuilder,
 };
 use pingora_core::upstreams::peer::HttpPeer;
-use pingora_error::{Error, Result};
+use pingora_error::{Error, ErrorSource, ErrorType, Result};
 use pingora_http::{RequestHeader, ResponseHeader};
-use pingora_proxy::{ProxyHttp, Session};
+use pingora_proxy::{FailToProxy, ProxyHttp, Session};
 use prometheus::{register_int_counter_vec, IntCounterVec};
 
 use crate::{
     config::{self, CacheDefaults},
     core::{
-        CompiledPluginPipeline, ProxyContext, ProxyError, ProxyPluginExecutor, RouteContext,
-        UpstreamSelection,
+        CompiledPluginPipeline, PassiveOutcome, ProxyContext, ProxyError, ProxyPluginExecutor,
+        RouteContext, UpstreamSelection,
     },
     plugins::cache::{self, CacheSettings, CTX_KEY_CACHE_SETTINGS},
     proxy::runtime::RUNTIME,
@@ -41,6 +41,24 @@ pub(crate) fn headers_indicate_shared_cache_credentials(headers: &http::HeaderMa
     headers.contains_key("authorization")
         || headers.contains_key("proxy-authorization")
         || headers.contains_key("cookie")
+}
+
+/// A WebSocket upgrade is trusted only when both RFC 7230/6455 handshake
+/// headers are present. In particular, an arbitrary `Upgrade` header must not
+/// alter upstream timeout behavior.
+fn is_websocket_upgrade(headers: &http::HeaderMap) -> bool {
+    let connection_has_upgrade = headers
+        .get_all(http::header::CONNECTION)
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .flat_map(|value| value.split(','))
+        .any(|token| token.trim().eq_ignore_ascii_case("upgrade"));
+    let upgrade_is_websocket = headers
+        .get_all(http::header::UPGRADE)
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .any(|value| value.trim().eq_ignore_ascii_case("websocket"));
+    connection_has_upgrade && upgrade_is_websocket
 }
 
 static CACHE_REQUESTS: Lazy<IntCounterVec> = Lazy::new(|| {
@@ -203,12 +221,17 @@ impl ProxyHttp for HttpService {
             let mut peer = backend
                 .ext
                 .get_mut::<HttpPeer>()
-                .ok_or_else(|| ProxyError::Internal("Peer missing".into()))
-                .map(|p| Box::new(p.clone()))?;
+                .ok_or_else(|| ProxyError::Internal("Peer missing".into()))?
+                .clone();
             if let Some(route) = ctx.route.as_ref() {
                 crate::proxy::route::apply_route_timeout(route.timeout(), &mut peer);
             }
-            UpstreamSelection { peer, upstream }
+            let selected_backend = backend.clone();
+            UpstreamSelection {
+                peer: Box::new(peer),
+                upstream,
+                backend: selected_backend,
+            }
         } else {
             let route = ctx
                 .route
@@ -217,8 +240,23 @@ impl ProxyHttp for HttpService {
             route.select_upstream(session)?
         };
 
-        let peer = selection.peer.clone();
+        let mut peer = selection.peer.clone();
         ctx.selected = Some(selection);
+
+        // Long-lived WebSocket streams may legitimately be idle. Only relax
+        // upstream timeouts for an explicitly enabled route and a complete,
+        // trusted WebSocket upgrade handshake.
+        let websocket_enabled = ctx
+            .route
+            .as_ref()
+            .map(|route| route.enable_websocket())
+            .unwrap_or(false);
+        if websocket_enabled && is_websocket_upgrade(&session.req_header().headers) {
+            peer.options.read_timeout = None;
+            peer.options.write_timeout = None;
+            log::debug!("WebSocket request: disabled upstream read/write timeouts");
+        }
+
         Ok(peer)
     }
 
@@ -262,6 +300,15 @@ impl ProxyHttp for HttpService {
         upstream_response: &mut ResponseHeader,
         ctx: &mut Self::CTX,
     ) -> Result<()> {
+        // Passive health check: observe the real-traffic response status
+        // (APISIX `checks.passive` unhealthy/healthy counters).
+        if let Some(selected) = ctx.selected.as_ref() {
+            selected.upstream.observe_passive(
+                &selected.backend,
+                PassiveOutcome::Http(upstream_response.status.as_u16()),
+            );
+        }
+
         // Add X-Cache-Status header logic
         if let Some(settings) = ctx.get::<Arc<CacheSettings>>(CTX_KEY_CACHE_SETTINGS) {
             let cache_phase = session.cache.phase();
@@ -300,8 +347,80 @@ impl ProxyHttp for HttpService {
         Ok(None)
     }
 
+    /// Stream request body chunks through plugin request-body filters
+    /// (e.g. client-control size enforcement).
+    async fn request_body_filter(
+        &self,
+        session: &mut Session,
+        body: &mut Option<Bytes>,
+        end_of_stream: bool,
+        ctx: &mut Self::CTX,
+    ) -> Result<()> {
+        let pipeline = ctx.pipeline.clone();
+        pipeline
+            .request_body_filter(session, body, end_of_stream, ctx)
+            .await
+    }
+
+    /// Map plugin-raised body errors to client-facing status codes; otherwise
+    /// mirror Pingora's default error-code derivation.
+    async fn fail_to_proxy(
+        &self,
+        session: &mut Session,
+        e: &Error,
+        _ctx: &mut Self::CTX,
+    ) -> FailToProxy {
+        let code = match e.etype() {
+            ErrorType::Custom(custom)
+                if *custom == crate::plugins::client_control::ERROR_PAYLOAD_TOO_LARGE =>
+            {
+                StatusCode::PAYLOAD_TOO_LARGE.as_u16()
+            }
+            _ => {
+                if let ErrorType::HTTPStatus(code) = e.etype() {
+                    *code
+                } else {
+                    match e.esource() {
+                        ErrorSource::Upstream => 502,
+                        ErrorSource::Downstream => match e.etype() {
+                            ErrorType::WriteError
+                            | ErrorType::ReadError
+                            | ErrorType::ConnectionClosed => {
+                                // connection already dead
+                                0
+                            }
+                            _ => 400,
+                        },
+                        ErrorSource::Internal | ErrorSource::Unset => 500,
+                    }
+                }
+            }
+        };
+        if code > 0 {
+            session.respond_error(code).await.unwrap_or_else(|err| {
+                log::error!("failed to send error response to downstream: {err}");
+            });
+        }
+
+        FailToProxy {
+            error_code: code,
+            // default to no reuse, which is safest
+            can_reuse_downstream: false,
+        }
+    }
+
+    /// Intercept `PURGE` requests to delete the matching cache entry
+    /// (Guide L46 / APISIX proxy-cache purge semantics). The cache plugin
+    /// enables the cache for PURGE requests and the key callback maps PURGE
+    /// onto the GET key, so this short-circuits before any upstream fetch.
+    fn is_purge(&self, session: &Session, ctx: &Self::CTX) -> bool {
+        session.req_header().method.as_str() == "PURGE"
+            && ctx
+                .get::<Arc<CacheSettings>>(CTX_KEY_CACHE_SETTINGS)
+                .is_some()
+    }
+
     fn request_cache_filter(&self, session: &mut Session, ctx: &mut Self::CTX) -> Result<()> {
-        // Check for cache bypass headers (optimized to avoid repeated map lookups)
         let headers = &session.req_header().headers;
 
         if headers.contains_key("x-bypass-cache") {
@@ -361,7 +480,14 @@ impl ProxyHttp for HttpService {
             .get(http::header::HOST)
             .and_then(|v| v.to_str().ok())
             .unwrap_or("");
-        let primary = format!("{} {} {}", req.method, host, req.uri);
+        // PURGE requests must compute the same key as the cached GET/HEAD so
+        // the delete hits the entry (APISIX proxy-cache keys exclude the method).
+        let method = if req.method.as_str() == "PURGE" {
+            "GET"
+        } else {
+            req.method.as_str()
+        };
+        let primary = format!("{method} {} {}", host, req.uri);
 
         let route_fp = ctx
             .route
@@ -501,6 +627,33 @@ impl ProxyHttp for HttpService {
         pipeline.logging(session, e, ctx).await;
     }
 
+    /// Observe only genuine post-connect upstream transport failures. Connection
+    /// failures are observed in `fail_to_connect`, avoiding double counting.
+    fn error_while_proxy(
+        &self,
+        _peer: &HttpPeer,
+        _session: &mut Session,
+        e: Box<Error>,
+        ctx: &mut Self::CTX,
+        _client_reused: bool,
+    ) -> Box<Error> {
+        if *e.esource() == ErrorSource::Upstream {
+            if let Some(selected) = ctx.selected.as_ref() {
+                let outcome = match e.etype() {
+                    ErrorType::ReadTimedout | ErrorType::WriteTimedout => PassiveOutcome::Timeout,
+                    ErrorType::ReadError | ErrorType::WriteError | ErrorType::ConnectionClosed => {
+                        PassiveOutcome::TcpFailure
+                    }
+                    _ => return e,
+                };
+                selected
+                    .upstream
+                    .observe_passive(&selected.backend, outcome);
+            }
+        }
+        e
+    }
+
     /// This filter is called when there is an error in the process of establishing a connection to the upstream.
     fn fail_to_connect(
         &self,
@@ -510,6 +663,22 @@ impl ProxyHttp for HttpService {
         mut e: Box<Error>,
     ) -> Box<Error> {
         if let Some(selected) = ctx.selected.as_ref() {
+            let outcome = match e.etype() {
+                ErrorType::ConnectTimedout | ErrorType::TLSHandshakeTimedout => {
+                    Some(PassiveOutcome::Timeout)
+                }
+                ErrorType::ConnectRefused
+                | ErrorType::ConnectNoRoute
+                | ErrorType::ConnectError
+                | ErrorType::TLSHandshakeFailure
+                | ErrorType::HandshakeError => Some(PassiveOutcome::TcpFailure),
+                _ => None,
+            };
+            if let Some(outcome) = outcome {
+                selected
+                    .upstream
+                    .observe_passive(&selected.backend, outcome);
+            }
             if let Some(retries) = selected.upstream.get_retries() {
                 if retries > 0 && ctx.tries < retries {
                     let within_timeout = match selected.upstream.get_retry_timeout() {
@@ -637,6 +806,22 @@ mod tests {
         headers.clear();
         headers.insert("cookie", "a=b".parse().unwrap());
         assert!(headers_indicate_shared_cache_credentials(&headers));
+    }
+
+    #[test]
+    fn websocket_upgrade_requires_both_handshake_headers() {
+        let mut headers = http::HeaderMap::new();
+        headers.insert(http::header::UPGRADE, "websocket".parse().unwrap());
+        assert!(!is_websocket_upgrade(&headers));
+
+        headers.insert(
+            http::header::CONNECTION,
+            "keep-alive, Upgrade".parse().unwrap(),
+        );
+        assert!(is_websocket_upgrade(&headers));
+
+        headers.insert(http::header::UPGRADE, "h2c".parse().unwrap());
+        assert!(!is_websocket_upgrade(&headers));
     }
 
     #[test]

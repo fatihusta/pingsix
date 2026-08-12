@@ -334,7 +334,15 @@ impl ProxyPlugin for PluginCache {
         let method = &session.req_header().method;
         let path = session.req_header().uri.path();
 
-        // 1. Check if method is cacheable
+        // 1. PURGE requests must enable the cache too: `is_purge` needs the
+        //    cache enabled with a matching key to delete the entry (Guide L46).
+        if method.as_str() == "PURGE" {
+            ctx.set(CTX_KEY_CACHE_SETTINGS, self.cache_settings.clone());
+            log::trace!("Cache enabled for PURGE {path}");
+            return Ok(false);
+        }
+
+        // 2. Check if method is cacheable
         if !self.methods.contains(method) {
             log::trace!("Method {method} not cacheable, skipping cache");
             return Ok(false);

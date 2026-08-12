@@ -15,54 +15,12 @@ pub fn request_selector_key<'a>(
     key: &str,
 ) -> Cow<'a, str> {
     match hash_on {
-        UpstreamHashOn::VARS => handle_vars(session, key),
+        UpstreamHashOn::VARS => resolve_var(session, key),
         UpstreamHashOn::HEAD => {
             Cow::Borrowed(get_req_header_value(session.req_header(), key).unwrap_or_default())
         }
         UpstreamHashOn::COOKIE => {
             Cow::Borrowed(get_cookie_value(session.req_header(), key).unwrap_or_default())
-        }
-    }
-}
-
-/// Handles variable-based request selection by interpreting predefined variable names.
-///
-/// Supports variables like request URI components, client/server addresses, and query arguments (`arg_*`).
-fn handle_vars<'a>(session: &'a mut Session, key: &str) -> Cow<'a, str> {
-    // Handle query arguments prefixed with "arg_"
-    if let Some(name) = key.strip_prefix("arg_") {
-        return Cow::Borrowed(get_query_value(session.req_header(), name).unwrap_or_default());
-    }
-
-    // Handle predefined variable names
-    match key {
-        "uri" => Cow::Borrowed(session.req_header().uri.path()),
-        "request_uri" => Cow::Borrowed(
-            session
-                .req_header()
-                .uri
-                .path_and_query()
-                .map_or_else(|| session.req_header().uri.path(), |pq| pq.as_str()),
-        ),
-        "query_string" => Cow::Borrowed(session.req_header().uri.query().unwrap_or_default()),
-        "remote_addr" => session
-            .client_addr()
-            .and_then(|addr| addr.as_inet())
-            .map_or_else(
-                || Cow::Borrowed(""),
-                |inet| Cow::Owned(inet.ip().to_string()),
-            ),
-        "remote_port" => session
-            .client_addr()
-            .and_then(|s| s.as_inet())
-            .map_or_else(|| Cow::Borrowed(""), |i| Cow::Owned(i.port().to_string())),
-        "server_addr" => session
-            .server_addr()
-            .map_or_else(|| Cow::Borrowed(""), |addr| Cow::Owned(addr.to_string())),
-        // Add other variables here if needed
-        _ => {
-            log::debug!("Unsupported variable key for hashing: {key}");
-            Cow::Borrowed("")
         }
     }
 }
@@ -202,6 +160,120 @@ pub fn remove_cookie_from_header(
     Ok(())
 }
 
+/// Resolve an APISIX limiter key. A `var` key is exactly one variable;
+/// `var_combination` renders `$name` / `${name}` placeholders while retaining
+/// all literal text (including separators next to missing variables).
+///
+/// APISIX falls back to `remote_addr` when the configured key is unavailable.
+pub fn apisix_key(session: &mut Session, key: &str, var_combination: bool) -> Cow<'static, str> {
+    let value = if var_combination {
+        render_apisix_template(key, |name| resolve_var(session, name).into_owned())
+    } else {
+        resolve_var(session, key.trim_start_matches('$')).into_owned()
+    };
+    if value.is_empty() {
+        resolve_var(session, "remote_addr").into_owned().into()
+    } else {
+        Cow::Owned(value)
+    }
+}
+
+/// Render an APISIX nginx-variable template. Kept independent of `Session` so
+/// plugins that need templates can share the exact parser and it is unit-testable.
+pub fn render_apisix_template<F>(template: &str, mut resolve: F) -> String
+where
+    F: FnMut(&str) -> String,
+{
+    let mut rendered = String::with_capacity(template.len());
+    let mut chars = template.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if ch != '$' {
+            rendered.push(ch);
+            continue;
+        }
+        let name = if chars.peek() == Some(&'{') {
+            chars.next();
+            let mut name = String::new();
+            for ch in chars.by_ref() {
+                if ch == '}' {
+                    break;
+                }
+                name.push(ch);
+            }
+            name
+        } else {
+            let mut name = String::new();
+            while matches!(chars.peek(), Some(ch) if ch.is_ascii_alphanumeric() || *ch == '_') {
+                name.push(chars.next().expect("peeked character exists"));
+            }
+            name
+        };
+        if name.is_empty() {
+            rendered.push('$');
+        } else {
+            rendered.push_str(&resolve(&name));
+        }
+    }
+    rendered
+}
+
+/// Render an APISIX nginx-variable template against the live request.
+///
+/// Variable names use the same resolution as [`apisix_key`]: `arg_*`, `http_*`,
+/// and the predefined nginx-style names. Literals without `$` are returned
+/// verbatim, so header values like `"30"` survive unchanged.
+pub fn render_apisix_request_template(session: &mut Session, template: &str) -> String {
+    render_apisix_template(template, |name| resolve_var(session, name).into_owned())
+}
+
+/// Resolve a single nginx-style variable name to a request-derived value.
+///
+/// Backs both upstream hashing (`UpstreamHashOn::VARS`) and APISIX-style
+/// limiter keys. Supports `arg_*` query arguments, `http_*` headers (nginx
+/// naming: `X-Custom-Id` -> `http_x_custom_id`), and the predefined names
+/// `uri`, `request_uri`, `query_string`, `remote_addr`, `remote_port`,
+/// `server_addr`, `host`.
+///
+/// Unknown variables resolve to an empty string so a missing value never
+/// panics; callers decide whether an empty key means "no limit" or "deny".
+fn resolve_var<'a>(session: &'a mut Session, name: &str) -> Cow<'a, str> {
+    if let Some(arg) = name.strip_prefix("arg_") {
+        return Cow::Borrowed(get_query_value(session.req_header(), arg).unwrap_or_default());
+    }
+    if let Some(header) = name.strip_prefix("http_") {
+        // nginx normalizes header names: `X-Custom-Id` -> `http_x_custom_id`
+        let header_name = header.replace('_', "-");
+        return Cow::Borrowed(
+            get_req_header_value(session.req_header(), &header_name).unwrap_or_default(),
+        );
+    }
+    match name {
+        "uri" => Cow::Borrowed(session.req_header().uri.path()),
+        "request_uri" => Cow::Borrowed(
+            session
+                .req_header()
+                .uri
+                .path_and_query()
+                .map_or_else(|| session.req_header().uri.path(), |pq| pq.as_str()),
+        ),
+        "query_string" => Cow::Borrowed(session.req_header().uri.query().unwrap_or_default()),
+        "remote_addr" => get_direct_client_ip(session)
+            .map_or_else(|| Cow::Borrowed(""), |ip| Cow::Owned(ip.to_string())),
+        "remote_port" => session
+            .client_addr()
+            .and_then(|s| s.as_inet())
+            .map_or_else(|| Cow::Borrowed(""), |i| Cow::Owned(i.port().to_string())),
+        "server_addr" => session
+            .server_addr()
+            .map_or_else(|| Cow::Borrowed(""), |addr| Cow::Owned(addr.to_string())),
+        "host" => Cow::Borrowed(get_request_host(session.req_header()).unwrap_or_default()),
+        _ => {
+            log::debug!("Unsupported variable key: {name}");
+            Cow::Borrowed("")
+        }
+    }
+}
+
 /// Retrieves the request host (domain name) from the request header.
 ///
 /// Prefers the host from the URI, falls back to the `Host` header.
@@ -250,6 +322,17 @@ pub fn get_direct_client_ip(session: &Session) -> Option<IpAddr> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn renders_var_combinations_without_removing_literal_separators() {
+        assert_eq!(
+            render_apisix_template("$name:${missing}/${name}", |name| match name {
+                "name" => "alice".to_string(),
+                _ => String::new(),
+            }),
+            "alice:/alice"
+        );
+    }
 
     #[test]
     fn removes_named_cookie_from_every_cookie_header() {

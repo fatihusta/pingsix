@@ -13,10 +13,10 @@ PingSIX is a modern API gateway designed for cloud-native environments, offering
 - 🚀 **High Performance**: Built with Rust and Tokio for exceptional throughput and low latency
 - 🔄 **Dynamic Configuration**: Real-time configuration updates via etcd integration
 - 🛣️ **Advanced Routing**: Flexible request matching based on host, path, methods, and priorities
-- 🔌 **Rich Plugin Ecosystem**: 20 built-in plugins with easy extensibility
+- 🔌 **Rich Plugin Ecosystem**: 25 built-in plugins with easy extensibility
 - 📊 **Observability**: Built-in Prometheus metrics and Sentry integration
-- 🔒 **Security**: JWT/API key authentication, IP restrictions, CORS support
-- ⚡ **Load Balancing**: Multiple algorithms with active health checking
+- 🔒 **Security**: JWT/API key authentication, IP restrictions, CORS support, circuit breaking
+- ⚡ **Load Balancing**: Multiple algorithms with active and passive health checking
 - 🌐 **SSL/TLS**: Dynamic certificate loading with SNI support
 - 📝 **Admin API**: RESTful API compatible with Apache APISIX specification
 
@@ -97,11 +97,16 @@ PingSIX includes 20 built-in plugins organized by category:
 
 ### 🚦 Traffic Management
 - **`limit-count`** - Request rate limiting with flexible keys
+- **`limit-req`** - Leaky bucket rate limiting with burst queueing
+- **`limit-conn`** - Concurrent request limiting with burst delay
 - **`traffic-split`** - A/B testing and canary deployments with weighted traffic distribution
+- **`proxy-mirror`** - Asynchronous request mirroring to shadow upstreams
+- **`api-breaker`** - Circuit breaking with exponential backoff recovery
 - **`proxy-rewrite`** - Request modification
 - **`response-rewrite`** - Response headers modification
 - **`redirect`** - HTTP redirects with regex support
-- **`cache`** - Response caching with TTL and conditions
+- **`cache`** - Response caching with TTL, PURGE, and conditions
+- **`client-control`** - Request body size limiting (413 enforcement)
 
 ### 📊 Observability
 - **`prometheus`** - Metrics collection and exposition

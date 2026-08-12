@@ -22,6 +22,18 @@ use pingora_load_balancing::Backend;
 // UPSTREAM & ROUTE TRAITS (defined here to avoid circular deps with context)
 // =============================================================================
 
+/// Outcome of a completed real-traffic interaction, used by passive health
+/// checking (APISIX `checks.passive`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PassiveOutcome {
+    /// TCP connect/read/write failure (not a timeout).
+    TcpFailure,
+    /// Connect or read timeout.
+    Timeout,
+    /// Upstream responded with the given HTTP status code.
+    Http(u16),
+}
+
 /// Abstract trait for upstream backend selection
 ///
 /// Decouples route logic from specific upstream implementations, enabling
@@ -30,6 +42,11 @@ use pingora_load_balancing::Backend;
 pub trait UpstreamSelector: Send + Sync {
     /// Select a backend for the given session
     fn select_backend(&self, session: &mut Session) -> Option<Backend>;
+
+    /// Observe a completed real-traffic outcome for passive health checking.
+    /// Default is a no-op; upstreams without a `checks.passive` config ignore
+    /// observations.
+    fn observe_passive(&self, _backend: &Backend, _outcome: PassiveOutcome) {}
 
     /// Get the number of retries configured for this upstream
     fn get_retries(&self) -> Option<usize>;
@@ -58,6 +75,9 @@ pub trait UpstreamSelector: Send + Sync {
 pub struct UpstreamSelection {
     pub peer: Box<HttpPeer>,
     pub upstream: Arc<dyn UpstreamSelector>,
+    /// The concrete backend chosen for this request. Used for passive health
+    /// checking and observability.
+    pub backend: Backend,
 }
 
 /// Trait for route behavior that can be used in proxy context
@@ -80,6 +100,11 @@ pub trait RouteContext: Send + Sync {
 
     /// Return the configured URI template used to match this route.
     fn uri_template(&self) -> Option<&str>;
+
+    /// Whether WebSocket upgrade requests are enabled for this route.
+    fn enable_websocket(&self) -> bool {
+        false
+    }
 
     /// Select an upstream peer for the route, compiling the selection artifact
     /// (peer plus owning selector) used by all downstream callbacks.
@@ -316,6 +341,22 @@ pub trait ProxyPlugin: Send + Sync {
     /// configured plugin needs it.
     fn has_response_body_filter(&self) -> bool {
         false
+    }
+
+    /// Handle request body chunks as they stream from the downstream.
+    ///
+    /// Use this for: WAF inspection, upload size limits, and body validation.
+    /// Return an error to abort the request (mapped by the service's
+    /// `fail_to_proxy`, e.g. `PayloadTooLarge` -> 413). Corresponds to
+    /// APISIX's body inspection during the request phase.
+    async fn request_body_filter(
+        &self,
+        _session: &mut Session,
+        _body: &mut Option<Bytes>,
+        _end_of_stream: bool,
+        _ctx: &mut ProxyContext,
+    ) -> Result<()> {
+        Ok(())
     }
 
     /// Handle the response body chunks
@@ -580,6 +621,17 @@ impl ProxyPlugin for ProxyPluginExecutor {
         Ok(())
     }
 
+    async fn request_body_filter(
+        &self,
+        session: &mut Session,
+        body: &mut Option<Bytes>,
+        end_of_stream: bool,
+        ctx: &mut ProxyContext,
+    ) -> Result<()> {
+        for_each_plugin_async!(self, request_body_filter, session, body, end_of_stream, ctx);
+        Ok(())
+    }
+
     fn response_body_filter(
         &self,
         session: &mut Session,
@@ -717,6 +769,22 @@ impl CompiledPluginPipeline {
             .response_body_filter(session, body, end_of_stream, ctx)?;
         self.route
             .response_body_filter(session, body, end_of_stream, ctx)
+    }
+
+    /// Run global-rule plugins then route/service plugins for `request_body_filter`.
+    pub async fn request_body_filter(
+        &self,
+        session: &mut Session,
+        body: &mut Option<Bytes>,
+        end_of_stream: bool,
+        ctx: &mut ProxyContext,
+    ) -> Result<()> {
+        self.global
+            .request_body_filter(session, body, end_of_stream, ctx)
+            .await?;
+        self.route
+            .request_body_filter(session, body, end_of_stream, ctx)
+            .await
     }
 
     /// Run global-rule plugins then route/service plugins for `logging`.

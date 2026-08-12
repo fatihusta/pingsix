@@ -16,6 +16,6 @@ pub use error::{ErrorContext, ProxyError, ProxyResult};
 pub use plugin::{
     apply_regex_uri_template, constant_time_digest_eq, constant_time_eq, secret_digest,
     sort_plugins_by_priority_desc, CompiledPluginPipeline, HealthCheckFingerprint, HealthCheckSpec,
-    PluginCreateFn, ProxyContext, ProxyPlugin, ProxyPluginExecutor, RouteContext,
+    PassiveOutcome, PluginCreateFn, ProxyContext, ProxyPlugin, ProxyPluginExecutor, RouteContext,
     UpstreamSelection, UpstreamSelector,
 };

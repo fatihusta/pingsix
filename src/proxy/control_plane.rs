@@ -655,6 +655,7 @@ mod tests {
                 upstream_id: Some("missing".into()),
                 service_id: None,
                 timeout: None,
+                enable_websocket: false,
             },
         );
         assert!(validate_config_set(&set).is_err());
@@ -681,6 +682,7 @@ mod tests {
                 upstream_id: Some("u1".into()),
                 service_id: Some("missing".into()),
                 timeout: None,
+                enable_websocket: false,
             },
         );
         assert!(validate_config_set(&set).is_err());
@@ -735,6 +737,7 @@ mod tests {
                 upstream_id: Some("u1".into()),
                 service_id: None,
                 timeout: None,
+                enable_websocket: false,
             },
         );
         let err = validate_config_set(&set).unwrap_err().to_string();
@@ -836,6 +839,7 @@ mod tests {
                 upstream_id: Some("u1".into()),
                 service_id: None,
                 timeout: None,
+                enable_websocket: false,
             },
         );
         assert!(validate_config_set(&set).is_ok());
@@ -876,6 +880,7 @@ mod tests {
                 upstream_id: Some("u1".into()),
                 service_id: None,
                 timeout: None,
+                enable_websocket: false,
             },
         );
         assert!(validate_config_set(&set).is_err());
@@ -913,6 +918,7 @@ mod tests {
                 upstream_id: Some("u1".into()),
                 service_id: Some("s1".into()),
                 timeout: None,
+                enable_websocket: false,
             },
         );
         assert!(validate_config_set(&set).is_ok());
@@ -937,6 +943,7 @@ mod tests {
             upstream_id: None,
             service_id: None,
             timeout: None,
+            enable_websocket: false,
         }
     }
 
@@ -1063,6 +1070,7 @@ mod tests {
                 upstream_id: None,
                 service_id: Some("s1".into()),
                 timeout: None,
+                enable_websocket: false,
             },
         );
         let previous = publish_seed(&set, 300);
@@ -1084,6 +1092,7 @@ mod tests {
                 upstream_id: None,
                 service_id: Some("s1".into()),
                 timeout: None,
+                enable_websocket: false,
             },
         );
         let plan = CandidatePlan::build(&next, &previous).unwrap();

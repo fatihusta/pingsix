@@ -1,4 +1,9 @@
-use std::{borrow::Cow, sync::Arc, time::Duration};
+use std::{
+    borrow::Cow,
+    collections::HashMap,
+    sync::{Arc, Mutex},
+    time::{Duration, Instant},
+};
 
 use futures::FutureExt;
 use http::Uri;
@@ -17,7 +22,7 @@ use pingora_proxy::Session;
 
 use crate::{
     config::{self, Identifiable},
-    core::{ProxyError, ProxyResult, UpstreamSelector},
+    core::{PassiveOutcome, ProxyError, ProxyResult, UpstreamSelector},
     proxy::upstream::selection,
     utils::request::request_selector_key,
 };
@@ -50,6 +55,151 @@ pub struct ProxyUpstream {
     lb: SelectionLB,
     /// Stable fingerprint of origin-identity fields used for cache namespacing.
     cache_origin_fingerprint: u64,
+    /// Passive health-check counters keyed by backend hash (APISIX `checks.passive`).
+    passive: Option<PassiveHealthState>,
+}
+
+/// Per-upstream passive health-check state: real-traffic failure counters per
+/// backend with independent thresholds for HTTP failures, TCP failures, and
+/// timeouts (APISIX `resty.healthcheck` semantics).
+struct PassiveHealthState {
+    config: config::PassiveCheck,
+    counters: Mutex<HashMap<String, PassiveCounters>>,
+    #[cfg(test)]
+    on_transition: Option<Box<dyn Fn(bool) + Send + Sync>>,
+}
+
+/// A half-open probe reservation expires if no observation arrives within this
+/// window. Without it, a request selected as a probe but cancelled before
+/// `observe()` (plugin error, disconnect, unclassified upstream error) would
+/// pin the node permanently and block recovery.
+const PROBE_LEASE: Duration = Duration::from_secs(30);
+
+#[derive(Default)]
+struct PassiveCounters {
+    http_failures: u32,
+    tcp_failures: u32,
+    timeouts: u32,
+    successes: u32,
+    /// Node currently disabled by passive checking. It remains enabled in
+    /// Pingora so this layer can send controlled half-open probes.
+    tripped: bool,
+    /// Deadline of the in-flight half-open probe; `None` when no probe is
+    /// reserved. Expired leases are treated as free.
+    probe_lease: Option<Instant>,
+}
+
+impl PassiveHealthState {
+    fn observe(&self, backend: &Backend, outcome: PassiveOutcome) {
+        let mut counters = self.counters.lock().unwrap_or_else(|e| e.into_inner());
+        let node = counters.entry(backend.addr.to_string()).or_default();
+
+        let unhealthy = &self.config.unhealthy;
+        let healthy_statuses = &self.config.healthy.http_statuses;
+
+        match outcome {
+            PassiveOutcome::TcpFailure => {
+                node.tcp_failures += 1;
+                node.http_failures = 0;
+                node.timeouts = 0;
+                node.successes = 0;
+                if unhealthy.tcp_failures > 0 && node.tcp_failures >= unhealthy.tcp_failures {
+                    node.tripped = true;
+                    #[cfg(test)]
+                    if let Some(callback) = &self.on_transition {
+                        callback(false);
+                    }
+                }
+            }
+            PassiveOutcome::Timeout => {
+                node.timeouts += 1;
+                node.http_failures = 0;
+                node.tcp_failures = 0;
+                node.successes = 0;
+                if unhealthy.timeouts > 0 && node.timeouts >= unhealthy.timeouts {
+                    node.tripped = true;
+                    #[cfg(test)]
+                    if let Some(callback) = &self.on_transition {
+                        callback(false);
+                    }
+                }
+            }
+            PassiveOutcome::Http(status) => {
+                if unhealthy.http_statuses.contains(&(status as u32)) {
+                    node.http_failures += 1;
+                    node.tcp_failures = 0;
+                    node.timeouts = 0;
+                    node.successes = 0;
+                    if unhealthy.http_failures > 0 && node.http_failures >= unhealthy.http_failures
+                    {
+                        node.tripped = true;
+                        #[cfg(test)]
+                        if let Some(callback) = &self.on_transition {
+                            callback(false);
+                        }
+                    }
+                } else if healthy_statuses.contains(&(status as u32)) {
+                    node.http_failures = 0;
+                    node.tcp_failures = 0;
+                    node.timeouts = 0;
+                    if node.tripped {
+                        node.successes += 1;
+                        if self.config.healthy.successes > 0
+                            && node.successes >= self.config.healthy.successes
+                        {
+                            node.tripped = false;
+                            node.successes = 0;
+                            #[cfg(test)]
+                            if let Some(callback) = &self.on_transition {
+                                callback(true);
+                            }
+                        }
+                    }
+                }
+                // Status codes in neither set are ignored (APISIX behavior).
+            }
+        }
+        // Every outcome completes a half-open probe. Unknown HTTP statuses do
+        // not affect counters but must free the probe lease.
+        node.probe_lease = None;
+    }
+
+    /// Admit normal traffic only to nodes that passive checking has not tripped.
+    fn allows_regular(&self, backend: &Backend) -> bool {
+        !self
+            .counters
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&backend.addr.to_string())
+            .is_some_and(|node| node.tripped)
+    }
+
+    /// Whether any tracked node is currently passive-tripped. Used to decide
+    /// between half-open probing and the all-unready active fallback.
+    fn has_tripped(&self) -> bool {
+        self.counters
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .values()
+            .any(|node| node.tripped)
+    }
+
+    /// Admit at most one half-open request to a tripped node until its probe
+    /// lease expires. Called only after no regular ready node was selectable,
+    /// so healthy nodes always continue to receive normal traffic.
+    fn take_probe(&self, backend: &Backend, now: Instant) -> bool {
+        let mut counters = self.counters.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(node) = counters.get_mut(&backend.addr.to_string()) else {
+            return false;
+        };
+        let lease_free = node.probe_lease.map(|d| d <= now).unwrap_or(true);
+        if node.tripped && lease_free {
+            node.probe_lease = Some(now + PROBE_LEASE);
+            true
+        } else {
+            false
+        }
+    }
 }
 
 /// Fingerprint of every upstream field that can change which origin is contacted
@@ -134,10 +284,25 @@ impl ProxyUpstream {
             ProxyError::Configuration(format!("Failed to create load balancer: {e}"))
         })?;
 
+        // Passive state intentionally does not call `Backends::set_enable`:
+        // Pingora has no half-open transition for manually disabled backends.
+        // Keeping its health intact lets selection issue our controlled probes.
+        let passive = upstream
+            .checks
+            .as_ref()
+            .and_then(|c| c.passive.clone())
+            .map(|config| PassiveHealthState {
+                config,
+                counters: Mutex::new(HashMap::new()),
+                #[cfg(test)]
+                on_transition: None,
+            });
+
         Ok(ProxyUpstream {
             inner: upstream,
             lb,
             cache_origin_fingerprint,
+            passive,
         })
     }
 
@@ -147,10 +312,52 @@ impl ProxyUpstream {
         with_lb!(&self.lb, |lb| lb.upstreams.clone())
     }
 
+    fn select_with_passive(&self, key: &[u8]) -> Option<Backend> {
+        // 1. Prefer actively-ready nodes that passive checking has not tripped.
+        let regular = |backend: &Backend| {
+            self.passive
+                .as_ref()
+                .is_none_or(|passive| passive.allows_regular(backend))
+        };
+        if let Some(backend) = with_lb!(&self.lb, |lb| {
+            lb.upstreams
+                .select_with(key, MAX_LB_ITERATIONS, |backend, ready| {
+                    ready && regular(backend)
+                })
+        }) {
+            return Some(backend);
+        }
+
+        // 2. No regular candidate remains. If passive checking has tripped any
+        //    node, admit one half-open probe among tripped-but-actively-ready
+        //    nodes. Healthy nodes always keep receiving normal traffic.
+        let now = Instant::now();
+        if self.passive.as_ref().is_some_and(|passive| passive.has_tripped()) {
+            if let Some(backend) = with_lb!(&self.lb, |lb| {
+                lb.upstreams
+                    .select_with(key, MAX_LB_ITERATIONS, |backend, ready| {
+                        ready
+                            && self
+                                .passive
+                                .as_ref()
+                                .is_some_and(|passive| passive.take_probe(backend, now))
+                    })
+            }) {
+                return Some(backend);
+            }
+        }
+
+        // 3. All-unready fallback: preserve APISIX/Pingora behavior of serving
+        //    from the highest-priority backend when nothing is healthy. This
+        //    also covers the case where passive is configured but no node is
+        //    tripped, so active health semantics are not broken.
+        with_lb!(&self.lb, |lb| lb.select(key))
+    }
+
     /// Test helper: select a backend without a full proxy session.
     #[cfg(test)]
     pub(crate) fn select_backend_for_test(&self) -> Option<Backend> {
-        let mut backend = with_lb!(&self.lb, |lb| lb.select(b""));
+        let mut backend = self.select_with_passive(b"");
         if let Some(backend) = backend.as_mut() {
             if let Some(peer) = backend.ext.get_mut::<HttpPeer>() {
                 self.set_timeout(peer);
@@ -185,12 +392,11 @@ impl ProxyUpstream {
 // Implementation of UpstreamSelector trait for decoupling from core module
 impl UpstreamSelector for ProxyUpstream {
     fn select_backend(&self, session: &mut Session) -> Option<Backend> {
-        let mut backend = match &self.lb {
-            SelectionLB::RoundRobin(lb) => lb.select(b""),
-            SelectionLB::Random(lb) => lb.select(b""),
-            SelectionLB::Fnv(lb) => lb.select(self.hash_key(session).as_bytes()),
-            SelectionLB::Ketama(lb) => lb.select(self.hash_key(session).as_bytes()),
+        let key = match &self.lb {
+            SelectionLB::RoundRobin(_) | SelectionLB::Random(_) => Cow::Borrowed(""),
+            SelectionLB::Fnv(_) | SelectionLB::Ketama(_) => self.hash_key(session),
         };
+        let mut backend = self.select_with_passive(key.as_bytes());
 
         if let Some(backend) = backend.as_mut() {
             if let Some(peer) = backend.ext.get_mut::<HttpPeer>() {
@@ -225,6 +431,12 @@ impl UpstreamSelector for ProxyUpstream {
 
     fn cache_isolation_key(&self) -> String {
         format!("{:x}", self.cache_origin_fingerprint)
+    }
+
+    fn observe_passive(&self, backend: &Backend, outcome: PassiveOutcome) {
+        if let Some(passive) = &self.passive {
+            passive.observe(backend, outcome);
+        }
     }
 }
 
@@ -281,22 +493,25 @@ where
         );
 
         if let Some(check) = upstream.checks {
-            let health_check: Box<dyn HealthCheckTrait + Send + Sync + 'static> =
-                check.clone().try_into().map_err(|e| {
-                    ProxyError::Configuration(format!(
-                        "Upstream '{}' has an invalid health check configuration: {e}",
-                        upstream.id
-                    ))
-                })?;
-            upstreams.set_health_check(health_check);
+            // Active probing is optional: a passive-only `checks` block must
+            // not register an active health checker or pollute its frequency.
+            if let Some(active) = check.active.clone() {
+                let health_check_frequency = active
+                    .healthy
+                    .as_ref()
+                    .map(|healthy| Duration::from_secs(healthy.interval as _))
+                    .unwrap_or(Duration::from_secs(1));
+                let health_check: Box<dyn HealthCheckTrait + Send + Sync + 'static> =
+                    active.try_into().map_err(|e| {
+                        ProxyError::Configuration(format!(
+                            "Upstream '{}' has an invalid health check configuration: {e}",
+                            upstream.id
+                        ))
+                    })?;
+                upstreams.set_health_check(health_check);
 
-            let health_check_frequency = check
-                .active
-                .healthy
-                .map(|healthy| Duration::from_secs(healthy.interval as _))
-                .unwrap_or(Duration::from_secs(1));
-
-            upstreams.health_check_frequency = Some(health_check_frequency);
+                upstreams.health_check_frequency = Some(health_check_frequency);
+            }
         }
 
         if let Some(interval) = config::dns_refresh_interval() {
@@ -329,11 +544,11 @@ where
     }
 }
 
-impl TryFrom<config::HealthCheck> for Box<dyn HealthCheckTrait + Send + Sync + 'static> {
+impl TryFrom<config::ActiveCheck> for Box<dyn HealthCheckTrait + Send + Sync + 'static> {
     type Error = ProxyError;
 
-    fn try_from(value: config::HealthCheck) -> Result<Self, Self::Error> {
-        match value.active.r#type {
+    fn try_from(value: config::ActiveCheck) -> Result<Self, Self::Error> {
+        match value.r#type {
             config::ActiveCheckType::TCP => Ok(Into::<Box<TcpHealthCheck>>::into(value)),
             config::ActiveCheckType::HTTP | config::ActiveCheckType::HTTPS => {
                 Ok(Box::new(HttpHealthCheck::try_from(value)?))
@@ -342,17 +557,17 @@ impl TryFrom<config::HealthCheck> for Box<dyn HealthCheckTrait + Send + Sync + '
     }
 }
 
-impl From<config::HealthCheck> for Box<TcpHealthCheck> {
-    fn from(value: config::HealthCheck) -> Self {
+impl From<config::ActiveCheck> for Box<TcpHealthCheck> {
+    fn from(value: config::ActiveCheck) -> Self {
         let mut health_check = TcpHealthCheck::new();
         health_check.peer_template.options.total_connection_timeout =
-            Some(Duration::from_secs(value.active.timeout as _));
+            Some(Duration::from_secs(value.timeout as _));
 
-        if let Some(healthy) = value.active.healthy {
+        if let Some(healthy) = value.healthy {
             health_check.consecutive_success = healthy.successes as _;
         }
 
-        if let Some(unhealthy) = value.active.unhealthy {
+        if let Some(unhealthy) = value.unhealthy {
             health_check.consecutive_failure = unhealthy.tcp_failures as _;
         }
 
@@ -360,30 +575,30 @@ impl From<config::HealthCheck> for Box<TcpHealthCheck> {
     }
 }
 
-impl TryFrom<config::HealthCheck> for HttpHealthCheck {
+impl TryFrom<config::ActiveCheck> for HttpHealthCheck {
     type Error = ProxyError;
 
-    fn try_from(value: config::HealthCheck) -> Result<Self, Self::Error> {
-        let host = value.active.host.unwrap_or_default();
-        let tls = value.active.r#type == config::ActiveCheckType::HTTPS;
+    fn try_from(value: config::ActiveCheck) -> Result<Self, Self::Error> {
+        let host = value.host.unwrap_or_default();
+        let tls = value.r#type == config::ActiveCheckType::HTTPS;
         let mut health_check = HttpHealthCheck::new(host.as_str(), tls);
 
         // Set total connection timeout if provided
         health_check.peer_template.options.total_connection_timeout =
-            Some(Duration::from_secs(value.active.timeout as _));
+            Some(Duration::from_secs(value.timeout as _));
 
         // Set certificate verification if TLS is enabled
-        health_check.peer_template.options.verify_cert = value.active.https_verify_certificate;
+        health_check.peer_template.options.verify_cert = value.https_verify_certificate;
 
         // Build URI for HTTP health check path. A malformed path must fail
         // candidate publication rather than silently disabling the probe.
         let uri = Uri::builder()
-            .path_and_query(&value.active.http_path)
+            .path_and_query(&value.http_path)
             .build()
             .map_err(|e| {
                 ProxyError::Configuration(format!(
                     "Invalid health check path '{}': {e}",
-                    value.active.http_path
+                    value.http_path
                 ))
             })?;
         health_check.req.set_uri(uri);
@@ -391,7 +606,7 @@ impl TryFrom<config::HealthCheck> for HttpHealthCheck {
         // Insert headers; malformed entries must fail closed instead of being
         // silently dropped, otherwise probes run with a different request than
         // the operator configured.
-        for header in value.active.req_headers.iter() {
+        for header in value.req_headers.iter() {
             let mut parts = header.splitn(2, ':');
             let (key, val) = match (parts.next(), parts.next()) {
                 (Some(key), Some(val)) => (key.trim().to_string(), val.trim().to_string()),
@@ -412,12 +627,12 @@ impl TryFrom<config::HealthCheck> for HttpHealthCheck {
         }
 
         // Handle port override
-        if let Some(port) = value.active.port {
+        if let Some(port) = value.port {
             health_check.port_override = Some(port as _);
         }
 
         // Set the success conditions
-        if let Some(healthy) = value.active.healthy {
+        if let Some(healthy) = value.healthy {
             health_check.consecutive_success = healthy.successes as _;
 
             // Validator for HTTP status codes
@@ -434,7 +649,7 @@ impl TryFrom<config::HealthCheck> for HttpHealthCheck {
         }
 
         // Set the failure conditions
-        if let Some(unhealthy) = value.active.unhealthy {
+        if let Some(unhealthy) = value.unhealthy {
             health_check.consecutive_failure = unhealthy.http_failures as _;
         }
 
@@ -650,7 +865,7 @@ mod tests {
         fn upstream_with_http_path(path: &str) -> config::Upstream {
             let mut upstream = sample_upstream("hc", None);
             upstream.checks = Some(HealthCheckConfig {
-                active: ActiveCheck {
+                active: Some(ActiveCheck {
                     r#type: ActiveCheckType::HTTP,
                     timeout: 1,
                     http_path: path.to_string(),
@@ -660,7 +875,8 @@ mod tests {
                     req_headers: vec![],
                     healthy: None,
                     unhealthy: None,
-                },
+                }),
+                passive: None,
             });
             upstream
         }
@@ -677,7 +893,7 @@ mod tests {
 
         let mut malformed_header = upstream_with_http_path("/");
         if let Some(check) = malformed_header.checks.as_mut() {
-            check.active.req_headers = vec!["HeaderWithoutColon".into()];
+            check.active.as_mut().unwrap().req_headers = vec!["HeaderWithoutColon".into()];
         }
         let err = ProxyUpstream::build_static(malformed_header)
             .err()
@@ -691,7 +907,7 @@ mod tests {
         // A well-formed configuration still builds.
         let mut ok = upstream_with_http_path("/healthz");
         if let Some(check) = ok.checks.as_mut() {
-            check.active.req_headers = vec!["X-Probe: healthz".into()];
+            check.active.as_mut().unwrap().req_headers = vec!["X-Probe: healthz".into()];
         }
         ProxyUpstream::build_static(ok).expect("valid health check must build");
     }
@@ -706,7 +922,7 @@ mod tests {
         // Probe the test backend, not the sample upstream's hard-coded node.
         upstream.nodes = Nodes::from_map(HashMap::from([(addr.to_string(), 1)]));
         upstream.checks = Some(HC {
-            active: ActiveCheck {
+            active: Some(ActiveCheck {
                 r#type: ActiveCheckType::HTTP,
                 timeout: 1,
                 http_path: "/".into(),
@@ -724,7 +940,8 @@ mod tests {
                     http_failures: 1,
                     tcp_failures: 1,
                 }),
-            },
+            }),
+            passive: None,
         });
         upstream
     }
@@ -818,5 +1035,182 @@ mod tests {
 
         health_task.abort();
         backend.abort();
+    }
+}
+
+#[cfg(test)]
+mod passive_tests {
+    use super::*;
+    use crate::config::{PassiveCheck, PassiveCheckType, PassiveHealthy, PassiveUnhealthy};
+
+    fn test_state(
+        http_failures: u32,
+        tcp_failures: u32,
+        timeouts: u32,
+        successes: u32,
+    ) -> (
+        PassiveHealthState,
+        Arc<std::sync::atomic::AtomicUsize>,
+        Arc<std::sync::atomic::AtomicUsize>,
+    ) {
+        let trips = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let restores = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let trips_clone = trips.clone();
+        let restores_clone = restores.clone();
+        let state = PassiveHealthState {
+            config: PassiveCheck {
+                r#type: PassiveCheckType::HTTP,
+                healthy: PassiveHealthy {
+                    http_statuses: vec![200],
+                    successes,
+                },
+                unhealthy: PassiveUnhealthy {
+                    http_statuses: vec![500],
+                    tcp_failures,
+                    timeouts,
+                    http_failures,
+                },
+            },
+            counters: Mutex::new(HashMap::new()),
+            on_transition: Some(Box::new(move |enabled| {
+                if enabled {
+                    restores_clone.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                } else {
+                    trips_clone.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                }
+            })),
+        };
+        (state, trips, restores)
+    }
+
+    fn backend() -> Backend {
+        Backend::new("127.0.0.1:18080").unwrap()
+    }
+
+    #[test]
+    fn trips_after_http_failure_threshold() {
+        let (state, trips, _) = test_state(3, 2, 7, 5);
+        let b = backend();
+        for _ in 0..2 {
+            state.observe(&b, PassiveOutcome::Http(500));
+        }
+        assert_eq!(trips.load(std::sync::atomic::Ordering::SeqCst), 0);
+        state.observe(&b, PassiveOutcome::Http(500));
+        assert_eq!(trips.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn trips_after_tcp_failure_threshold() {
+        let (state, trips, _) = test_state(5, 2, 7, 5);
+        let b = backend();
+        state.observe(&b, PassiveOutcome::TcpFailure);
+        assert_eq!(trips.load(std::sync::atomic::Ordering::SeqCst), 0);
+        state.observe(&b, PassiveOutcome::TcpFailure);
+        assert_eq!(trips.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn trips_after_timeout_threshold() {
+        let (state, trips, _) = test_state(5, 2, 3, 5);
+        let b = backend();
+        for _ in 0..2 {
+            state.observe(&b, PassiveOutcome::Timeout);
+        }
+        assert_eq!(trips.load(std::sync::atomic::Ordering::SeqCst), 0);
+        state.observe(&b, PassiveOutcome::Timeout);
+        assert_eq!(trips.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn mixed_failures_do_not_accumulate_across_categories() {
+        let (state, trips, _) = test_state(3, 2, 7, 5);
+        let b = backend();
+        state.observe(&b, PassiveOutcome::Http(500));
+        state.observe(&b, PassiveOutcome::Http(500));
+        // A TCP failure resets the http failure counter.
+        state.observe(&b, PassiveOutcome::TcpFailure);
+        state.observe(&b, PassiveOutcome::Http(500));
+        assert_eq!(trips.load(std::sync::atomic::Ordering::SeqCst), 0);
+        state.observe(&b, PassiveOutcome::Http(500));
+        state.observe(&b, PassiveOutcome::Http(500));
+        assert_eq!(trips.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn restores_after_healthy_successes() {
+        let (state, trips, restores) = test_state(3, 2, 7, 2);
+        let b = backend();
+        for _ in 0..3 {
+            state.observe(&b, PassiveOutcome::Http(500));
+        }
+        assert_eq!(trips.load(std::sync::atomic::Ordering::SeqCst), 1);
+        state.observe(&b, PassiveOutcome::Http(200));
+        assert_eq!(restores.load(std::sync::atomic::Ordering::SeqCst), 0);
+        state.observe(&b, PassiveOutcome::Http(200));
+        assert_eq!(restores.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn zero_threshold_disables_its_failure_category() {
+        let (state, trips, _) = test_state(0, 0, 0, 1);
+        let b = backend();
+        for _ in 0..10 {
+            state.observe(&b, PassiveOutcome::TcpFailure);
+            state.observe(&b, PassiveOutcome::Timeout);
+            state.observe(&b, PassiveOutcome::Http(500));
+        }
+        assert_eq!(trips.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn half_open_probe_is_single_flight_and_recovers() {
+        let (state, trips, _) = test_state(1, 2, 7, 1);
+        let b = backend();
+        let now = Instant::now();
+        state.observe(&b, PassiveOutcome::Http(500));
+        assert_eq!(trips.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert!(!state.allows_regular(&b));
+        assert!(state.take_probe(&b, now));
+        // A second probe within the lease window is refused.
+        assert!(!state.take_probe(&b, now));
+        state.observe(&b, PassiveOutcome::Http(200));
+        assert!(state.allows_regular(&b));
+    }
+
+    #[test]
+    fn half_open_probe_lease_expires_without_observation() {
+        // A request selected as a probe but cancelled before observe() must
+        // not pin the node forever: the lease expires and another probe is
+        // admitted after PROBE_LEASE.
+        let (state, trips, _) = test_state(1, 2, 7, 1);
+        let b = backend();
+        let now = Instant::now();
+        state.observe(&b, PassiveOutcome::Http(500));
+        assert_eq!(trips.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert!(state.take_probe(&b, now));
+        // Still tripped, lease held.
+        assert!(!state.take_probe(&b, now));
+        // Past the lease window a new probe is admitted even without observe().
+        assert!(state.take_probe(&b, now + PROBE_LEASE));
+    }
+
+    #[test]
+    fn successful_outcomes_do_not_trip_or_restore_when_not_tripped() {
+        let (state, trips, restores) = test_state(3, 2, 7, 5);
+        let b = backend();
+        state.observe(&b, PassiveOutcome::Http(200));
+        state.observe(&b, PassiveOutcome::Http(200));
+        assert_eq!(trips.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert_eq!(restores.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn out_of_set_statuses_are_ignored() {
+        let (state, trips, _) = test_state(3, 2, 7, 5);
+        let b = backend();
+        for _ in 0..10 {
+            state.observe(&b, PassiveOutcome::Http(404));
+        }
+        assert_eq!(trips.load(std::sync::atomic::Ordering::SeqCst), 0);
     }
 }

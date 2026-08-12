@@ -1,6 +1,8 @@
+pub mod api_breaker;
 pub mod basic_auth;
 pub mod brotli;
 pub mod cache;
+pub mod client_control;
 pub mod compression;
 pub mod cors;
 pub mod csrf;
@@ -12,8 +14,11 @@ pub mod gzip;
 pub mod ip_restriction;
 pub mod jwt_auth;
 pub mod key_auth;
+pub mod limit_conn;
 pub mod limit_count;
+pub mod limit_req;
 pub mod prometheus;
+pub mod proxy_mirror;
 pub mod proxy_rewrite;
 pub mod redirect;
 pub mod request_id;
@@ -37,6 +42,10 @@ use crate::{
 /// The priority value determines execution order in the plugin chain.
 static PLUGIN_BUILDER_REGISTRY: Lazy<HashMap<&'static str, PluginCreateFn>> = Lazy::new(|| {
     let arr: Vec<(&str, PluginCreateFn)> = vec![
+        (
+            client_control::PLUGIN_NAME,
+            client_control::create_client_control_plugin,
+        ), // 22000
         (
             request_id::PLUGIN_NAME,
             request_id::create_request_id_plugin,
@@ -62,6 +71,23 @@ static PLUGIN_BUILDER_REGISTRY: Lazy<HashMap<&'static str, PluginCreateFn>> = La
             proxy_rewrite::PLUGIN_NAME,
             proxy_rewrite::create_proxy_rewrite_plugin,
         ), // 1008
+        (
+            api_breaker::PLUGIN_NAME,
+            api_breaker::create_api_breaker_plugin,
+        ), // 1005
+        (
+            proxy_mirror::PLUGIN_NAME,
+            proxy_mirror::create_proxy_mirror_plugin,
+        ), // 1010
+        (
+            limit_conn::PLUGIN_NAME,
+            limit_conn::create_limit_conn_plugin,
+        ), // 1003
+        (
+            limit_count::PLUGIN_NAME,
+            limit_count::create_limit_count_plugin,
+        ), // 1002
+        (limit_req::PLUGIN_NAME, limit_req::create_limit_req_plugin), // 1001
         (brotli::PLUGIN_NAME, brotli::create_brotli_plugin), // 996
         (gzip::PLUGIN_NAME, gzip::create_gzip_plugin), // 995
         (redirect::PLUGIN_NAME, redirect::create_redirect_plugin), // 900
@@ -70,10 +96,6 @@ static PLUGIN_BUILDER_REGISTRY: Lazy<HashMap<&'static str, PluginCreateFn>> = La
             response_rewrite::create_response_rewrite_plugin,
         ), // 899
         (grpc_web::PLUGIN_NAME, grpc_web::create_grpc_web_plugin), // 505
-        (
-            limit_count::PLUGIN_NAME,
-            limit_count::create_limit_count_plugin,
-        ), // 503
         (
             prometheus::PLUGIN_NAME,
             prometheus::create_prometheus_plugin,

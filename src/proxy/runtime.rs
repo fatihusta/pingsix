@@ -414,6 +414,7 @@ mod tests {
                 upstream_id: Some("u1".into()),
                 service_id: None,
                 timeout: None,
+                enable_websocket: false,
             },
         );
         let snap2 = RuntimeSnapshot::compile(CandidateSnapshot::build(set).unwrap(), 2).unwrap();
@@ -460,6 +461,7 @@ mod tests {
                 upstream_id: Some("u1".into()),
                 service_id: None,
                 timeout: None,
+                enable_websocket: false,
             },
         );
         RUNTIME

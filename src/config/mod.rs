@@ -677,6 +677,12 @@ pub struct Route {
     pub service_id: Option<String>,
     #[validate(nested)]
     pub timeout: Option<Timeout>,
+    /// Enable WebSocket upgrade proxying for this route (APISIX `enable_websocket`).
+    /// When enabled (or when a request carries an `Upgrade` header), upstream
+    /// read/write timeouts are disabled so long-lived bidirectional streams are
+    /// not killed while idle.
+    #[serde(default)]
+    pub enable_websocket: bool,
 }
 
 impl Route {
@@ -808,10 +814,164 @@ pub enum SelectionType {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, Validate)]
+#[validate(schema(function = "HealthCheck::validate"))]
 pub struct HealthCheck {
-    // only support passive check for now
+    /// Active health probing. Optional so a passive-only `checks` block is
+    /// valid (APISIX allows `checks` with only `passive`). At least one of
+    /// `active`/`passive` must be present.
+    #[serde(default)]
     #[validate(nested)]
-    pub active: ActiveCheck,
+    pub active: Option<ActiveCheck>,
+    /// Passive health checking driven by real request outcomes
+    /// (APISIX `checks.passive`). Nodes are pulled from rotation after
+    /// `unhealthy.*` consecutive failures and restored after
+    /// `healthy.successes` consecutive healthy responses.
+    #[serde(default)]
+    #[validate(nested)]
+    pub passive: Option<PassiveCheck>,
+}
+
+impl HealthCheck {
+    fn validate(&self) -> Result<(), ValidationError> {
+        if self.active.is_none() && self.passive.is_none() {
+            return Err(ValidationError::new(
+                "health_check_requires_active_or_passive",
+            ));
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, Validate)]
+#[validate(schema(function = "PassiveCheck::validate"))]
+#[serde(rename_all = "lowercase")]
+pub struct PassiveCheck {
+    /// Check type. Accepted for APISIX schema compatibility; counters are
+    /// driven by real traffic outcomes regardless of this value.
+    #[serde(default)]
+    pub r#type: PassiveCheckType,
+    #[serde(default)]
+    #[validate(nested)]
+    pub healthy: PassiveHealthy,
+    #[serde(default)]
+    #[validate(nested)]
+    pub unhealthy: PassiveUnhealthy,
+}
+
+impl PassiveCheck {
+    fn validate(&self) -> Result<(), ValidationError> {
+        validate_passive_statuses(&self.healthy.http_statuses)?;
+        validate_passive_statuses(&self.unhealthy.http_statuses)?;
+        if self.healthy.successes > 254
+            || self.unhealthy.tcp_failures > 254
+            || self.unhealthy.timeouts > 254
+            || self.unhealthy.http_failures > 254
+        {
+            return Err(ValidationError::new("invalid_passive_threshold"));
+        }
+        Ok(())
+    }
+}
+
+fn validate_passive_statuses(statuses: &[u32]) -> Result<(), ValidationError> {
+    if statuses.is_empty()
+        || statuses.iter().any(|status| !(200..=599).contains(status))
+        || statuses.iter().collect::<HashSet<_>>().len() != statuses.len()
+    {
+        return Err(ValidationError::new("invalid_passive_http_statuses"));
+    }
+    Ok(())
+}
+
+#[derive(Clone, Copy, Default, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+#[allow(clippy::upper_case_acronyms)]
+pub enum PassiveCheckType {
+    TCP,
+    #[default]
+    HTTP,
+    HTTPS,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, Validate)]
+pub struct PassiveHealthy {
+    /// Status codes that count as a successful real-traffic outcome.
+    #[serde(default = "PassiveHealthy::default_http_statuses")]
+    pub http_statuses: Vec<u32>,
+    /// Consecutive healthy outcomes required to restore a tripped node. Zero disables recovery.
+    #[serde(default = "PassiveHealthy::default_successes")]
+    #[validate(range(min = 0, max = 254))]
+    pub successes: u32,
+}
+
+impl PassiveHealthy {
+    fn default_http_statuses() -> Vec<u32> {
+        vec![
+            200, 201, 202, 203, 204, 205, 206, 207, 208, 226, 300, 301, 302, 303, 304, 305, 306,
+            307, 308,
+        ]
+    }
+
+    fn default_successes() -> u32 {
+        5
+    }
+}
+
+impl Default for PassiveHealthy {
+    fn default() -> Self {
+        Self {
+            http_statuses: Self::default_http_statuses(),
+            successes: Self::default_successes(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, Validate)]
+pub struct PassiveUnhealthy {
+    /// Status codes that count as an unhealthy real-traffic outcome.
+    #[serde(default = "PassiveUnhealthy::default_http_statuses")]
+    pub http_statuses: Vec<u32>,
+    /// Consecutive TCP failures before the node is tripped. Zero disables this category.
+    #[serde(default = "PassiveUnhealthy::default_tcp_failures")]
+    #[validate(range(min = 0, max = 254))]
+    pub tcp_failures: u32,
+    /// Consecutive timeouts before the node is tripped. Zero disables this category.
+    #[serde(default = "PassiveUnhealthy::default_timeouts")]
+    #[validate(range(min = 0, max = 254))]
+    pub timeouts: u32,
+    /// Consecutive unhealthy HTTP statuses before the node is tripped. Zero disables this category.
+    #[serde(default = "PassiveUnhealthy::default_http_failures")]
+    #[validate(range(min = 0, max = 254))]
+    pub http_failures: u32,
+}
+
+impl PassiveUnhealthy {
+    fn default_http_statuses() -> Vec<u32> {
+        vec![429, 500, 503]
+    }
+
+    fn default_tcp_failures() -> u32 {
+        2
+    }
+
+    fn default_timeouts() -> u32 {
+        7
+    }
+
+    fn default_http_failures() -> u32 {
+        5
+    }
+}
+
+impl Default for PassiveUnhealthy {
+    fn default() -> Self {
+        Self {
+            http_statuses: Self::default_http_statuses(),
+            tcp_failures: Self::default_tcp_failures(),
+            timeouts: Self::default_timeouts(),
+            http_failures: Self::default_http_failures(),
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, Validate)]
@@ -999,6 +1159,54 @@ mod tests {
 
     fn init_log() {
         let _ = env_logger::builder().is_test(true).try_init();
+    }
+
+    #[test]
+    fn passive_schema_accepts_disabled_thresholds_and_rejects_bad_statuses() {
+        let valid = PassiveCheck {
+            r#type: PassiveCheckType::HTTP,
+            healthy: PassiveHealthy {
+                http_statuses: vec![200],
+                successes: 0,
+            },
+            unhealthy: PassiveUnhealthy {
+                http_statuses: vec![500],
+                tcp_failures: 0,
+                timeouts: 0,
+                http_failures: 0,
+            },
+        };
+        assert!(valid.validate().is_ok());
+
+        for statuses in [vec![], vec![199], vec![600], vec![500, 500]] {
+            let mut invalid = valid.clone();
+            invalid.unhealthy.http_statuses = statuses;
+            assert!(invalid.validate().is_err());
+        }
+        let mut too_large = valid;
+        too_large.healthy.successes = 255;
+        assert!(too_large.validate().is_err());
+    }
+
+    #[test]
+    fn health_check_requires_active_or_passive() {
+        // Passive-only is valid (APISIX allows a `checks` block with only passive).
+        let passive_only = HealthCheck {
+            active: None,
+            passive: Some(PassiveCheck {
+                r#type: PassiveCheckType::HTTP,
+                healthy: PassiveHealthy::default(),
+                unhealthy: PassiveUnhealthy::default(),
+            }),
+        };
+        assert!(passive_only.validate().is_ok());
+
+        // Neither active nor passive is rejected.
+        let neither = HealthCheck {
+            active: None,
+            passive: None,
+        };
+        assert!(neither.validate().is_err());
     }
 
     #[test]

@@ -297,6 +297,10 @@ impl RouteContext for ProxyRoute {
         self.inner.uri.as_deref()
     }
 
+    fn enable_websocket(&self) -> bool {
+        self.inner.enable_websocket
+    }
+
     fn select_upstream(&self, session: &mut Session) -> ProxyResult<UpstreamSelection> {
         let upstream = self.resolve_upstream().ok_or_else(|| {
             ProxyError::UpstreamSelection(
@@ -310,6 +314,7 @@ impl RouteContext for ProxyRoute {
                 self.inner.id
             ))
         })?;
+        let selected_backend = backend.clone();
 
         let peer = backend.ext.get_mut::<HttpPeer>().ok_or_else(|| {
             ProxyError::UpstreamSelection(
@@ -321,6 +326,7 @@ impl RouteContext for ProxyRoute {
         Ok(UpstreamSelection {
             peer: Box::new(peer.clone()),
             upstream,
+            backend: selected_backend,
         })
     }
 
@@ -792,6 +798,7 @@ mod tests {
             upstream_id: None,
             service_id: None,
             timeout: None,
+            enable_websocket: false,
         };
 
         let upstreams = HashMap::new();
