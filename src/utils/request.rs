@@ -25,25 +25,29 @@ pub fn request_selector_key<'a>(
     }
 }
 
+/// Split `s` on `sep` into `(name, value)` pairs. Segments are trimmed, empty
+/// segments are skipped, and a key-only segment yields `(name, "")`.
+///
+/// Shared by the query (`'&'`) and cookie (`';'`) parsers so that lookup and
+/// removal always agree on the same wire format.
+fn split_pairs(s: &str, sep: char) -> impl Iterator<Item = (&str, &str)> {
+    s.split(sep)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(|seg| match seg.split_once('=') {
+            Some((n, v)) => (n.trim(), v.trim()),
+            None => (seg, ""),
+        })
+}
+
 /// Extracts the value of a specific query parameter from the request URI.
 ///
 /// Returns the first occurrence of the parameter's value.
 pub fn get_query_value<'a>(req_header: &'a RequestHeader, name: &str) -> Option<&'a str> {
     req_header.uri.query().and_then(|query| {
-        query.split('&').find_map(|pair| {
-            if let Some((k, v)) = pair.split_once('=') {
-                if k == name {
-                    Some(v.trim()) // Trim whitespace from value
-                } else {
-                    None
-                }
-            } else if pair == name {
-                // Handle key-only parameters if needed? Usually not.
-                Some("") // Or None, depending on desired behavior for key-only params
-            } else {
-                None
-            }
-        })
+        split_pairs(query, '&')
+            .find(|(n, _)| *n == name)
+            .map(|(_, v)| v)
     })
 }
 
@@ -63,17 +67,17 @@ pub fn remove_query_from_header(
     name: &str,
 ) -> Result<(), http::uri::InvalidUri> {
     if let Some(query) = req_header.uri.query() {
-        let mut query_list = vec![];
-        for item in query.split('&') {
-            if let Some((k, v)) = item.split_once('=') {
-                if k != name {
-                    query_list.push(format!("{k}={v}"));
+        let query = split_pairs(query, '&')
+            .filter(|(n, _)| *n != name)
+            .map(|(n, v)| {
+                if v.is_empty() {
+                    n.to_string()
+                } else {
+                    format!("{n}={v}")
                 }
-            } else if item != name {
-                query_list.push(item.to_string());
-            }
-        }
-        let query = query_list.join("&");
+            })
+            .collect::<Vec<_>>()
+            .join("&");
         let mut new_path = req_header.uri.path().to_string();
         if !query.is_empty() {
             new_path = format!("{new_path}?{query}");
@@ -102,19 +106,14 @@ pub fn get_req_header_value<'a>(req_header: &'a RequestHeader, key: &str) -> Opt
 /// key=value pairs but might not handle complex/encoded cookie values robustly.
 /// Returns the first occurrence of the cookie's value.
 pub fn get_cookie_value<'a>(req_header: &'a RequestHeader, cookie_name: &str) -> Option<&'a str> {
-    for cookie_header_value in req_header.headers.get_all(http::header::COOKIE) {
-        if let Ok(cookie_header_value) = cookie_header_value.to_str() {
-            for item in cookie_header_value.split(';') {
-                let trimmed_item = item.trim();
-                if let Some((k, v)) = trimmed_item.split_once('=') {
-                    if k.trim() == cookie_name {
-                        return Some(v.trim());
-                    }
-                }
-            }
-        }
-    }
-    None
+    req_header
+        .headers
+        .get_all(http::header::COOKIE)
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .flat_map(|value| split_pairs(value, ';'))
+        .find(|(n, _)| *n == cookie_name)
+        .map(|(_, v)| v)
 }
 
 /// Remove every cookie named `cookie_name` from all Cookie fields. Other cookie
@@ -135,12 +134,14 @@ pub fn remove_cookie_from_header(
         .collect::<crate::core::ProxyResult<Vec<_>>>()?
         .into_iter()
         .map(|value| {
-            value
-                .split(';')
-                .filter_map(|item| {
-                    let item = item.trim();
-                    let name = item.split_once('=').map_or(item, |(name, _)| name.trim());
-                    (name != cookie_name).then_some(item)
+            split_pairs(value, ';')
+                .filter(|(n, _)| *n != cookie_name)
+                .map(|(n, v)| {
+                    if v.is_empty() {
+                        n.to_string()
+                    } else {
+                        format!("{n}={v}")
+                    }
                 })
                 .collect::<Vec<_>>()
                 .join("; ")
@@ -167,7 +168,7 @@ pub fn remove_cookie_from_header(
 /// APISIX falls back to `remote_addr` when the configured key is unavailable.
 pub fn apisix_key(session: &mut Session, key: &str, var_combination: bool) -> Cow<'static, str> {
     let value = if var_combination {
-        render_apisix_template(key, |name| resolve_var(session, name).into_owned())
+        render_apisix_request_template(session, key)
     } else {
         resolve_var(session, key.trim_start_matches('$')).into_owned()
     };
@@ -331,6 +332,44 @@ mod tests {
                 _ => String::new(),
             }),
             "alice:/alice"
+        );
+    }
+
+    #[test]
+    fn split_pairs_trims_and_skips_empty_segments() {
+        assert_eq!(
+            split_pairs(" a = 1 ; jwt; b=2;; ", ';').collect::<Vec<_>>(),
+            vec![("a", "1"), ("jwt", ""), ("b", "2")]
+        );
+    }
+
+    #[test]
+    fn query_lookup_and_removal_agree_on_the_same_parser() {
+        let mut req = RequestHeader::build("GET", b"/x?keep=1&flag&jwt=t", None).unwrap();
+        // Lookup sees the same normalized pairs that removal filters.
+        assert_eq!(get_query_value(&req, "flag"), Some(""));
+        assert_eq!(get_query_value(&req, "jwt"), Some("t"));
+        remove_query_from_header(&mut req, "jwt").unwrap();
+        assert_eq!(req.uri.to_string(), "/x?keep=1&flag");
+    }
+
+    #[test]
+    fn cookie_lookup_and_removal_agree_on_the_same_parser() {
+        let mut req = RequestHeader::build("GET", b"/", None).unwrap();
+        req.headers
+            .append(http::header::COOKIE, " a = 1 ; jwt; b=2 ".parse().unwrap());
+        // Key-only cookies are visible to lookup ...
+        assert_eq!(get_cookie_value(&req, "jwt"), Some(""));
+        assert_eq!(get_cookie_value(&req, "a"), Some("1"));
+        // ... and removal drops them exactly like named pairs.
+        remove_cookie_from_header(&mut req, "jwt").unwrap();
+        assert_eq!(
+            req.headers
+                .get_all(http::header::COOKIE)
+                .iter()
+                .map(|v| v.to_str().unwrap())
+                .collect::<Vec<_>>(),
+            vec!["a=1; b=2"]
         );
     }
 
