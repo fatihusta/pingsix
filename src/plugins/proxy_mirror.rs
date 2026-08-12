@@ -49,10 +49,10 @@ const MIRROR_WRITE_TIMEOUT: Duration = Duration::from_secs(1);
 /// Creates a `proxy-mirror` plugin instance from JSON configuration.
 pub fn create_proxy_mirror_plugin(cfg: JsonValue) -> ProxyResult<Arc<dyn ProxyPlugin>> {
     let config = PluginConfig::try_from(cfg)?;
-    let peer = build_mirror_peer(&config.host)?;
+    let target = parse_mirror_target(&config.host)?;
     Ok(Arc::new(PluginProxyMirror {
         config,
-        peer,
+        target,
         connector: Arc::new(Connector::new(None)),
     }))
 }
@@ -93,7 +93,7 @@ impl PluginConfig {
 }
 
 fn validate_host(host: &str) -> Result<(), ValidationError> {
-    if build_mirror_peer(host).is_err() {
+    if parse_mirror_target(host).is_err() {
         return Err(ValidationError::new(
             "host must be an http(s) scheme and authority only, e.g. http://127.0.0.1:9797",
         ));
@@ -112,9 +112,20 @@ fn validate_path(path: Option<&str>) -> ProxyResult<()> {
     Ok(())
 }
 
-/// Parse `host` into an [`HttpPeer`]. Returns a validation error for
+/// Parsed mirror target. Kept free of any I/O: name resolution happens per
+/// request inside the mirror task, so config validation never blocks on DNS
+/// and an unresolvable target can only drop a mirror, never panic the proxy.
+#[derive(Debug, Clone)]
+struct MirrorTarget {
+    host: String,
+    port: u16,
+    tls: bool,
+    sni: String,
+}
+
+/// Parse `host` into a [`MirrorTarget`]. Returns a validation error for
 /// unsupported schemes or malformed URLs.
-fn build_mirror_peer(host: &str) -> ProxyResult<HttpPeer> {
+fn parse_mirror_target(host: &str) -> ProxyResult<MirrorTarget> {
     let uri: http::Uri = host
         .parse()
         .map_err(|e| ProxyError::validation_error(format!("invalid mirror host '{host}': {e}")))?;
@@ -150,10 +161,26 @@ fn build_mirror_peer(host: &str) -> ProxyResult<HttpPeer> {
     let host_str = uri
         .host()
         .ok_or_else(|| ProxyError::validation_error("mirror host is missing a hostname"))?;
-    let port = uri.port_u16().unwrap_or(default_port);
-    let sni = host_str.to_string();
 
-    Ok(HttpPeer::new((host_str.to_string(), port), tls, sni))
+    Ok(MirrorTarget {
+        host: host_str.to_string(),
+        port: uri.port_u16().unwrap_or(default_port),
+        tls,
+        sni: host_str.to_string(),
+    })
+}
+
+/// Resolve a [`MirrorTarget`] to a connectable [`HttpPeer`]. Runs inside the
+/// mirror task so a DNS failure only drops the mirror, never the request.
+/// `HttpPeer::new` performs the resolution itself and panics on failure, so
+/// resolve first with the non-panicking async lookup.
+async fn resolve_mirror_peer(target: &MirrorTarget) -> Result<HttpPeer, &'static str> {
+    let addr = tokio::net::lookup_host((target.host.as_str(), target.port))
+        .await
+        .map_err(|_| "mirror target DNS lookup failed")?
+        .next()
+        .ok_or("mirror target resolved to no address")?;
+    Ok(HttpPeer::new(addr, target.tls, target.sni.clone()))
 }
 
 impl TryFrom<JsonValue> for PluginConfig {
@@ -171,7 +198,7 @@ impl TryFrom<JsonValue> for PluginConfig {
 
 pub struct PluginProxyMirror {
     config: PluginConfig,
-    peer: HttpPeer,
+    target: MirrorTarget,
     connector: Arc<Connector>,
 }
 
@@ -285,9 +312,15 @@ impl ProxyPlugin for PluginProxyMirror {
             },
         );
         let connector = self.connector.clone();
-        let peer = self.peer.clone();
+        let target = self.target.clone();
         tokio::spawn(async move {
             let result = async {
+                // Resolve inside the connect budget: an unresolvable or slow
+                // DNS target only drops the mirror, never the request.
+                let peer =
+                    tokio::time::timeout(MIRROR_CONNECT_TIMEOUT, resolve_mirror_peer(&target))
+                        .await
+                        .map_err(|_| "mirror target DNS lookup timed out")??;
                 let (mut session, _) =
                     tokio::time::timeout(MIRROR_CONNECT_TIMEOUT, connector.get_http_session(&peer))
                         .await
@@ -441,9 +474,11 @@ mod tests {
     }
 
     #[test]
-    fn mirror_peer_parses_scheme_and_default_port() {
-        let peer = build_mirror_peer("https://mirror.example.com").unwrap();
-        assert_eq!(peer.sni, "mirror.example.com");
+    fn mirror_target_parses_scheme_and_default_port() {
+        let target = parse_mirror_target("https://mirror.example.com").unwrap();
+        assert_eq!(target.sni, "mirror.example.com");
+        assert_eq!(target.port, 443);
+        assert!(target.tls);
     }
 
     #[test]
@@ -455,7 +490,7 @@ mod tests {
                 path_concat_mode: PathConcatMode::Replace,
                 sample_ratio: 1.0,
             },
-            peer: build_mirror_peer("http://127.0.0.1:9797").unwrap(),
+            target: parse_mirror_target("http://127.0.0.1:9797").unwrap(),
             connector: Arc::new(Connector::new(None)),
         };
         let mut req = RequestHeader::build("GET", b"/original?a=1", None).unwrap();
@@ -473,7 +508,7 @@ mod tests {
                 path_concat_mode: PathConcatMode::Prefix,
                 sample_ratio: 1.0,
             },
-            peer: build_mirror_peer("http://127.0.0.1:9797").unwrap(),
+            target: parse_mirror_target("http://127.0.0.1:9797").unwrap(),
             connector: Arc::new(Connector::new(None)),
         };
         let req = RequestHeader::build("GET", b"/api/x", None).unwrap();
@@ -490,7 +525,7 @@ mod tests {
                 path_concat_mode: PathConcatMode::Replace,
                 sample_ratio: 1.0,
             },
-            peer: build_mirror_peer("http://127.0.0.1:9797").unwrap(),
+            target: parse_mirror_target("http://127.0.0.1:9797").unwrap(),
             connector: Arc::new(Connector::new(None)),
         };
         let req = RequestHeader::build("GET", b"/api/x?b=2", None).unwrap();
