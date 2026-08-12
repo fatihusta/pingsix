@@ -452,10 +452,7 @@ mod tests {
         // literals, resolves variables, and keeps separators next to missing
         // variables. Request-bound resolution is exercised via render_apisix_*
         // in utils::request tests.
-        assert_eq!(
-            render_apisix_template("30", |_| String::new()),
-            "30"
-        );
+        assert_eq!(render_apisix_template("30", |_| String::new()), "30");
         assert_eq!(
             render_apisix_template("$name:${missing}/${name}", |name| match name {
                 "name" => "alice".to_string(),

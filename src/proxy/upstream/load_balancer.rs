@@ -332,7 +332,11 @@ impl ProxyUpstream {
         //    node, admit one half-open probe among tripped-but-actively-ready
         //    nodes. Healthy nodes always keep receiving normal traffic.
         let now = Instant::now();
-        if self.passive.as_ref().is_some_and(|passive| passive.has_tripped()) {
+        if self
+            .passive
+            .as_ref()
+            .is_some_and(|passive| passive.has_tripped())
+        {
             if let Some(backend) = with_lb!(&self.lb, |lb| {
                 lb.upstreams
                     .select_with(key, MAX_LB_ITERATIONS, |backend, ready| {
