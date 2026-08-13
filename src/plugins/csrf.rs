@@ -24,7 +24,10 @@ const PRIORITY: i32 = 2980;
 /// Safe HTTP methods that do not require CSRF validation
 const SAFE_METHODS: &[Method] = &[Method::GET, Method::HEAD, Method::OPTIONS];
 
-pub fn create_csrf_plugin(cfg: JsonValue) -> ProxyResult<Arc<dyn ProxyPlugin>> {
+pub fn create_csrf_plugin(
+    cfg: JsonValue,
+    _defaults: &crate::config::EffectiveDefaults,
+) -> ProxyResult<Arc<dyn ProxyPlugin>> {
     let config = PluginConfig::try_from(cfg)?;
     Ok(Arc::new(PluginCsrf { config }))
 }
@@ -277,6 +280,7 @@ impl ProxyPlugin for PluginCsrf {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::utils::encryption::KeyringService;
     use crate::utils::encryption::{EncryptFields, SecretOp};
 
     fn build_plugin(expires: u64) -> PluginCsrf {
@@ -296,7 +300,8 @@ mod tests {
             "name": "csrf-token",
             "expires": 7200,
         });
-        PluginConfig::transform_secrets(&mut cfg, SecretOp::Decrypt).unwrap();
+        PluginConfig::transform_secrets(&mut cfg, SecretOp::Decrypt, &KeyringService::global())
+            .unwrap();
         assert_eq!(cfg["key"], "unit-test-key");
         assert_eq!(cfg["name"], "csrf-token");
     }

@@ -15,7 +15,10 @@ const PRIORITY: i32 = 505;
 /// This plugin enables support for the gRPC-Web protocol by initializing the `GrpcWebBridge` module
 /// for each request. The configuration is currently unused, but the `cfg` parameter is provided for
 /// future extensibility.
-pub fn create_grpc_web_plugin(_cfg: JsonValue) -> ProxyResult<Arc<dyn ProxyPlugin>> {
+pub fn create_grpc_web_plugin(
+    _cfg: JsonValue,
+    _defaults: &crate::config::EffectiveDefaults,
+) -> ProxyResult<Arc<dyn ProxyPlugin>> {
     Ok(Arc::new(PluginGrpcWeb {}))
 }
 

@@ -63,7 +63,7 @@ pub trait UpstreamSelector: Send + Sync {
     /// Stable cache-namespace fragment that changes when upstream identity or
     /// origin-selection configuration changes, so process-local cache cannot
     /// reuse stale entries after a dynamic config switch.
-    fn cache_isolation_key(&self) -> String;
+    fn cache_isolation_key(&self) -> u64;
 }
 
 /// One request's compiled upstream selection: the selected peer plus the
@@ -263,7 +263,13 @@ impl ProxyContext {
 // =============================================================================
 
 /// Type alias for plugin initialization functions
-pub type PluginCreateFn = fn(JsonValue) -> ProxyResult<Arc<dyn ProxyPlugin>>;
+///
+/// `defaults` carries the owning gateway instance's effective
+/// `pingsix.defaults` (resolved at startup) so plugin construction can honor
+/// instance-scoped fallbacks (e.g. cache capacity) instead of the
+/// process-global OnceCells.
+pub type PluginCreateFn =
+    fn(JsonValue, &crate::config::EffectiveDefaults) -> ProxyResult<Arc<dyn ProxyPlugin>>;
 
 /// The core plugin trait that defines the lifecycle hooks for proxy plugins.
 ///

@@ -11,7 +11,8 @@
 //! distributed counter backend.
 
 use std::{
-    collections::HashMap,
+    collections::{BTreeMap, HashMap},
+    hash::{Hash, Hasher},
     sync::{
         atomic::{AtomicUsize, Ordering},
         Arc, Mutex,
@@ -43,12 +44,30 @@ const CTX_KEY_CONN_GUARD: &str = "pingsix_limit_conn_guard";
 /// Upper bound on tracked keys before idle entries are swept.
 const MAX_KEYS: usize = 4096;
 
+/// Number of independent shards the in-flight counter map is split across so
+/// requests with different keys do not all serialize on one mutex. The total
+/// entry bound stays `MAX_KEYS` (`PER_SHARD_MAX * LIMIT_SHARDS`).
+const LIMIT_SHARDS: usize = 16;
+const PER_SHARD_MAX: usize = MAX_KEYS / LIMIT_SHARDS;
+const PER_SHARD_REGULAR_MAX: usize = PER_SHARD_MAX - 1;
+const CLEANUP_BUDGET: usize = 8;
+
+/// Shard index for a limiter key.
+fn shard_idx(key: &str) -> usize {
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    key.hash(&mut hasher);
+    (hasher.finish() as usize) % LIMIT_SHARDS
+}
+
 /// Creates a `limit-conn` plugin instance from JSON configuration.
-pub fn create_limit_conn_plugin(cfg: JsonValue) -> ProxyResult<Arc<dyn ProxyPlugin>> {
+pub fn create_limit_conn_plugin(
+    cfg: JsonValue,
+    _defaults: &crate::config::EffectiveDefaults,
+) -> ProxyResult<Arc<dyn ProxyPlugin>> {
     let config = PluginConfig::try_from(cfg)?;
     Ok(Arc::new(PluginLimitConn {
         config,
-        counters: Mutex::new(HashMap::new()),
+        counters: std::array::from_fn(|_| Mutex::new(CounterShard::default())),
     }))
 }
 
@@ -80,6 +99,44 @@ fn decide(count: usize, conn: u32, burst: u32, unit_delay: f64) -> Decision {
 struct ConnState {
     count: AtomicUsize,
     unit_delay: Mutex<f64>,
+}
+
+#[derive(Default)]
+struct CounterShard {
+    entries: HashMap<String, Arc<ConnState>>,
+    oldest: BTreeMap<u64, String>,
+    next_touch: u64,
+}
+
+impl CounterShard {
+    fn touch(&mut self, key: &str) {
+        self.next_touch = self.next_touch.wrapping_add(1);
+        if self.next_touch == 0 {
+            self.next_touch = 1;
+        }
+        self.oldest.insert(self.next_touch, key.to_string());
+    }
+
+    /// Remove at most `CLEANUP_BUDGET` inactive states; active states remain.
+    fn sweep_inactive(&mut self) {
+        for _ in 0..CLEANUP_BUDGET {
+            let Some((touch, key)) = self.oldest.pop_first() else {
+                break;
+            };
+            if self
+                .entries
+                .get(&key)
+                .is_some_and(|state| state.count.load(Ordering::Relaxed) == 0)
+            {
+                self.entries.remove(&key);
+            } else {
+                // Move active entries to the back so one active oldest entry
+                // cannot consume every cleanup slot.
+                let _ = touch;
+                self.touch(&key);
+            }
+        }
+    }
 }
 
 /// Request-scoped state released by the reliable `logging` lifecycle hook.
@@ -221,28 +278,35 @@ impl TryFrom<JsonValue> for PluginConfig {
 /// Concurrency limiting plugin implementation.
 pub struct PluginLimitConn {
     config: PluginConfig,
-    /// Exact per-key in-flight counters. Entries are swept when the map grows
-    /// past [`MAX_KEYS`] to avoid unbounded memory from ephemeral keys.
-    counters: Mutex<HashMap<String, Arc<ConnState>>>,
+    /// Sharded in-flight counters. Entries are swept when a shard grows past
+    /// [`PER_SHARD_MAX`] to avoid unbounded memory from ephemeral keys.
+    /// Sharding keeps requests with different keys off the same mutex and
+    /// bounds any cleanup sweep to one shard (1/`LIMIT_SHARDS` of keys).
+    counters: [Mutex<CounterShard>; LIMIT_SHARDS],
 }
 
 impl PluginLimitConn {
     fn get_or_insert_counter(&self, key: &str) -> Arc<ConnState> {
-        let mut counters = self.counters.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(state) = counters.get(key) {
-            return state.clone();
+        let mut shard = self.counters[shard_idx(key)]
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if let Some(state) = shard.entries.get(key).cloned() {
+            shard.touch(key);
+            return state;
         }
-        if counters.len() >= MAX_KEYS {
-            counters.retain(|_, state| state.count.load(Ordering::Relaxed) > 0);
+        if shard.entries.len() >= PER_SHARD_REGULAR_MAX {
+            // A fixed, small cleanup budget prevents a request-time full scan.
+            shard.sweep_inactive();
         }
         // Never evict active entries. New keys use one stable overflow state
-        // once all entries are active, avoiding split concurrency guards.
-        let storage_key = if counters.len() < MAX_KEYS {
+        // once all regular entries are active, avoiding split guards.
+        let storage_key = if shard.entries.len() < PER_SHARD_REGULAR_MAX {
             key
         } else {
             "__pingsix_limit_conn_overflow__"
         };
-        counters
+        let state = shard
+            .entries
             .entry(storage_key.to_string())
             .or_insert_with(|| {
                 Arc::new(ConnState {
@@ -250,7 +314,9 @@ impl PluginLimitConn {
                     unit_delay: Mutex::new(self.config.default_conn_delay),
                 })
             })
-            .clone()
+            .clone();
+        shard.touch(storage_key);
+        state
     }
 
     async fn reject(&self, session: &mut Session) -> Result<bool> {
@@ -390,6 +456,38 @@ mod tests {
         guard.leave(false);
         assert_eq!(state.count.load(Ordering::Relaxed), 0);
         // A second release via Drop must not double-decrement.
+    }
+
+    #[test]
+    fn bounded_sweep_keeps_active_state_and_removes_only_budget() {
+        let mut shard = CounterShard::default();
+        let active = "active".to_string();
+        shard.entries.insert(
+            active.clone(),
+            Arc::new(ConnState {
+                count: AtomicUsize::new(1),
+                unit_delay: Mutex::new(0.1),
+            }),
+        );
+        shard.touch(&active);
+        for i in 0..CLEANUP_BUDGET + 2 {
+            let key = i.to_string();
+            shard.entries.insert(
+                key.clone(),
+                Arc::new(ConnState {
+                    count: AtomicUsize::new(0),
+                    unit_delay: Mutex::new(0.1),
+                }),
+            );
+            shard.touch(&key);
+        }
+        shard.sweep_inactive();
+        assert!(shard.entries.contains_key(&active));
+        assert_eq!(
+            shard.entries.len(),
+            4,
+            "the active entry plus two inactive entries remain after an 8-item bounded sweep"
+        );
     }
 
     #[test]

@@ -20,6 +20,11 @@ const PRIORITY: i32 = 1085;
 /// Global default max object size, populated once at startup from
 /// `pingsix.defaults.cache.default_max_object_bytes`. Falls back to 1MB when unset
 /// (e.g. in unit tests that do not initialize the full config).
+///
+/// Migration facade retained as test scaffolding: production cache plugins
+/// receive the instance's [`crate::config::EffectiveDefaults`] at build time;
+/// this OnceCell backs [`crate::config::EffectiveDefaults::global`] and the
+/// legacy getter used by unit/integration tests.
 static DEFAULT_MAX_OBJECT_BYTES: OnceCell<usize> = OnceCell::new();
 
 /// 1MB fallback used when no global default has been initialized.
@@ -229,7 +234,10 @@ pub struct PluginCache {
     cache_settings: Arc<CacheSettings>,
 }
 
-pub fn create_cache_plugin(cfg: JsonValue) -> ProxyResult<Arc<dyn ProxyPlugin>> {
+pub fn create_cache_plugin(
+    cfg: JsonValue,
+    defaults: &crate::config::EffectiveDefaults,
+) -> ProxyResult<Arc<dyn ProxyPlugin>> {
     let config = PluginConfig::try_from(cfg)?;
 
     let methods = config
@@ -259,10 +267,12 @@ pub fn create_cache_plugin(cfg: JsonValue) -> ProxyResult<Arc<dyn ProxyPlugin>> 
     vary.dedup();
     let vary = Arc::new(vary);
 
-    // Resolve the final max object size: None inherits the global default,
-    // Some(0) means unlimited, Some(n) is an explicit limit.
-    let max_file_size_bytes =
-        resolve_max_file_size(config.max_file_size_bytes, default_max_object_bytes());
+    // Resolve the final max object size: None inherits the instance's
+    // effective default, Some(0) means unlimited, Some(n) is an explicit limit.
+    let max_file_size_bytes = resolve_max_file_size(
+        config.max_file_size_bytes,
+        defaults.cache.default_max_object_bytes,
+    );
 
     let policy_fingerprint = {
         use std::collections::hash_map::DefaultHasher;

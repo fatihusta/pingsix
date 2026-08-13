@@ -12,7 +12,7 @@
 //! APISIX, which only observes `upstream_status`.
 
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{BTreeMap, HashMap, HashSet},
     sync::{Arc, Mutex},
     time::Instant,
 };
@@ -39,40 +39,75 @@ const PRIORITY: i32 = 1005;
 /// Cap on the exponential factor so `2^failure_times` cannot overflow.
 const MAX_EXPONENT: u32 = 30;
 
+/// Fixed bitset over HTTP status codes (0..640), so per-response membership
+/// tests are O(1) and allocation-free. Built once at plugin construction from
+/// the configured `http_statuses` lists.
+#[derive(Clone)]
+struct StatusCodeSet([u64; 10]);
+
+impl StatusCodeSet {
+    fn from_statuses(statuses: &[u16]) -> Self {
+        let mut bits = [0u64; 10];
+        for &status in statuses {
+            let idx = status as usize;
+            if idx < 640 {
+                bits[idx / 64] |= 1u64 << (idx % 64);
+            }
+        }
+        Self(bits)
+    }
+
+    fn contains(&self, status: u16) -> bool {
+        let idx = status as usize;
+        idx < 640 && (self.0[idx / 64] & (1u64 << (idx % 64))) != 0
+    }
+}
+
 /// Creates an `api-breaker` plugin instance from JSON configuration.
-pub fn create_api_breaker_plugin(cfg: JsonValue) -> ProxyResult<Arc<dyn ProxyPlugin>> {
+pub fn create_api_breaker_plugin(
+    cfg: JsonValue,
+    _defaults: &crate::config::EffectiveDefaults,
+) -> ProxyResult<Arc<dyn ProxyPlugin>> {
     let config = PluginConfig::try_from(cfg)?;
     Ok(Arc::new(PluginApiBreaker {
+        unhealthy_set: StatusCodeSet::from_statuses(&config.unhealthy.http_statuses),
+        healthy_set: StatusCodeSet::from_statuses(&config.healthy.http_statuses),
         config,
         state: Mutex::new(BreakerStates::default()),
     }))
 }
 
-/// Bounded, per route identity + host breaker state. The state key excludes
-/// the raw request URI (query/parameters) so high-cardinality inputs cannot
-/// bypass the breaker or evict hot state.
+/// Bounded breaker state keyed by stable route identity (or one fixed key for
+/// a global-rule instance). Client-controlled Host/path values are excluded so
+/// high-cardinality inputs cannot bypass the breaker or evict hot state.
 const MAX_BREAKER_KEYS: usize = 1024;
 
 #[derive(Default)]
 struct BreakerStates {
     entries: HashMap<String, BreakerState>,
+    /// Exactly one ordered record per entry, so eviction is O(log n), not a
+    /// request-time map scan.
+    oldest: BTreeMap<u64, String>,
+    next_touch: u64,
 }
 
 impl BreakerStates {
     fn entry(&mut self, key: String) -> &mut BreakerState {
-        if !self.entries.contains_key(&key) && self.entries.len() >= MAX_BREAKER_KEYS {
-            // Evict only the least-recently-used key; never clear all hot state.
-            if let Some(oldest) = self
-                .entries
-                .iter()
-                .min_by_key(|(_, state)| state.last_touch)
-                .map(|(key, _)| key.clone())
-            {
-                self.entries.remove(&oldest);
-            }
+        if let Some(state) = self.entries.get(&key) {
+            self.oldest.remove(&state.touch);
+        } else if self.entries.len() >= MAX_BREAKER_KEYS {
+            let (_, oldest) = self.oldest.pop_first().expect("non-empty index");
+            self.entries.remove(&oldest);
         }
-        let state = self.entries.entry(key).or_default();
+        self.next_touch = self.next_touch.wrapping_add(1);
+        if self.next_touch == 0 {
+            self.next_touch = 1;
+        }
+        let touch = self.next_touch;
+        let state = self.entries.entry(key.clone()).or_default();
         state.last_touch = Instant::now();
+        state.touch = touch;
+        self.oldest.insert(touch, key);
         state
     }
 }
@@ -85,6 +120,7 @@ struct BreakerState {
     /// When the current trip started (None when closed).
     lasttime: Option<Instant>,
     last_touch: Instant,
+    touch: u64,
 }
 
 impl Default for BreakerState {
@@ -94,6 +130,7 @@ impl Default for BreakerState {
             healthy_count: 0,
             lasttime: None,
             last_touch: Instant::now(),
+            touch: 0,
         }
     }
 }
@@ -272,25 +309,25 @@ impl TryFrom<JsonValue> for PluginConfig {
 
 pub struct PluginApiBreaker {
     config: PluginConfig,
+    unhealthy_set: StatusCodeSet,
+    healthy_set: StatusCodeSet,
     state: Mutex<BreakerStates>,
 }
 
 impl PluginApiBreaker {
-    /// Is the circuit currently open (within the breaker window)?
+    /// Stable, bounded breaker state key.
+    ///
+    /// Uses route identity when a route is bound, falling back to the request
+    /// path for global-rule instances. The raw `Host` header is deliberately
+    /// **not** part of the key: under wildcard/multi-host routes it is
+    /// attacker-controllable and would let a client rotate subdomains to keep
+    /// failure counts from accumulating (bypassing the breaker) or to evict
+    /// hot state under LRU pressure.
     fn state_key(session: &Session, ctx: &ProxyContext) -> String {
-        let host = session
-            .req_header()
-            .headers
-            .get(http::header::HOST)
-            .and_then(|value| value.to_str().ok())
-            .unwrap_or("");
-        // Scope by route identity so a service-level plugin instance shared
-        // across routes does not leak failures between them, and so high-cardinality
-        // query strings or path parameters cannot bypass the breaker. Falls back
-        // to the request path only when no route is bound (global rule).
+        let _ = session;
         match ctx.route.as_ref().map(|route| route.id()) {
-            Some(route_id) if !route_id.is_empty() => format!("{route_id}\n{host}"),
-            _ => format!("{host}\n{}", session.req_header().uri.path()),
+            Some(route_id) if !route_id.is_empty() => route_id.into(),
+            _ => "__global__".to_string(),
         }
     }
 
@@ -359,19 +396,14 @@ impl ProxyPlugin for PluginApiBreaker {
         ctx: &mut ProxyContext,
     ) -> Result<()> {
         let status = upstream_response.status.as_u16();
+        // Pre-compiled bitsets: no per-response HashSet allocation.
+        let is_unhealthy = self.unhealthy_set.contains(status);
+        let is_healthy = self.healthy_set.contains(status);
+
         let mut states = self.state.lock().unwrap_or_else(|e| e.into_inner());
         let state = states.entry(Self::state_key(session, ctx));
 
-        let unhealthy: HashSet<u16> = self
-            .config
-            .unhealthy
-            .http_statuses
-            .iter()
-            .copied()
-            .collect();
-        let healthy: HashSet<u16> = self.config.healthy.http_statuses.iter().copied().collect();
-
-        if unhealthy.contains(&status) {
+        if is_unhealthy {
             // Unhealthy process (APISIX `_M.log`).
             state.healthy_count = 0;
             state.unhealthy_count += 1;
@@ -382,7 +414,7 @@ impl ProxyPlugin for PluginApiBreaker {
                     state.unhealthy_count
                 );
             }
-        } else if healthy.contains(&status) && state.lasttime.is_some() {
+        } else if is_healthy && state.lasttime.is_some() {
             // Health process: recovery only tracked while previously tripped.
             state.healthy_count += 1;
             if state.healthy_count >= self.config.healthy.successes.max(1) {
@@ -403,6 +435,18 @@ impl ProxyPlugin for PluginApiBreaker {
 mod tests {
     use super::*;
     use crate::utils::request::render_apisix_template;
+
+    #[test]
+    fn breaker_state_capacity_evicts_oldest_without_scan() {
+        let mut states = BreakerStates::default();
+        for i in 0..MAX_BREAKER_KEYS {
+            states.entry(i.to_string());
+        }
+        states.entry("new".to_string());
+        assert_eq!(states.entries.len(), MAX_BREAKER_KEYS);
+        assert!(!states.entries.contains_key("0"));
+        assert!(states.entries.contains_key("new"));
+    }
 
     #[test]
     fn breaker_window_grows_exponentially_and_caps() {
@@ -460,6 +504,18 @@ mod tests {
             }),
             "alice:/alice"
         );
+    }
+
+    #[test]
+    fn status_code_set_membership_is_precomputed() {
+        let set = StatusCodeSet::from_statuses(&[200, 302, 503]);
+        assert!(set.contains(200));
+        assert!(set.contains(302));
+        assert!(set.contains(503));
+        assert!(!set.contains(201));
+        assert!(!set.contains(500));
+        // Out of bitset range is safely ignored.
+        assert!(!StatusCodeSet::from_statuses(&[700]).contains(700));
     }
 
     #[test]

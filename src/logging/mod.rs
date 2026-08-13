@@ -168,8 +168,8 @@ async fn rotate_log_file(path: &str, max_backups: u32) -> io::Result<()> {
 
 impl Logger {
     pub fn new(config: config::Log) -> Self {
-        // Bounded channel with configurable buffer size (default: 1024)
-        let (sender, receiver) = channel::<Vec<u8>>(4096);
+        // Bounded channel with configurable capacity (default: 4096)
+        let (sender, receiver) = channel::<Vec<u8>>(config.channel_capacity);
         Self {
             sender,
             receiver,
@@ -185,11 +185,17 @@ impl Logger {
         }
     }
 
-    pub fn init_env_logger(&self) {
+    /// Try to install this instance's asynchronous writer as Rust's one
+    /// process-global logger.
+    ///
+    /// The `log` facade permits exactly one logger for the entire process. A
+    /// later gateway runtime must retain the logger already installed by the
+    /// first runtime rather than panic or start an unreferenced writer service.
+    pub fn try_init_env_logger(&self) -> Result<(), log::SetLoggerError> {
         let writer = self.create_async_writer();
         Builder::from_env(env_logger::Env::default().default_filter_or("info"))
             .target(env_logger::Target::Pipe(Box::new(writer)))
-            .init();
+            .try_init()
     }
 
     /// Report a runtime writer error to stderr (never via `log::error!`, which
@@ -235,9 +241,16 @@ impl Service for Logger {
         // `file_writer` is `None` when the file could not be opened; in that
         // case we keep the loop running and redirect every received log line
         // to stderr so application logs are not silently lost.
+        let mut written_bytes: u64 = 0;
         let mut file_writer: Option<BufWriter<tokio::fs::File>> =
             match open_log_file(log_file_path).await {
-                Ok(f) => Some(BufWriter::with_capacity(4096, f)),
+                Ok(f) => {
+                    // One metadata read at startup preserves the configured
+                    // size bound for an existing append-only log file without
+                    // returning to a stat syscall for every message.
+                    written_bytes = f.metadata().await.map(|m| m.len()).unwrap_or(0);
+                    Some(BufWriter::with_capacity(4096, f))
+                }
                 Err(e) => {
                     // Runtime fallback marker: the AsyncWriter will now write
                     // directly to stderr once the channel fills or this service
@@ -254,6 +267,8 @@ impl Service for Logger {
         // Use configurable flush interval (default: 5 seconds)
         let mut flush_interval = interval(Duration::from_secs(5));
         let mut fail_count: u64 = 0;
+        // `written_bytes` starts at the existing file length and is then
+        // maintained in memory, avoiding a per-message `metadata()` syscall.
 
         loop {
             tokio::select! {
@@ -291,6 +306,8 @@ impl Service for Logger {
                                     match file.write_all(&data).await {
                                         Ok(()) => {
                                             fail_count = 0;
+                                            written_bytes =
+                                                written_bytes.saturating_add(data.len() as u64);
                                             true
                                         }
                                         Err(e) => {
@@ -322,16 +339,10 @@ impl Service for Logger {
                                 }
 
                                 // Rotate between messages, preserving the active writer's
-                                // ordering and bounding retained disk use.
+                                // ordering and bounding retained disk use. The byte
+                                // accumulator avoids a per-message file `metadata()` stat.
                                 let should_rotate = self.config.rotation == config::LogRotation::Internal
-                                    && match file_writer.as_ref() {
-                                    Some(file) => file
-                                        .get_ref()
-                                        .metadata()
-                                        .await
-                                        .is_ok_and(|metadata| metadata.len() >= self.config.max_size_bytes),
-                                    None => false,
-                                };
+                                    && written_bytes >= self.config.max_size_bytes;
                                 if should_rotate {
                                     if let Some(file) = file_writer.as_mut() {
                                         if let Err(e) = file.flush().await {
@@ -349,6 +360,7 @@ impl Service for Logger {
                                         match open_log_file(log_file_path).await {
                                             Ok(file) => {
                                                 file_writer = Some(BufWriter::with_capacity(4096, file));
+                                                written_bytes = 0;
                                                 LOG_ROTATIONS.inc();
                                             }
                                             Err(e) => {
@@ -378,18 +390,24 @@ impl Service for Logger {
                                         break;
                                     };
                                     let file = file_writer.as_mut().unwrap();
-                                    if let Err(e) = file.write_all(&queued).await {
-                                        let _ = io::stderr().write_all(&queued);
-                                        Self::report_write_failure(
-                                            &mut fail_count,
-                                            log_file_path,
-                                            e,
-                                        )
-                                        .await;
-                                        file_writer = None;
-                                        self.stopped.store(true, Ordering::Relaxed);
-                                        switched = true;
-                                        break;
+                                    match file.write_all(&queued).await {
+                                        Ok(()) => {
+                                            written_bytes =
+                                                written_bytes.saturating_add(queued.len() as u64);
+                                        }
+                                        Err(e) => {
+                                            let _ = io::stderr().write_all(&queued);
+                                            Self::report_write_failure(
+                                                &mut fail_count,
+                                                log_file_path,
+                                                e,
+                                            )
+                                            .await;
+                                            file_writer = None;
+                                            self.stopped.store(true, Ordering::Relaxed);
+                                            switched = true;
+                                            break;
+                                        }
                                     }
                                 }
                                 if switched {
@@ -494,6 +512,7 @@ mod tests {
             max_size_bytes: 100 * 1024 * 1024,
             max_backups: 5,
             rotation: config::LogRotation::Internal,
+            channel_capacity: 4096,
         }
     }
 
@@ -645,5 +664,54 @@ mod tests {
             .await
             .is_ok();
         assert!(completed, "start_service did not shut down in time");
+    }
+
+    /// Size-based rotation driven by the byte accumulator (no per-message
+    /// `metadata()` stat). Crossing `max_size_bytes` must rotate and keep a
+    /// backup, and the current file must stay bounded.
+    #[tokio::test]
+    async fn size_accumulator_triggers_rotation() {
+        let dir = std::env::temp_dir().join(format!("pingsix-log-rot-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("app.log");
+
+        let mut cfg = config_for(path.to_string_lossy());
+        cfg.max_size_bytes = 64;
+        cfg.max_backups = 2;
+
+        let mut logger = Logger::new(cfg);
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let sender = logger.sender.clone();
+        let handle = tokio::spawn(async move {
+            logger.start_service(None, shutdown_rx, 0).await;
+        });
+
+        // Write enough to cross the 64-byte threshold across several select
+        // iterations (a batch drain can consume up to 256 messages, so the
+        // rotation check at the start of a later iteration is what trips).
+        for _ in 0..400 {
+            let _ = sender.try_send(vec![b'x'; 32]);
+        }
+        tokio::time::sleep(Duration::from_millis(800)).await;
+        shutdown_tx.send(true).unwrap();
+        let _ = tokio::time::timeout(Duration::from_secs(2), handle).await;
+
+        // At least one rotated backup must exist.
+        let backup1 = format!("{}.1", path.display());
+        assert!(
+            std::path::Path::new(&backup1).exists(),
+            "rotation should have created a .1 backup"
+        );
+        // Current file is bounded: rotation is checked at each iteration, so
+        // the live file can hold at most ~one batch (~8 KiB) past the threshold,
+        // far below the 12.8 KiB burst total.
+        let current_len = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+        assert!(
+            current_len < 9000,
+            "current file should be bounded after rotation, got {current_len}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -11,14 +11,11 @@ use etcd_client::{
 };
 use pingora::server::ListenFds;
 use pingora_core::{server::ShutdownWatch, services::Service};
-use tokio::{
-    sync::{Mutex, OnceCell},
-    time::sleep,
-};
+use tokio::{sync::OnceCell, time::sleep};
 
 use super::{Etcd, EtcdTls};
 use crate::{
-    core::{status, ProxyError, ProxyResult},
+    core::{status::StatusStore, ProxyError, ProxyResult},
     proxy::graph_mutation::{
         CommitRevision, ConfigurationGraph, GraphCommit, GraphError, GraphStore, ResourceKey,
         ResourceKind, StoreError, StoredChange, StoredGraph, StoredMutation, StoredResource,
@@ -54,10 +51,11 @@ pub struct EtcdConfigSync {
     client: Option<Client>,
     revision: i64,
     graph: Arc<ConfigurationGraph>,
+    status: Arc<StatusStore>,
 }
 
 impl EtcdConfigSync {
-    pub fn new(config: Etcd, graph: Arc<ConfigurationGraph>) -> Self {
+    pub fn new(config: Etcd, graph: Arc<ConfigurationGraph>, status: Arc<StatusStore>) -> Self {
         let canonical_prefix = canonicalize_prefix(&config.prefix);
         Self {
             config,
@@ -65,6 +63,7 @@ impl EtcdConfigSync {
             client: None,
             revision: 0,
             graph,
+            status,
         }
     }
 
@@ -100,7 +99,7 @@ impl EtcdConfigSync {
 
         // Mark transport recovery before submitting: a fast publish must be the
         // operation that clears the reconnect publication fence.
-        status::record_sync_success(revision);
+        self.status.record_sync_success(revision);
         let kvs: Vec<ListKv<'_>> = response
             .kvs()
             .iter()
@@ -121,7 +120,7 @@ impl EtcdConfigSync {
             .replace_all(snapshot)
             .map_err(classify_rejection)?;
         self.revision = revision;
-        status::set_revision(Some(revision));
+        self.status.set_revision(Some(revision));
         Ok(())
     }
 
@@ -145,7 +144,7 @@ impl EtcdConfigSync {
                 ProxyError::etcd_error_with_cause(format!("Failed to watch key '{prefix}'"), e)
             })?;
 
-        status::mark_etcd_connected(true);
+        self.status.mark_etcd_connected(true);
 
         // Periodically request progress so last_success advances even when the server
         // is quiet and its own progress interval is longer than config_stale_after.
@@ -186,7 +185,7 @@ impl EtcdConfigSync {
 
                     if let Some(header) = response.header() {
                         self.revision = header.revision();
-                        status::record_sync_success(self.revision);
+                        self.status.record_sync_success(self.revision);
                     }
                 }
                 _ = progress_interval.tick() => {
@@ -208,7 +207,7 @@ impl EtcdConfigSync {
     fn reset_client(&mut self) {
         log::debug!("Resetting etcd client for prefix '{}'", self.config.prefix);
         self.client = None;
-        status::mark_etcd_connected(false);
+        self.status.mark_etcd_connected(false);
     }
 
     /// Main task loop for synchronization.
@@ -228,14 +227,14 @@ impl EtcdConfigSync {
                         log::error!("List operation failed for prefix '{}': {:?}", self.config.prefix, err);
                         match &err {
                             SyncError::Transport(_) => {
-                                status::record_sync_error(err.to_string());
+                                self.status.record_sync_error(err.to_string());
                                 self.reset_client();
                             }
                             SyncError::Data(_) => {
                                 // Broken configuration data: keep the etcd
                                 // connection and readiness on the LKG while
                                 // relisting for an operator repair.
-                                status::record_preparation_error(err.to_string());
+                                self.status.record_preparation_error(err.to_string());
                             }
                         }
                         if sleep_or_shutdown(LIST_RETRY_DELAY, &shutdown).await {
@@ -260,11 +259,11 @@ impl EtcdConfigSync {
                         log::error!("Watch operation failed for prefix '{}': {:?}", self.config.prefix, err);
                         match &err {
                             SyncError::Transport(_) => {
-                                status::record_sync_error(err.to_string());
+                                self.status.record_sync_error(err.to_string());
                                 self.reset_client();
                             }
                             SyncError::Data(_) => {
-                                status::record_preparation_error(err.to_string());
+                                self.status.record_preparation_error(err.to_string());
                             }
                         }
                         if sleep_or_shutdown(WATCH_RETRY_DELAY, &shutdown).await {
@@ -286,7 +285,7 @@ impl Service for EtcdConfigSync {
         shutdown: ShutdownWatch,
         _listeners_per_fd: usize,
     ) {
-        status::begin_etcd_sync();
+        self.status.begin_etcd_sync();
         self.run_sync_loop(shutdown).await
     }
 
@@ -557,7 +556,11 @@ pub const GRAPH_PROTOCOL_VERSION: &[u8] = b"pingsix-graph-v1";
 pub struct EtcdGraphStore {
     config: Etcd,
     canonical_prefix: String,
-    client: OnceCell<Mutex<Client>>,
+    /// `etcd_client::Client` is `Clone` and internally shares one gRPC channel,
+    /// so each operation clones the handle instead of holding a mutex across a
+    /// network `await`. That removes head-of-line blocking between concurrent
+    /// Admin/etcd requests.
+    client: OnceCell<Client>,
 }
 
 impl EtcdGraphStore {
@@ -575,20 +578,19 @@ impl EtcdGraphStore {
         &self.canonical_prefix
     }
 
-    async fn ensure_connected(&self) -> ProxyResult<&Mutex<Client>> {
-        self.client
+    async fn ensure_connected(&self) -> ProxyResult<Client> {
+        Ok(self
+            .client
             .get_or_try_init(|| async {
                 log::debug!("Creating etcd client for prefix '{}'", self.config.prefix);
-                let client = create_client(&self.config).await?;
-                Ok::<Mutex<Client>, ProxyError>(Mutex::new(client))
+                create_client(&self.config).await
             })
-            .await
-            .map_err(|e| ProxyError::etcd_error_with_cause("Failed to create etcd client", e))
+            .await?
+            .clone())
     }
 
     pub async fn list(&self, key: &str) -> ProxyResult<etcd_client::GetResponse> {
-        let client_mutex = self.ensure_connected().await?;
-        let mut client = client_mutex.lock().await;
+        let mut client = self.ensure_connected().await?;
 
         let prefixed_key = self.with_prefix(key);
         let options = GetOptions::new().with_prefix();
@@ -613,8 +615,7 @@ impl EtcdGraphStore {
         expected_mod_revision: Option<i64>,
         guard_mod_revision: Option<i64>,
     ) -> ProxyResult<i64> {
-        let client_mutex = self.ensure_connected().await?;
-        let mut client = client_mutex.lock().await;
+        let mut client = self.ensure_connected().await?;
         let target = match expected_mod_revision {
             None => Compare::create_revision(key.as_bytes(), CompareOp::Equal, 0),
             Some(revision) => Compare::mod_revision(key.as_bytes(), CompareOp::Equal, revision),
@@ -661,11 +662,10 @@ impl EtcdGraphStore {
 #[async_trait]
 impl GraphStore for EtcdGraphStore {
     async fn snapshot(&self) -> Result<StoredGraph, StoreError> {
-        let client_mutex = self
+        let mut client = self
             .ensure_connected()
             .await
             .map_err(|e| StoreError::Unavailable { source: e })?;
-        let mut client = client_mutex.lock().await;
 
         let options = GetOptions::new().with_prefix();
         let response = client

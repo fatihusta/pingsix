@@ -163,6 +163,8 @@ impl ProxyRoute {
         upstreams: &HashMap<String, Arc<ProxyUpstream>>,
         services: &HashMap<String, Arc<ProxyService>>,
         prepared: &PreparedUpstreams,
+        defaults: &config::EffectiveDefaults,
+        resolver: &Arc<hickory_resolver::TokioResolver>,
     ) -> ProxyResult<Self> {
         let service = route
             .service_id
@@ -190,6 +192,8 @@ impl ProxyRoute {
                                 route.id
                             ))
                         })?,
+                    defaults,
+                    resolver,
                 )
                 .with_context(&format!(
                     "Failed to create upstream for route '{}'",
@@ -224,8 +228,10 @@ impl ProxyRoute {
         let mut plugins = Vec::with_capacity(route.plugins.len());
         let owner = TrafficSplitOwner::Route(route.id.clone());
         for (name, value) in route.plugins.clone() {
-            let plugin = build_plugin_with_upstreams(&name, value, upstreams, prepared, &owner)
-                .map_err(|e| ProxyError::Plugin(format!("Failed to build plugin '{name}': {e}")))?;
+            let plugin = build_plugin_with_upstreams(
+                &name, value, upstreams, prepared, &owner, defaults, resolver,
+            )
+            .map_err(|e| ProxyError::Plugin(format!("Failed to build plugin '{name}': {e}")))?;
             plugins.push(plugin);
         }
         sort_plugins_by_priority_desc(plugins.as_mut_slice());
@@ -803,8 +809,16 @@ mod tests {
 
         let upstreams = HashMap::new();
         let services = HashMap::new();
-        let proxy_route =
-            ProxyRoute::build(route_cfg, &upstreams, &services, &HashMap::new()).unwrap();
+        let resolver = crate::proxy::upstream::discovery::get_global_resolver_for_build().unwrap();
+        let proxy_route = ProxyRoute::build(
+            route_cfg,
+            &upstreams,
+            &services,
+            &HashMap::new(),
+            &config::EffectiveDefaults::global(),
+            &resolver,
+        )
+        .unwrap();
         let exec = proxy_route.build_plugin_executor();
         assert!(Arc::ptr_eq(&exec, &ProxyPluginExecutor::default_shared()));
     }

@@ -14,7 +14,10 @@ use crate::core::{apply_regex_uri_template, ProxyContext, ProxyError, ProxyPlugi
 pub const PLUGIN_NAME: &str = "proxy-rewrite";
 const PRIORITY: i32 = 1008;
 
-pub fn create_proxy_rewrite_plugin(cfg: JsonValue) -> ProxyResult<Arc<dyn ProxyPlugin>> {
+pub fn create_proxy_rewrite_plugin(
+    cfg: JsonValue,
+    _defaults: &crate::config::EffectiveDefaults,
+) -> ProxyResult<Arc<dyn ProxyPlugin>> {
     let config = PluginConfig::try_from(cfg)?;
 
     // Precompile regex patterns for regex_uri to improve performance

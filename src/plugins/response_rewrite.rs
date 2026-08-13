@@ -19,7 +19,10 @@ use crate::{
 pub const PLUGIN_NAME: &str = "response-rewrite";
 const PRIORITY: i32 = 899;
 
-pub fn create_response_rewrite_plugin(cfg: JsonValue) -> ProxyResult<Arc<dyn ProxyPlugin>> {
+pub fn create_response_rewrite_plugin(
+    cfg: JsonValue,
+    _defaults: &crate::config::EffectiveDefaults,
+) -> ProxyResult<Arc<dyn ProxyPlugin>> {
     let config = PluginConfig::try_from(cfg)?;
     Ok(Arc::new(PluginResponseRewrite { config }))
 }

@@ -6,6 +6,7 @@ use std::{
 };
 
 use futures::FutureExt;
+use hickory_resolver::TokioResolver;
 use http::Uri;
 use pingora::services::background::background_service;
 use pingora_core::upstreams::peer::HttpPeer;
@@ -21,7 +22,7 @@ use pingora_load_balancing::{
 use pingora_proxy::Session;
 
 use crate::{
-    config::{self, Identifiable},
+    config::{self, EffectiveDefaults, Identifiable},
     core::{PassiveOutcome, ProxyError, ProxyResult, UpstreamSelector},
     proxy::upstream::selection,
     utils::request::request_selector_key,
@@ -55,8 +56,13 @@ pub struct ProxyUpstream {
     lb: SelectionLB,
     /// Stable fingerprint of origin-identity fields used for cache namespacing.
     cache_origin_fingerprint: u64,
-    /// Passive health-check counters keyed by backend hash (APISIX `checks.passive`).
+    /// Passive health-check counters keyed by collision-free backend identity
+    /// (APISIX `checks.passive`).
     passive: Option<PassiveHealthState>,
+    /// Effective `pingsix.defaults.upstream_timeout` captured at build time, so
+    /// peer timeouts honor the owning gateway instance's defaults without
+    /// reading the process-global OnceCell on every request.
+    default_timeout: Option<config::Timeout>,
 }
 
 /// Per-upstream passive health-check state: real-traffic failure counters per
@@ -64,7 +70,10 @@ pub struct ProxyUpstream {
 /// timeouts (APISIX `resty.healthcheck` semantics).
 struct PassiveHealthState {
     config: config::PassiveCheck,
-    counters: Mutex<HashMap<String, PassiveCounters>>,
+    /// Keyed by stable backend id (`selection::backend_id`) instead of the
+    /// backend address string, so observe/select paths never allocate a
+    /// `String` per lookup.
+    counters: Mutex<HashMap<selection::BackendId, PassiveCounters>>,
     #[cfg(test)]
     on_transition: Option<Box<dyn Fn(bool) + Send + Sync>>,
 }
@@ -92,7 +101,7 @@ struct PassiveCounters {
 impl PassiveHealthState {
     fn observe(&self, backend: &Backend, outcome: PassiveOutcome) {
         let mut counters = self.counters.lock().unwrap_or_else(|e| e.into_inner());
-        let node = counters.entry(backend.addr.to_string()).or_default();
+        let node = counters.entry(selection::backend_id(backend)).or_default();
 
         let unhealthy = &self.config.unhealthy;
         let healthy_statuses = &self.config.healthy.http_statuses;
@@ -164,18 +173,6 @@ impl PassiveHealthState {
         node.probe_lease = None;
     }
 
-    /// Admit normal traffic only to nodes that passive checking has not tripped.
-    fn allows_regular(&self, backend: &Backend) -> bool {
-        !self
-            .counters
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .get(&backend.addr.to_string())
-            .is_some_and(|node| node.tripped)
-    }
-
-    /// Whether any tracked node is currently passive-tripped. Used to decide
-    /// between half-open probing and the all-unready active fallback.
     fn has_tripped(&self) -> bool {
         self.counters
             .lock()
@@ -189,7 +186,7 @@ impl PassiveHealthState {
     /// so healthy nodes always continue to receive normal traffic.
     fn take_probe(&self, backend: &Backend, now: Instant) -> bool {
         let mut counters = self.counters.lock().unwrap_or_else(|e| e.into_inner());
-        let Some(node) = counters.get_mut(&backend.addr.to_string()) else {
+        let Some(node) = counters.get_mut(&selection::backend_id(backend)) else {
             return false;
         };
         let lease_free = node.probe_lease.map(|d| d <= now).unwrap_or(true);
@@ -263,15 +260,19 @@ impl ProxyUpstream {
     /// explicitly prepared material to [`Self::build`].
     #[cfg(test)]
     pub(crate) fn build_static(upstream: config::Upstream) -> ProxyResult<Self> {
-        let prepared = prepare_static_upstream(&upstream)?;
-        Self::build(upstream, prepared)
+        let resolver = super::discovery::get_global_resolver_for_build()?;
+        let prepared = prepare_static_upstream(&upstream, &resolver)?;
+        Self::build(upstream, prepared, &EffectiveDefaults::global(), &resolver)
     }
 
     /// Build an upstream from material prepared before candidate compilation.
-    /// This constructor never performs discovery I/O.
+    /// This constructor never performs discovery I/O. `defaults` supplies the
+    /// effective `pingsix.defaults` fallbacks for this gateway instance.
     pub(crate) fn build(
         mut upstream: config::Upstream,
         prepared: PreparedUpstream,
+        defaults: &EffectiveDefaults,
+        resolver: &Arc<TokioResolver>,
     ) -> ProxyResult<Self> {
         // Auto-generate upstream ID if empty (for inline upstreams in route, service, traffic-split)
         if upstream.id.is_empty() {
@@ -280,9 +281,10 @@ impl ProxyUpstream {
         }
 
         let cache_origin_fingerprint = cache_origin_fingerprint(&upstream);
-        let lb = SelectionLB::from_prepared(upstream.clone(), prepared).map_err(|e| {
-            ProxyError::Configuration(format!("Failed to create load balancer: {e}"))
-        })?;
+        let lb = SelectionLB::from_prepared(upstream.clone(), prepared, defaults, resolver)
+            .map_err(|e| {
+                ProxyError::Configuration(format!("Failed to create load balancer: {e}"))
+            })?;
 
         // Passive state intentionally does not call `Backends::set_enable`:
         // Pingora has no half-open transition for manually disabled backends.
@@ -303,6 +305,7 @@ impl ProxyUpstream {
             lb,
             cache_origin_fingerprint,
             passive,
+            default_timeout: defaults.upstream_timeout.clone(),
         })
     }
 
@@ -313,11 +316,18 @@ impl ProxyUpstream {
     }
 
     fn select_with_passive(&self, key: &[u8]) -> Option<Backend> {
-        // 1. Prefer actively-ready nodes that passive checking has not tripped.
+        // State is keyed structurally by socket address and weight. Consult it
+        // in-place: unlike the former per-request `Vec` snapshot this neither
+        // allocates nor linearly scans tripped candidates.
         let regular = |backend: &Backend| {
-            self.passive
-                .as_ref()
-                .is_none_or(|passive| passive.allows_regular(backend))
+            self.passive.as_ref().is_none_or(|passive| {
+                !passive
+                    .counters
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .get(&selection::backend_id(backend))
+                    .is_some_and(|node| node.tripped)
+            })
         };
         if let Some(backend) = with_lb!(&self.lb, |lb| {
             lb.upstreams
@@ -335,7 +345,7 @@ impl ProxyUpstream {
         if self
             .passive
             .as_ref()
-            .is_some_and(|passive| passive.has_tripped())
+            .is_some_and(PassiveHealthState::has_tripped)
         {
             if let Some(backend) = with_lb!(&self.lb, |lb| {
                 lb.upstreams
@@ -378,7 +388,7 @@ impl ProxyUpstream {
             send,
         } = config::resolve_upstream_timeout(
             self.inner.timeout.clone(),
-            config::default_upstream_timeout(),
+            self.default_timeout.clone(),
         );
         p.options.connection_timeout = Some(Duration::from_secs(connect));
         p.options.read_timeout = Some(Duration::from_secs(read));
@@ -433,8 +443,8 @@ impl UpstreamSelector for ProxyUpstream {
         }
     }
 
-    fn cache_isolation_key(&self) -> String {
-        format!("{:x}", self.cache_origin_fingerprint)
+    fn cache_isolation_key(&self) -> u64 {
+        self.cache_origin_fingerprint
     }
 
     fn observe_passive(&self, backend: &Backend, outcome: PassiveOutcome) {
@@ -452,19 +462,24 @@ enum SelectionLB {
 }
 
 impl SelectionLB {
-    fn from_prepared(value: config::Upstream, prepared: PreparedUpstream) -> ProxyResult<Self> {
+    fn from_prepared(
+        value: config::Upstream,
+        prepared: PreparedUpstream,
+        defaults: &EffectiveDefaults,
+        resolver: &Arc<TokioResolver>,
+    ) -> ProxyResult<Self> {
         match value.r#type {
             config::SelectionType::RoundRobin => Ok(SelectionLB::RoundRobin(
-                LB::<RoundRobin>::from_prepared(value, prepared)?,
+                LB::<RoundRobin>::from_prepared(value, prepared, defaults, resolver)?,
             )),
             config::SelectionType::Random => Ok(SelectionLB::Random(LB::<Random>::from_prepared(
-                value, prepared,
+                value, prepared, defaults, resolver,
             )?)),
             config::SelectionType::Fnv => Ok(SelectionLB::Fnv(LB::<FVNHash>::from_prepared(
-                value, prepared,
+                value, prepared, defaults, resolver,
             )?)),
             config::SelectionType::Ketama => Ok(SelectionLB::Ketama(
-                LB::<KetamaHashing>::from_prepared(value, prepared)?,
+                LB::<KetamaHashing>::from_prepared(value, prepared, defaults, resolver)?,
             )),
         }
     }
@@ -489,8 +504,13 @@ where
         selection::select_backend(&self.upstreams, key, MAX_LB_ITERATIONS)
     }
 
-    fn from_prepared(upstream: config::Upstream, prepared: PreparedUpstream) -> ProxyResult<Self> {
-        let refresh: HybridDiscovery = upstream.clone().try_into()?;
+    fn from_prepared(
+        upstream: config::Upstream,
+        prepared: PreparedUpstream,
+        defaults: &EffectiveDefaults,
+        resolver: &Arc<TokioResolver>,
+    ) -> ProxyResult<Self> {
+        let refresh: HybridDiscovery = HybridDiscovery::build(upstream.clone(), resolver.clone())?;
         let discovery = SeededDiscovery::new(prepared, refresh);
         let mut upstreams = LoadBalancer::<selection::PriorityGrouped<BS>>::from_backends(
             Backends::new(Box::new(discovery)),
@@ -518,8 +538,12 @@ where
             }
         }
 
-        if let Some(interval) = config::dns_refresh_interval() {
-            upstreams.update_frequency = Some(Duration::from_secs(interval));
+        if let Some(interval) = defaults.dns_refresh_interval {
+            // Pingora exposes one refresh frequency per upstream, rather than
+            // a scheduler hook. Derive a stable, bounded phase from the
+            // upstream id so otherwise-identical instances do not refresh in
+            // lockstep while reloads retain their cadence.
+            upstreams.update_frequency = Some(dns_refresh_frequency(&upstream.id, interval));
         }
 
         // Extract the Arc<LoadBalancer> via background_service().task().
@@ -546,6 +570,29 @@ where
 
         Ok(Self { upstreams })
     }
+}
+
+/// Stable upstream-level DNS refresh jitter for Pingora's frequency-only API.
+/// The base interval remains the lower bound; jitter is at most 10% (capped at
+/// 60 seconds) and is represented at millisecond precision for small values.
+fn dns_refresh_frequency(upstream_id: &str, interval_secs: u64) -> Duration {
+    let base = Duration::from_secs(interval_secs);
+    let jitter = base / 10;
+    let jitter = jitter.min(Duration::from_secs(60));
+    if jitter.is_zero() {
+        return base;
+    }
+
+    // FNV-1a is used only to distribute a deterministic schedule; this is not
+    // an identity or security boundary.
+    let hash = upstream_id
+        .bytes()
+        .fold(0xcbf29ce484222325u64, |hash, byte| {
+            (hash ^ u64::from(byte)).wrapping_mul(0x100000001b3)
+        });
+    let jitter_nanos = jitter.as_nanos();
+    let offset = Duration::from_nanos((u128::from(hash) % (jitter_nanos + 1)) as u64);
+    base + offset
 }
 
 impl TryFrom<config::ActiveCheck> for Box<dyn HealthCheckTrait + Send + Sync + 'static> {
@@ -729,6 +776,43 @@ mod tests {
     }
 
     #[test]
+    fn injected_defaults_produce_distinct_peer_timeouts() {
+        // Two gateway instances with different `pingsix.defaults.upstream_timeout`
+        // must yield different peer timeouts for the same upstream config.
+        let make = |defaults: &EffectiveDefaults| {
+            let upstream = sample_upstream("plain", None);
+            let resolver =
+                crate::proxy::upstream::discovery::get_global_resolver_for_build().unwrap();
+            let prepared =
+                crate::proxy::upstream::discovery::prepare_static_upstream(&upstream, &resolver)
+                    .unwrap();
+            let built = ProxyUpstream::build(upstream, prepared, defaults, &resolver).unwrap();
+            let backend = built.select_backend_for_test().unwrap();
+            backend.ext.get::<HttpPeer>().unwrap().clone()
+        };
+        let a = make(&EffectiveDefaults {
+            upstream_timeout: Some(Timeout {
+                connect: 1,
+                send: 2,
+                read: 3,
+            }),
+            ..EffectiveDefaults::default()
+        });
+        let b = make(&EffectiveDefaults {
+            upstream_timeout: Some(Timeout {
+                connect: 9,
+                send: 8,
+                read: 7,
+            }),
+            ..EffectiveDefaults::default()
+        });
+        assert_eq!(a.options.connection_timeout, Some(Duration::from_secs(1)));
+        assert_eq!(a.options.read_timeout, Some(Duration::from_secs(3)));
+        assert_eq!(b.options.connection_timeout, Some(Duration::from_secs(9)));
+        assert_eq!(b.options.read_timeout, Some(Duration::from_secs(7)));
+    }
+
+    #[test]
     fn missing_upstream_timeout_uses_global_default() {
         init_default_upstream_timeout(Some(Timeout {
             connect: 5,
@@ -754,6 +838,20 @@ mod tests {
         } else {
             assert!(peer.options.connection_timeout.is_none());
         }
+    }
+
+    #[test]
+    fn dns_refresh_jitter_is_stable_and_bounded() {
+        let a = dns_refresh_frequency("orders", 60);
+        assert_eq!(a, dns_refresh_frequency("orders", 60));
+        assert!(a >= Duration::from_secs(60));
+        assert!(a <= Duration::from_secs(66));
+        // A spread of IDs should exercise distinct phases without any timing
+        // dependency or external resolver.
+        let phases: std::collections::HashSet<_> = (0..64)
+            .map(|n| dns_refresh_frequency(&format!("upstream-{n}"), 60))
+            .collect();
+        assert!(phases.len() > 1, "stable jitter must spread refreshes");
     }
 
     #[test]
@@ -819,10 +917,14 @@ mod tests {
     fn duplicate_addr_keeps_higher_priority() {
         // Pingora Backend identity ignores ext; same addr+weight collapses.
         // We keep the higher priority so negative cannot "stick" over 0/10.
-        let prepared = prepare_static_upstream(&config::Upstream {
-            nodes: Nodes(vec![node("127.0.0.1", 443, -1), node("127.0.0.1", 443, 10)]),
-            ..sample_upstream("dup", None)
-        })
+        let resolver = crate::proxy::upstream::discovery::get_global_resolver_for_build().unwrap();
+        let prepared = prepare_static_upstream(
+            &config::Upstream {
+                nodes: Nodes(vec![node("127.0.0.1", 443, -1), node("127.0.0.1", 443, 10)]),
+                ..sample_upstream("dup", None)
+            },
+            &resolver,
+        )
         .unwrap();
 
         assert_eq!(prepared.backends.len(), 1);
@@ -1173,12 +1275,45 @@ mod passive_tests {
         let now = Instant::now();
         state.observe(&b, PassiveOutcome::Http(500));
         assert_eq!(trips.load(std::sync::atomic::Ordering::SeqCst), 1);
-        assert!(!state.allows_regular(&b));
+        assert!(state.has_tripped());
         assert!(state.take_probe(&b, now));
         // A second probe within the lease window is refused.
         assert!(!state.take_probe(&b, now));
         state.observe(&b, PassiveOutcome::Http(200));
-        assert!(state.allows_regular(&b));
+        assert!(!state.has_tripped());
+    }
+
+    #[test]
+    fn half_open_probe_allows_exactly_one_concurrent_winner() {
+        use std::sync::{Arc, Barrier};
+
+        let (state, trips, _) = test_state(1, 2, 7, 1);
+        let state = Arc::new(state);
+        let b = backend();
+        state.observe(&b, PassiveOutcome::Http(500));
+        assert_eq!(trips.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+        let workers = 32;
+        let barrier = Arc::new(Barrier::new(workers));
+        let winners: Vec<_> = (0..workers)
+            .map(|_| {
+                let state = state.clone();
+                let barrier = barrier.clone();
+                let backend = b.clone();
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    state.take_probe(&backend, Instant::now()) as usize
+                })
+            })
+            .collect();
+        assert_eq!(
+            winners
+                .into_iter()
+                .map(|worker| worker.join().unwrap())
+                .sum::<usize>(),
+            1,
+            "the half-open lease must elect exactly one concurrent probe"
+        );
     }
 
     #[test]

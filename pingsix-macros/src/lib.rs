@@ -102,6 +102,7 @@ fn expand_encrypt_fields(input: &DeriveInput) -> Result<proc_macro2::TokenStream
                         __obj,
                         #json_name,
                         __op,
+                        __keyring,
                     )?;
                 });
             }
@@ -113,6 +114,7 @@ fn expand_encrypt_fields(input: &DeriveInput) -> Result<proc_macro2::TokenStream
                             <#inner_ty as crate::utils::encryption::EncryptFields>::transform_secrets(
                                 __nested,
                                 __op,
+                                __keyring,
                             )?;
                         }
                     }
@@ -126,7 +128,7 @@ fn expand_encrypt_fields(input: &DeriveInput) -> Result<proc_macro2::TokenStream
                                 if let Some(__transform) =
                                     crate::plugins::PLUGIN_ENCRYPT_FIELDS.get(__name.as_str())
                                 {
-                                    __transform(__cfg, __op)?;
+                                    __transform(__cfg, __op, __keyring)?;
                                 }
                             }
                         }
@@ -153,11 +155,13 @@ fn expand_encrypt_fields(input: &DeriveInput) -> Result<proc_macro2::TokenStream
             fn transform_secrets(
                 config: &mut serde_json::Value,
                 op: crate::utils::encryption::SecretOp,
+                keyring: &crate::utils::encryption::KeyringService,
             ) -> crate::core::ProxyResult<()> {
                 let Some(__obj) = config.as_object_mut() else {
                     return Ok(());
                 };
                 let __op = op;
+                let __keyring = keyring;
                 #(#transform_stmts)*
                 Ok(())
             }

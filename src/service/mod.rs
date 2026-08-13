@@ -1,8 +1,10 @@
 //! Process-level gateway runtime.
 //!
-//! [`GatewayRuntime`] owns initialization order (defaults → config source →
-//! server → services → listeners), service registration, and bounded shutdown
-//! of the configuration graph. `main` is a thin CLI/fatal-error adapter.
+//! [`GatewayRuntime::build`] assembles one instance-owned [`GatewayState`]
+//! (readiness, runtime snapshots, effective defaults, encryption keyring,
+//! cache, health-check registry, DNS resolver) and injects it into every
+//! submodule, so repeated in-process builds never share state. `main` is a
+//! thin CLI/fatal-error adapter.
 
 pub mod http;
 pub mod status;
@@ -21,16 +23,92 @@ use pingora_proxy::{http_proxy_service_with_name, HttpProxy};
 use sentry::IntoDsn;
 
 use crate::admin::AdminHttpApp;
-use crate::config::{self, etcd::EtcdConfigSync, Config};
-use crate::core;
+use crate::config::{self, etcd::EtcdConfigSync, Config, EffectiveDefaults};
+use crate::core::status::StatusStore;
 use crate::logging::Logger;
 use crate::proxy::{
-    graph_mutation::ConfigurationGraph, ssl::DynamicCert, upstream::SHARED_HEALTH_CHECK_SERVICE,
+    graph_mutation::ConfigurationGraph, runtime::RuntimeStore, ssl::DynamicCert,
+    upstream::health_check::SharedHealthCheckService,
 };
-use crate::service::{http::HttpService, status::StatusHttpApp};
+use crate::service::{
+    http::{CacheRuntime, HttpService},
+    status::StatusHttpApp,
+};
+use crate::utils::encryption::KeyringService;
+use hickory_resolver::TokioResolver;
 
 // Service name constants
 const PINGSIX_SERVICE: &str = "pingsix";
+
+/// Instance-owned runtime state assembled once per [`GatewayRuntime::build`].
+///
+/// Every submodule (configuration graph, etcd sync, status app, HTTP service,
+/// health-check executor) receives references into this single state, so two
+/// builds in one process never share readiness, published snapshots, defaults,
+/// encryption keyrings, cache namespaces, health-check registries, or DNS
+/// resolvers.
+pub struct GatewayState {
+    /// Readiness / etcd-sync status (status HTTP app, graph, etcd sync).
+    pub status: Arc<StatusStore>,
+    /// Published runtime snapshots + health-check registration (graph, HTTP
+    /// service, TLS callback).
+    pub runtime: Arc<RuntimeStore>,
+    /// Effective `pingsix.defaults` resolved at startup (candidate
+    /// preparation/compilation, cache sizing).
+    pub defaults: EffectiveDefaults,
+    /// Field-encryption service (admin write path, control-plane load path).
+    pub keyring: Arc<KeyringService>,
+    /// Response-cache backend/eviction/lock (HTTP service).
+    pub cache: Arc<CacheRuntime>,
+    /// Health-check registry + executor service (registered with the server).
+    pub health_check: Arc<SharedHealthCheckService>,
+    /// DNS resolver (candidate preparation, refresh discovery).
+    pub resolver: Arc<TokioResolver>,
+}
+
+impl GatewayState {
+    /// Assemble a fresh state from configuration. Every component is
+    /// instance-owned: nothing here reads the process-global facades.
+    pub fn build(config: &Config) -> Result<Self, String> {
+        let defaults = EffectiveDefaults::from_pingsix(&config.pingsix);
+        let status = Arc::new(StatusStore::new());
+        let health_check = Arc::new(SharedHealthCheckService::new());
+        let runtime = Arc::new(RuntimeStore::with_state(
+            status.clone(),
+            health_check.clone(),
+        ));
+        let (enable, keyring) = match &config.pingsix.data_encryption {
+            Some(c) => (c.enable, c.keyring.as_slice()),
+            None => (false, &[][..]),
+        };
+        let keyring = Arc::new(KeyringService::new(enable, keyring).map_err(|e| e.to_string())?);
+        if enable {
+            log::info!(
+                "Data encryption enabled with {} keyring key(s)",
+                keyring_key_count(&config.pingsix)
+            );
+        }
+        let cache = Arc::new(CacheRuntime::new(&defaults.cache));
+        let resolver = crate::proxy::upstream::discovery::build_resolver_for_state()
+            .map_err(|e| e.to_string())?;
+        Ok(Self {
+            status,
+            runtime,
+            defaults,
+            keyring,
+            cache,
+            health_check,
+            resolver,
+        })
+    }
+}
+
+fn keyring_key_count(cfg: &config::Pingsix) -> usize {
+    cfg.data_encryption
+        .as_ref()
+        .map(|c| c.keyring.len())
+        .unwrap_or(0)
+}
 
 /// The complete gateway process: owns startup order, service registration, and
 /// the configuration graph's lifecycle.
@@ -42,16 +120,19 @@ pub struct GatewayRuntime {
 impl GatewayRuntime {
     /// Build the full process from a loaded configuration.
     ///
-    /// Order is significant: logging, then `pingsix.defaults` and data
+    /// Order is significant: process-global logging, then `pingsix.defaults` and data
     /// encryption (plugins and upstream peers bake these in at construction),
     /// then the configuration source (etcd graph or static YAML), then the
     /// server, services, and listeners. A failure here aborts startup before
     /// any listener accepts traffic.
     pub fn build(opt: Opt, config: Config) -> Result<Self, String> {
         let logger = init_logger(&config);
-        init_pingsix_defaults(&config.pingsix)?;
 
-        let (etcd_sync, config_graph) = init_config_source(&config)?;
+        // Single composition root: every submodule below receives references
+        // into this one instance-owned state.
+        let state = GatewayState::build(&config)?;
+
+        let (etcd_sync, config_graph) = init_config_source(&config, &state)?;
 
         let mut server = Server::new_with_opt_and_conf(Some(opt), config.pingora);
 
@@ -68,9 +149,10 @@ impl GatewayRuntime {
         }
 
         // Shared health check service reduces overhead by consolidating upstream
-        // health monitoring and DNS refresh.
+        // health monitoring and DNS refresh. The instance-owned service is
+        // registered so its executor runs against THIS state's registry.
         log::debug!("Initializing shared health check service");
-        server.add_service(SHARED_HEALTH_CHECK_SERVICE.clone());
+        server.add_service((*state.health_check).clone());
 
         // The runtime owns the graph's shutdown: a lifecycle service stops the
         // preparation worker on process shutdown, so the etcd transport never
@@ -79,10 +161,20 @@ impl GatewayRuntime {
             server.add_service(GraphShutdownService { graph });
         }
 
-        add_optional_services(&mut server, &config.pingsix, config_graph)?;
+        add_optional_services(
+            &mut server,
+            &config.pingsix,
+            config_graph,
+            state.status.clone(),
+        )?;
 
-        let http_service = build_proxy_service(&server.configuration, &config.pingsix)
-            .map_err(|e| format!("Failed to configure listeners: {e}"))?;
+        let http_service = build_proxy_service(
+            &server.configuration,
+            &config.pingsix,
+            state.runtime.clone(),
+            state.cache.clone(),
+        )
+        .map_err(|e| format!("Failed to configure listeners: {e}"))?;
 
         Ok(Self {
             server,
@@ -137,39 +229,74 @@ impl pingora_core::services::Service for GraphShutdownService {
     }
 }
 
-/// Set up process-wide logging. Returns the logger service to register, if any.
+/// Set up process-wide logging and return the service that owns the installed
+/// writer, if this runtime won the one-time process-global installation race.
+///
+/// Rust's [`log`] facade has one immutable logger per process. Consequently the
+/// first successful gateway build owns the logging sink; later builds never
+/// panic and deliberately retain that sink instead of creating a Logger service
+/// whose channel cannot receive any records. Changing the log destination in a
+/// long-lived multi-runtime process requires a process restart.
 fn init_logger(config: &Config) -> Option<Logger> {
-    if let Some(log_cfg) = &config.pingsix.log {
+    let install = if let Some(log_cfg) = &config.pingsix.log {
         let logger = Logger::new(log_cfg.clone());
-        logger.init_env_logger();
-        Some(logger)
+        match logger.try_init_env_logger() {
+            Ok(()) => return Some(logger),
+            Err(_) => "custom file logger",
+        }
     } else {
-        env_logger::init();
-        None
-    }
+        match env_logger::try_init() {
+            Ok(()) => return None,
+            Err(_) => "default env logger",
+        }
+    };
+
+    // `try_init` only fails here because a logger is already installed. Do not
+    // use `log::warn!`: the pre-existing logger may itself be a failed/custom
+    // sink, and direct stderr keeps the ownership decision observable.
+    eprintln!(
+        "A process-global logger is already installed; this gateway build will retain it and ignore its requested {install}"
+    );
+    None
 }
 
 /// Choose the configuration source: etcd for dynamic updates in distributed
 /// environments, or static file for simple setups.
 fn init_config_source(
     config: &Config,
+    state: &GatewayState,
 ) -> Result<(Option<EtcdConfigSync>, Option<Arc<ConfigurationGraph>>), String> {
     if let Some(etcd_cfg) = &config.pingsix.etcd {
         log::debug!(
             "Initializing etcd config sync with prefix: {}",
             etcd_cfg.prefix
         );
-        let graph = Arc::new(ConfigurationGraph::new(Arc::new(
-            crate::config::etcd::EtcdGraphStore::new(etcd_cfg.clone()),
-        )));
+        let graph = Arc::new(ConfigurationGraph::with_state(
+            Arc::new(crate::config::etcd::EtcdGraphStore::new(etcd_cfg.clone())),
+            state.status.clone(),
+            state.runtime.clone(),
+            state.defaults.clone(),
+            state.keyring.clone(),
+            state.resolver.clone(),
+        ));
         Ok((
-            Some(EtcdConfigSync::new(etcd_cfg.clone(), graph.clone())),
+            Some(EtcdConfigSync::new(
+                etcd_cfg.clone(),
+                graph.clone(),
+                state.status.clone(),
+            )),
             Some(graph),
         ))
     } else {
         log::debug!("Loading static configurations from config file");
-        ConfigurationGraph::load_static(config)
-            .map_err(|e| format!("Failed to load static configurations: {e}"))?;
+        ConfigurationGraph::load_static(
+            config,
+            &state.status,
+            &state.runtime,
+            &state.defaults,
+            &state.resolver,
+        )
+        .map_err(|e| format!("Failed to load static configurations: {e}"))?;
         Ok((None, None))
     }
 }
@@ -181,13 +308,18 @@ fn init_config_source(
 fn build_proxy_service(
     server_conf: &Arc<pingora::server::configuration::ServerConf>,
     cfg: &config::Pingsix,
+    runtime: Arc<RuntimeStore>,
+    cache: Arc<CacheRuntime>,
 ) -> Result<Service<HttpProxy<HttpService>>, Box<dyn std::error::Error>> {
-    let mut http_service =
-        http_proxy_service_with_name(server_conf, HttpService {}, PINGSIX_SERVICE);
+    let mut http_service = http_proxy_service_with_name(
+        server_conf,
+        HttpService::new(runtime.clone(), cache),
+        PINGSIX_SERVICE,
+    );
 
     for list_cfg in cfg.listeners.iter() {
         if let Some(tls) = &list_cfg.tls {
-            let dynamic_cert = DynamicCert::new(tls).map_err(|e| {
+            let dynamic_cert = DynamicCert::new(tls, runtime.clone()).map_err(|e| {
                 std::io::Error::new(
                     std::io::ErrorKind::InvalidInput,
                     format!("Failed to initialize TLS certificate: {e}"),
@@ -232,6 +364,7 @@ fn add_optional_services(
     server: &mut Server,
     cfg: &config::Pingsix,
     config_graph: Option<Arc<ConfigurationGraph>>,
+    status: Arc<StatusStore>,
 ) -> Result<(), String> {
     if let Some(sentry_cfg) = &cfg.sentry {
         if is_example_sentry_dsn(&sentry_cfg.dsn) {
@@ -272,12 +405,12 @@ fn add_optional_services(
 
     if let Some(status_cfg) = &cfg.status {
         status_cfg.log_bind_safety();
-        core::status::configure_status_policy(
+        status.configure_policy(
             status_cfg.config_stale_after.unwrap_or(300),
             status_cfg.fail_readiness_when_stale,
         );
         log::debug!("Configuring status HTTP endpoint on {}", status_cfg.address);
-        let status_service_http = StatusHttpApp::status_http_service(status_cfg);
+        let status_service_http = StatusHttpApp::status_http_service(status_cfg, status);
         server.add_service(status_service_http);
         log::info!("Status HTTP endpoint enabled on {}", status_cfg.address);
     }
@@ -293,38 +426,6 @@ fn add_optional_services(
         log::info!(
             "Prometheus metrics endpoint enabled on {}",
             prometheus_cfg.address
-        );
-    }
-    Ok(())
-}
-
-/// Apply `pingsix.defaults` before any static/etcd resource graph is built.
-///
-/// Cache plugins and upstream peers resolve their fallbacks at construction time;
-/// initializing after static/etcd graph publication would leave the baked-in
-/// 1 MiB / absent-timeout fallbacks in place for the entire process lifetime.
-fn init_pingsix_defaults(cfg: &config::Pingsix) -> Result<(), String> {
-    if let Some(cache) = cfg.defaults.as_ref().and_then(|d| d.cache.as_ref()) {
-        crate::service::http::init_cache_defaults(cache);
-    }
-    if let Some(defaults) = &cfg.defaults {
-        crate::config::init_dns_resolution_timeout(defaults.dns_resolution_timeout);
-        crate::config::init_dns_refresh_interval(defaults.dns_refresh_interval);
-    }
-    crate::config::init_default_upstream_timeout(
-        cfg.defaults
-            .as_ref()
-            .and_then(|d| d.upstream_timeout.clone()),
-    );
-    let (enable, keyring) = match &cfg.data_encryption {
-        Some(c) => (c.enable, c.keyring.as_slice()),
-        None => (false, &[][..]),
-    };
-    crate::config::init_data_encryption(enable, keyring).map_err(|e| e.to_string())?;
-    if enable {
-        log::info!(
-            "Data encryption enabled with {} keyring key(s)",
-            keyring.len()
         );
     }
     Ok(())
@@ -351,12 +452,120 @@ mod tests {
     }
 
     #[test]
-    fn init_pingsix_defaults_rejects_bad_encryption_keyring() {
+    fn repeated_logger_initialization_is_non_panicking_and_first_wins() {
+        // The test process may already have a logger (or another test may win
+        // first). In either case both calls must be safe and only an installer
+        // receives a Logger service to register.
+        let config = config::Config::default();
+        let first = std::panic::catch_unwind(|| init_logger(&config));
+        assert!(first.is_ok());
+        let second = std::panic::catch_unwind(|| init_logger(&config));
+        assert!(second.is_ok());
+        assert!(first.unwrap().is_none() || second.unwrap().is_none());
+    }
+
+    #[test]
+    fn gateway_runtime_builds_twice_in_one_process() {
+        let mut config_a = config::Config::default();
+        config_a.pingsix.defaults = Some(config::Defaults {
+            upstream_timeout: Some(config::Timeout {
+                connect: 1,
+                send: 2,
+                read: 3,
+            }),
+            dns_resolution_timeout: 5,
+            dns_refresh_interval: None,
+            cache: None,
+        });
+        let mut config_b = config::Config::default();
+        config_b.pingsix.defaults = Some(config::Defaults {
+            upstream_timeout: Some(config::Timeout {
+                connect: 9,
+                send: 8,
+                read: 7,
+            }),
+            dns_resolution_timeout: 5,
+            dns_refresh_interval: None,
+            cache: None,
+        });
+
+        // Regression for `env_logger::init()`: the second complete runtime
+        // build must not panic or silently reuse A's injected state.
+        let first = GatewayRuntime::build(Opt::default(), config_a);
+        assert!(first.is_ok());
+        drop(first);
+        let second = GatewayRuntime::build(Opt::default(), config_b);
+        assert!(second.is_ok());
+    }
+
+    #[test]
+    fn gateway_state_rejects_bad_encryption_keyring() {
         let mut config = config::Config::default();
         config.pingsix.data_encryption = Some(config::DataEncryption {
             enable: true,
             keyring: vec![],
         });
-        assert!(init_pingsix_defaults(&config.pingsix).is_err());
+        assert!(GatewayState::build(&config).is_err());
+    }
+
+    #[test]
+    fn two_states_with_different_defaults_do_not_pollute_each_other() {
+        // Task 6 acceptance: repeated in-process builds must not silently
+        // ignore configuration — every state owns its defaults, status, and
+        // cache sizing.
+        let mut config_a = config::Config::default();
+        config_a.pingsix.defaults = Some(config::Defaults {
+            upstream_timeout: Some(config::Timeout {
+                connect: 1,
+                send: 2,
+                read: 3,
+            }),
+            dns_resolution_timeout: 2,
+            dns_refresh_interval: Some(7),
+            cache: Some(config::CacheDefaults {
+                max_memory_bytes: 11,
+                default_max_object_bytes: 12,
+            }),
+        });
+        let state_a = GatewayState::build(&config_a).unwrap();
+
+        let mut config_b = config::Config::default();
+        config_b.pingsix.defaults = Some(config::Defaults {
+            upstream_timeout: Some(config::Timeout {
+                connect: 9,
+                send: 8,
+                read: 7,
+            }),
+            dns_resolution_timeout: 5,
+            dns_refresh_interval: None,
+            cache: Some(config::CacheDefaults {
+                max_memory_bytes: 22,
+                default_max_object_bytes: 23,
+            }),
+        });
+        let state_b = GatewayState::build(&config_b).unwrap();
+
+        // Each build resolved its own defaults (no first-write-wins globals).
+        assert_eq!(
+            state_a.defaults.upstream_timeout.as_ref().unwrap().connect,
+            1
+        );
+        assert_eq!(
+            state_b.defaults.upstream_timeout.as_ref().unwrap().connect,
+            9
+        );
+        assert_eq!(state_a.defaults.cache.max_memory_bytes, 11);
+        assert_eq!(state_b.defaults.cache.max_memory_bytes, 22);
+
+        // Readiness state is per-instance: publishing on A never touches B.
+        state_a.status.set_published_revision(42);
+        assert_eq!(state_b.status.published_revision(), 0);
+        assert_eq!(state_a.status.published_revision(), 42);
+
+        // Distinct runtime snapshots, health-check registries, and cache
+        // backends (the Pingora `'static` edge is owned per instance).
+        assert!(!Arc::ptr_eq(&state_a.runtime, &state_b.runtime));
+        assert!(!Arc::ptr_eq(&state_a.health_check, &state_b.health_check));
+        assert!(!Arc::ptr_eq(&state_a.cache, &state_b.cache));
     }
 }

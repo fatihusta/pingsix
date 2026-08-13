@@ -159,7 +159,10 @@ impl Default for PrometheusConfig {
     }
 }
 
-pub fn create_prometheus_plugin(cfg: JsonValue) -> ProxyResult<Arc<dyn ProxyPlugin>> {
+pub fn create_prometheus_plugin(
+    cfg: JsonValue,
+    _defaults: &crate::config::EffectiveDefaults,
+) -> ProxyResult<Arc<dyn ProxyPlugin>> {
     let config = if cfg.is_null() {
         PrometheusConfig::default()
     } else {

@@ -213,6 +213,37 @@ admin_handler!(GetHandler);
 admin_handler!(DeleteHandler);
 admin_handler!(ListHandler);
 
+struct PublicationHandler;
+
+#[async_trait]
+impl Handler for PublicationHandler {
+    async fn handle(
+        &self,
+        graph: &ConfigurationGraph,
+        _prefix: &str,
+        _session: &mut ServerSession,
+        params: RequestParams,
+    ) -> ApiResult<ApiResponse> {
+        let revision = params
+            .get("revision")
+            .ok_or_else(|| ApiError::MissingParameter("revision".into()))?
+            .parse::<i64>()
+            .ok()
+            .filter(|revision| *revision > 0)
+            .ok_or_else(|| {
+                ApiError::InvalidRequest("revision must be a positive integer".into())
+            })?;
+        let publication = graph
+            .publication(revision)
+            .ok_or_else(|| ApiError::NotFound("Publication revision not found".into()))?;
+        Ok(ResponseBuilder::success_json(&serde_json::json!({
+            "state": publication.state,
+            "published_revision": publication.published_revision,
+            "error": publication.error,
+        })))
+    }
+}
+
 impl<T: AdminResource> ResourceHandler<T> {
     fn extract_key(params: &RequestParams) -> ApiResult<ResourceKey> {
         let id = params
@@ -259,7 +290,16 @@ impl<T: AdminResource> Handler for ResourceHandler<T> {
         // validation, and the guarded CAS all happen behind the authority.
         let committed = graph.put(key, value).await?;
 
-        let body = serde_json::json!({ "revision": committed.0 });
+        let publication = graph
+            .publication(committed.0)
+            .expect("committed revisions are registered before returning");
+        let body = serde_json::json!({
+            "revision": committed.0,
+            "committed_revision": committed.0,
+            "state": publication.state,
+            "published_revision": publication.published_revision,
+            "error": publication.error,
+        });
         Ok(ResponseBuilder::success_json(&body))
     }
 }
@@ -297,9 +337,19 @@ impl<T: AdminResource> Handler for DeleteHandler<T> {
     ) -> ApiResult<ApiResponse> {
         let key = ResourceHandler::<T>::extract_key(&params)?;
 
-        graph.delete(key).await?;
+        let committed = graph.delete(key).await?;
 
-        Ok(ResponseBuilder::success_http(Vec::new(), None))
+        let publication = graph
+            .publication(committed.0)
+            .expect("committed revisions are registered before returning");
+        let body = serde_json::json!({
+            "revision": committed.0,
+            "committed_revision": committed.0,
+            "state": publication.state,
+            "published_revision": publication.published_revision,
+            "error": publication.error,
+        });
+        Ok(ResponseBuilder::success_json(&body))
     }
 }
 
@@ -361,11 +411,16 @@ impl AdminHttpApp {
         };
 
         // Register routes with type safety and reduced boilerplate
-        this.register_resource_routes::<config::Route>()
-            .register_resource_routes::<config::Upstream>()
-            .register_resource_routes::<config::Service>()
-            .register_resource_routes::<config::GlobalRule>()
-            .register_resource_routes::<config::SSL>();
+        this.route(
+            "/apisix/admin/publications/{revision}",
+            Method::GET,
+            Box::new(PublicationHandler),
+        )
+        .register_resource_routes::<config::Route>()
+        .register_resource_routes::<config::Upstream>()
+        .register_resource_routes::<config::Service>()
+        .register_resource_routes::<config::GlobalRule>()
+        .register_resource_routes::<config::SSL>();
 
         this
     }

@@ -19,8 +19,8 @@ use validator::{Validate, ValidationError};
 pub use node::{Node, Nodes};
 
 /// Re-export so external callers (integration tests, other crates) can name the
-/// argument type of [`transform_resource_secrets`].
-pub use crate::utils::encryption::SecretOp;
+/// argument types of [`transform_resource_secrets`].
+pub use crate::utils::encryption::{KeyringService, SecretOp};
 
 /// Enables uniform ID handling across configuration entities for validation.
 pub trait Identifiable {
@@ -138,6 +138,13 @@ impl Config {
         Self::validate_unique_ids(&conf.ssls, "ssl")
             .or_err_with(FileReadError, || "SSL ID validation failed")?;
 
+        // Best-effort unrecognized-field warnings for static YAML resources.
+        // Unknown fields are still accepted (ingress metadata compatibility);
+        // this only logs likely typos of behavior fields.
+        if let Ok(graph) = serde_yml::from_str::<JsonValue>(conf_str) {
+            warn_static_resources(&graph);
+        }
+
         Ok(conf)
     }
 
@@ -192,6 +199,271 @@ impl Config {
             }
         }
         Ok(())
+    }
+}
+
+/// Schema of a dynamic configuration resource for unrecognized-field warnings.
+///
+/// Only typed object fields appear in `nested`. Deliberately free-form objects
+/// (`plugins`, `nodes`, and compatibility metadata) remain leaves: their
+/// contents belong to another schema or external producer and must not be
+/// diagnosed here.
+struct ResourceSchema {
+    fields: &'static [&'static str],
+    nested: &'static [(&'static str, &'static str)],
+}
+
+fn schema_for(id: &str) -> Option<&'static ResourceSchema> {
+    const ROUTE: ResourceSchema = ResourceSchema {
+        fields: &[
+            "id",
+            "name",
+            "uri",
+            "uris",
+            "methods",
+            "host",
+            "hosts",
+            "priority",
+            "plugins",
+            "upstream",
+            "upstream_id",
+            "service_id",
+            "timeout",
+            "enable_websocket",
+            "metadata",
+        ],
+        nested: &[("upstream", "upstream"), ("timeout", "timeout")],
+    };
+    const UPSTREAM: ResourceSchema = ResourceSchema {
+        fields: &[
+            "id",
+            "name",
+            "retries",
+            "retry_timeout",
+            "timeout",
+            "nodes",
+            "plugins",
+            "type",
+            "checks",
+            "hash_on",
+            "key",
+            "scheme",
+            "pass_host",
+            "upstream_host",
+            "tls",
+            "metadata",
+        ],
+        nested: &[
+            ("timeout", "timeout"),
+            ("checks", "health_check"),
+            ("tls", "upstream_tls"),
+        ],
+    };
+    const SERVICE: ResourceSchema = ResourceSchema {
+        fields: &[
+            "id",
+            "name",
+            "plugins",
+            "upstream",
+            "upstream_id",
+            "hosts",
+            "metadata",
+        ],
+        nested: &[("upstream", "upstream")],
+    };
+    const GLOBAL_RULE: ResourceSchema = ResourceSchema {
+        fields: &["id", "plugins", "metadata"],
+        nested: &[],
+    };
+    const SSL: ResourceSchema = ResourceSchema {
+        fields: &["id", "cert", "key", "snis", "metadata"],
+        nested: &[],
+    };
+    const TIMEOUT: ResourceSchema = ResourceSchema {
+        fields: &["connect", "send", "read"],
+        nested: &[],
+    };
+    const UPSTREAM_TLS: ResourceSchema = ResourceSchema {
+        fields: &["client_cert", "client_key"],
+        nested: &[],
+    };
+    const HEALTH_CHECK: ResourceSchema = ResourceSchema {
+        fields: &["active", "passive"],
+        nested: &[("active", "active_check"), ("passive", "passive_check")],
+    };
+    const ACTIVE_CHECK: ResourceSchema = ResourceSchema {
+        fields: &[
+            "type",
+            "timeout",
+            "http_path",
+            "host",
+            "port",
+            "https_verify_certificate",
+            "req_headers",
+            "healthy",
+            "unhealthy",
+        ],
+        nested: &[("healthy", "health"), ("unhealthy", "unhealthy")],
+    };
+    const HEALTH: ResourceSchema = ResourceSchema {
+        fields: &["interval", "http_statuses", "successes"],
+        nested: &[],
+    };
+    const UNHEALTHY: ResourceSchema = ResourceSchema {
+        fields: &["http_failures", "tcp_failures"],
+        nested: &[],
+    };
+    const PASSIVE_CHECK: ResourceSchema = ResourceSchema {
+        fields: &["type", "healthy", "unhealthy"],
+        nested: &[
+            ("healthy", "passive_healthy"),
+            ("unhealthy", "passive_unhealthy"),
+        ],
+    };
+    const PASSIVE_HEALTHY: ResourceSchema = ResourceSchema {
+        fields: &["http_statuses", "successes"],
+        nested: &[],
+    };
+    const PASSIVE_UNHEALTHY: ResourceSchema = ResourceSchema {
+        fields: &["http_statuses", "tcp_failures", "timeouts", "http_failures"],
+        nested: &[],
+    };
+    match id {
+        "route" => Some(&ROUTE),
+        "upstream" => Some(&UPSTREAM),
+        "service" => Some(&SERVICE),
+        "global_rule" => Some(&GLOBAL_RULE),
+        "ssl" => Some(&SSL),
+        "timeout" => Some(&TIMEOUT),
+        "upstream_tls" => Some(&UPSTREAM_TLS),
+        "health_check" => Some(&HEALTH_CHECK),
+        "active_check" => Some(&ACTIVE_CHECK),
+        "health" => Some(&HEALTH),
+        "unhealthy" => Some(&UNHEALTHY),
+        "passive_check" => Some(&PASSIVE_CHECK),
+        "passive_healthy" => Some(&PASSIVE_HEALTHY),
+        "passive_unhealthy" => Some(&PASSIVE_UNHEALTHY),
+        _ => None,
+    }
+}
+
+/// Edit distance between two short field names for typo suggestions.
+fn edit_distance(a: &str, b: &str) -> usize {
+    let a: Vec<char> = a.chars().collect();
+    let b: Vec<char> = b.chars().collect();
+    if a.is_empty() {
+        return b.len();
+    }
+    if b.is_empty() {
+        return a.len();
+    }
+    let mut prev: Vec<usize> = (0..=b.len()).collect();
+    let mut curr = vec![0usize; b.len() + 1];
+    for (i, ac) in a.iter().enumerate() {
+        curr[0] = i + 1;
+        for (j, bc) in b.iter().enumerate() {
+            let cost = if ac == bc { 0 } else { 1 };
+            curr[j + 1] = (prev[j + 1] + 1).min(curr[j] + 1).min(prev[j] + cost);
+        }
+        std::mem::swap(&mut prev, &mut curr);
+    }
+    prev[b.len()]
+}
+
+/// Warn about unrecognized fields on a resource object, suggesting likely
+/// typos of known behavior fields. Unknown fields are still accepted (ingress
+/// metadata compatibility); this only logs, so a typo like `retry_timout` does
+/// not fail silently while the operator believes it took effect.
+///
+/// `resource_type` is the plural store segment (e.g. `"upstreams"`).
+pub(crate) fn warn_unrecognized_fields(resource_type: &str, value: &JsonValue) {
+    for warning in unrecognized_fields(resource_type, value) {
+        if let Some(suggestion) = warning.suggestion {
+            log::warn!(
+                "Configuration: field '{}' is not recognized; did you mean '{}'? It will be ignored.",
+                warning.path,
+                suggestion,
+            );
+        } else {
+            log::warn!(
+                "Configuration: field '{}' is not recognized and will be ignored.",
+                warning.path,
+            );
+        }
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct FieldWarning {
+    path: String,
+    suggestion: Option<&'static str>,
+}
+
+/// Find warnings without emitting them, keeping warning traversal testable.
+fn unrecognized_fields(resource_type: &str, value: &JsonValue) -> Vec<FieldWarning> {
+    let schema_id = match resource_type {
+        "routes" => "route",
+        "upstreams" => "upstream",
+        "services" => "service",
+        "global_rules" => "global_rule",
+        "ssls" => "ssl",
+        _ => return Vec::new(),
+    };
+    let mut warnings = Vec::new();
+    collect_schema_warnings(schema_id, resource_type, value, &mut warnings);
+    warnings
+}
+
+fn collect_schema_warnings(
+    schema_id: &str,
+    path: &str,
+    value: &JsonValue,
+    warnings: &mut Vec<FieldWarning>,
+) {
+    let (Some(schema), Some(obj)) = (schema_for(schema_id), value.as_object()) else {
+        return;
+    };
+    for (key, val) in obj {
+        let field_path = format!("{path}.{key}");
+        if schema.fields.contains(&key.as_str()) {
+            if let Some(nested_id) = schema
+                .nested
+                .iter()
+                .find_map(|(field, id)| (*field == key.as_str()).then_some(*id))
+            {
+                collect_schema_warnings(nested_id, &field_path, val, warnings);
+            }
+            continue;
+        }
+        warnings.push(FieldWarning {
+            path: field_path,
+            suggestion: suggest_field(schema, key, key.chars().count()),
+        });
+    }
+}
+
+/// Closest known field to `key` within edit distance 1..=2, else `None`.
+fn suggest_field(schema: &ResourceSchema, key: &str, key_len: usize) -> Option<&'static str> {
+    schema
+        .fields
+        .iter()
+        .copied()
+        .filter(|known| known.chars().count().abs_diff(key_len) <= 2)
+        .map(|known| (known, edit_distance(key, known)))
+        .filter(|(_, d)| *d > 0 && *d <= 2)
+        .min_by_key(|(_, d)| *d)
+        .map(|(k, _)| k)
+}
+
+/// Best-effort unrecognized-field warnings for the top-level resource arrays of
+/// a static YAML document (etcd/Admin resources are checked at decode time).
+fn warn_static_resources(graph: &JsonValue) {
+    for key in ["routes", "upstreams", "services", "global_rules", "ssls"] {
+        if let Some(arr) = graph.get(key).and_then(|v| v.as_array()) {
+            for elem in arr {
+                warn_unrecognized_fields(key, elem);
+            }
+        }
     }
 }
 
@@ -307,9 +579,81 @@ impl CacheDefaults {
     }
 }
 
+impl Default for CacheDefaults {
+    fn default() -> Self {
+        Self {
+            max_memory_bytes: Self::default_max_memory_bytes(),
+            default_max_object_bytes: Self::default_max_object_bytes(),
+        }
+    }
+}
+
+/// Instance-owned effective defaults resolved once at startup from
+/// `pingsix.defaults` (plus built-in fallbacks for unset knobs).
+///
+/// The process-global `init_*`/getter facade remains for migration; new code
+/// resolves its fallbacks from an injected `EffectiveDefaults` at construction
+/// time so two gateway runtimes in one process can use different defaults.
+#[derive(Clone, Debug)]
+pub struct EffectiveDefaults {
+    /// Fallback upstream timeout used when neither route nor upstream sets one.
+    pub upstream_timeout: Option<Timeout>,
+    /// Maximum time spent resolving an upstream DNS name (seconds).
+    pub dns_resolution_timeout: u64,
+    /// Optional DNS refresh interval for published upstream load balancers.
+    pub dns_refresh_interval: Option<u64>,
+    /// Response-cache capacity knobs.
+    pub cache: CacheDefaults,
+}
+
+impl EffectiveDefaults {
+    /// Resolve effective defaults from `pingsix.defaults`, applying the same
+    /// built-in fallbacks the deserializer would use for absent fields.
+    pub fn from_pingsix(cfg: &Pingsix) -> Self {
+        let defaults = cfg.defaults.as_ref();
+        Self {
+            upstream_timeout: defaults.and_then(|d| d.upstream_timeout.clone()),
+            dns_resolution_timeout: defaults
+                .map(|d| d.dns_resolution_timeout)
+                .unwrap_or_else(Defaults::default_dns_resolution_timeout),
+            dns_refresh_interval: defaults.and_then(|d| d.dns_refresh_interval),
+            cache: defaults.and_then(|d| d.cache.clone()).unwrap_or_default(),
+        }
+    }
+
+    /// The migration-period process-global defaults, read from the legacy
+    /// `init_*` OnceCells so the facade and injected paths agree.
+    pub fn global() -> Self {
+        Self {
+            upstream_timeout: default_upstream_timeout(),
+            dns_resolution_timeout: dns_resolution_timeout(),
+            dns_refresh_interval: dns_refresh_interval(),
+            cache: CacheDefaults {
+                max_memory_bytes: crate::service::http::configured_max_memory_bytes(),
+                default_max_object_bytes: crate::plugins::cache::default_max_object_bytes(),
+            },
+        }
+    }
+}
+
+impl Default for EffectiveDefaults {
+    fn default() -> Self {
+        Self {
+            upstream_timeout: None,
+            dns_resolution_timeout: Defaults::default_dns_resolution_timeout(),
+            dns_refresh_interval: None,
+            cache: CacheDefaults::default(),
+        }
+    }
+}
+
 /// Global default upstream timeout, populated once at startup from
 /// `pingsix.defaults.upstream_timeout`. Used as a fallback when a route or
 /// upstream does not configure its own `timeout`.
+///
+/// Migration facade retained as test scaffolding: production resolves
+/// [`EffectiveDefaults`] per gateway build; these OnceCells back
+/// [`EffectiveDefaults::global`] and the legacy getters used by unit tests.
 static DEFAULT_UPSTREAM_TIMEOUT: once_cell::sync::OnceCell<Option<Timeout>> =
     once_cell::sync::OnceCell::new();
 static DNS_RESOLUTION_TIMEOUT: once_cell::sync::OnceCell<u64> = once_cell::sync::OnceCell::new();
@@ -364,17 +708,18 @@ pub fn init_data_encryption(enable: bool, keyring: &[String]) -> crate::core::Pr
 /// three paths at once — no changes here, and no separate redaction list.
 /// Unknown resource types pass through unchanged.
 pub fn transform_resource_secrets(
+    keyring: &crate::utils::encryption::KeyringService,
     resource_type: &str,
     value: &mut JsonValue,
     op: SecretOp,
 ) -> crate::core::ProxyResult<()> {
     use crate::utils::encryption::EncryptFields;
     match resource_type {
-        "ssls" => SSL::transform_secrets(value, op),
-        "upstreams" => Upstream::transform_secrets(value, op),
-        "routes" => Route::transform_secrets(value, op),
-        "services" => Service::transform_secrets(value, op),
-        "global_rules" => GlobalRule::transform_secrets(value, op),
+        "ssls" => SSL::transform_secrets(value, op, keyring),
+        "upstreams" => Upstream::transform_secrets(value, op, keyring),
+        "routes" => Route::transform_secrets(value, op, keyring),
+        "services" => Service::transform_secrets(value, op, keyring),
+        "global_rules" => GlobalRule::transform_secrets(value, op, keyring),
         _ => Ok(()),
     }
 }
@@ -584,6 +929,13 @@ pub struct Log {
     /// and disabled modes must be selected explicitly.
     #[serde(default)]
     pub rotation: LogRotation,
+
+    /// Bounded capacity of the async log channel (buffered log lines pending the
+    /// writer). Defaults to 4096; larger values smooth bursts at the cost of
+    /// memory under a stalled sink.
+    #[serde(default = "Log::default_channel_capacity")]
+    #[validate(range(min = 64))]
+    pub channel_capacity: usize,
 }
 
 /// Log file rotation strategy.
@@ -610,6 +962,10 @@ impl Log {
 
     fn default_max_backups() -> u32 {
         5
+    }
+
+    fn default_channel_capacity() -> usize {
+        4096
     }
 
     fn validate_path(path: &str) -> Result<(), ValidationError> {
@@ -1155,6 +1511,7 @@ pub struct SSL {
 mod tests {
     use super::*;
     use crate::utils::encryption::EncryptFields;
+    use crate::utils::encryption::KeyringService;
     use http::Method;
 
     fn init_log() {
@@ -1845,7 +2202,9 @@ upstreams:
                 "client_key": format!("{CIPHERTEXT_PREFIX}deadbeef"),
             }
         });
-        let err = Upstream::transform_secrets(&mut cfg, SecretOp::Decrypt).unwrap_err();
+        let err =
+            Upstream::transform_secrets(&mut cfg, SecretOp::Decrypt, &KeyringService::global())
+                .unwrap_err();
         assert!(
             err.to_string().contains("data_encryption is disabled")
                 || err.to_string().contains("Encrypted value"),
@@ -1872,7 +2231,13 @@ upstreams:
                 }
             }
         });
-        let err = transform_resource_secrets("routes", &mut route, SecretOp::Decrypt).unwrap_err();
+        let err = transform_resource_secrets(
+            &KeyringService::global(),
+            "routes",
+            &mut route,
+            SecretOp::Decrypt,
+        )
+        .unwrap_err();
         assert!(
             err.to_string().contains("data_encryption is disabled")
                 || err.to_string().contains("Encrypted value"),
@@ -1890,7 +2255,13 @@ upstreams:
                 }
             }
         });
-        let err = transform_resource_secrets("routes", &mut route, SecretOp::Decrypt).unwrap_err();
+        let err = transform_resource_secrets(
+            &KeyringService::global(),
+            "routes",
+            &mut route,
+            SecretOp::Decrypt,
+        )
+        .unwrap_err();
         assert!(
             err.to_string().contains("data_encryption is disabled")
                 || err.to_string().contains("Encrypted value"),
@@ -1899,7 +2270,13 @@ upstreams:
 
         // Unknown resource types are a no-op pass-through.
         let mut other = serde_json::json!({ "foo": "bar" });
-        transform_resource_secrets("unknown", &mut other, SecretOp::Decrypt).unwrap();
+        transform_resource_secrets(
+            &KeyringService::global(),
+            "unknown",
+            &mut other,
+            SecretOp::Decrypt,
+        )
+        .unwrap();
         assert_eq!(other["foo"], "bar");
     }
 
@@ -1990,6 +2367,71 @@ routes:
             conf.is_ok(),
             "Expected unknown fields in resources to be accepted, got error: {:?}",
             conf.err()
+        );
+    }
+
+    #[test]
+    fn unrecognized_field_warnings_include_full_typed_paths_and_skip_free_objects() {
+        let resource = serde_json::json!({
+            "nodes": { "backend:80": { "weigth": 1 } },
+            "plugins": { "example": { "config_typo": true } },
+            "metadata": { "annotation_typo": true },
+            "checks": {
+                "active": {
+                    "healthy": { "sucesses": 2 },
+                },
+                "passive": {
+                    "unhealthy": { "http_failuers": 3 },
+                },
+            },
+            "tls": { "client_kay": "private" },
+        });
+
+        let warnings = unrecognized_fields("upstreams", &resource);
+        assert_eq!(
+            warnings,
+            vec![
+                FieldWarning {
+                    path: "upstreams.checks.active.healthy.sucesses".into(),
+                    suggestion: Some("successes"),
+                },
+                FieldWarning {
+                    path: "upstreams.checks.passive.unhealthy.http_failuers".into(),
+                    suggestion: Some("http_failures"),
+                },
+                FieldWarning {
+                    path: "upstreams.tls.client_kay".into(),
+                    suggestion: Some("client_key"),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn unknown_field_typos_suggest_the_closest_known_field() {
+        let upstream = schema_for("upstream").expect("upstream schema exists");
+        // `retry_timout` is one deletion away from `retry_timeout`.
+        assert_eq!(
+            suggest_field(upstream, "retry_timout", "retry_timout".chars().count()),
+            Some("retry_timeout")
+        );
+        // A completely unrelated field gets no suggestion.
+        assert_eq!(
+            suggest_field(
+                upstream,
+                "totally_unrelated",
+                "totally_unrelated".chars().count()
+            ),
+            None
+        );
+        // A known field is not a typo of itself; suggestion is for *other* fields only.
+        assert_eq!(
+            suggest_field(
+                schema_for("route").unwrap(),
+                "upstream",
+                "upstream".chars().count()
+            ),
+            None
         );
     }
 

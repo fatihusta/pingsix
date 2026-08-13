@@ -35,12 +35,52 @@ use pingora_load_balancing::{
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct NodePriority(pub i8);
 
+/// Collision-free, allocation-free identity for per-backend state.
+///
+/// Pingora's backend identity comprises the socket address and weight. Keep
+/// those fields directly rather than reducing them to a `u64` hash: `HashMap`
+/// can still hash this key for indexing, but equality resolves collisions.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) struct BackendId {
+    addr: std::net::SocketAddr,
+    weight: usize,
+}
+
 pub(crate) fn set_backend_priority(backend: &mut Backend, priority: i8) {
     backend.ext.insert(NodePriority(priority));
 }
 
 pub(crate) fn backend_priority(backend: &Backend) -> i8 {
     backend.ext.get::<NodePriority>().map(|p| p.0).unwrap_or(0)
+}
+
+/// Stamp a stable [`BackendId`] onto a backend. Called once on every backend
+/// construction path in discovery.
+pub(crate) fn set_backend_id(backend: &mut Backend) {
+    let addr = *backend
+        .addr
+        .as_inet()
+        .expect("pingsix upstream backends must use internet socket addresses");
+    backend.ext.insert(BackendId {
+        addr,
+        weight: backend.weight,
+    });
+}
+
+/// Stable backend identity for per-backend state lookups. Production backends
+/// are stamped during construction; retaining this structural fallback keeps
+/// direct unit-test backends correct without reintroducing hash collisions.
+pub(crate) fn backend_id(backend: &Backend) -> BackendId {
+    backend.ext.get::<BackendId>().copied().unwrap_or_else(|| {
+        let addr = *backend
+            .addr
+            .as_inet()
+            .expect("pingsix upstream backends must use internet socket addresses");
+        BackendId {
+            addr,
+            weight: backend.weight,
+        }
+    })
 }
 
 /// Insert `backend` into `set`, keeping the higher priority when Pingora identity
@@ -311,6 +351,7 @@ mod tests {
     fn backend(addr: &str, weight: usize, priority: i8) -> Backend {
         let mut backend = Backend::new_with_weight(addr, weight).unwrap();
         set_backend_priority(&mut backend, priority);
+        set_backend_id(&mut backend);
         backend
     }
 

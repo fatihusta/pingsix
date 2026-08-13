@@ -25,7 +25,10 @@ const DEFAULT_API_KEY_HEADER: &str = "apikey";
 /// Creates a Key Auth plugin instance with the given configuration.
 /// This plugin authenticates requests by matching an API key in the HTTP header or query parameter
 /// against configured keys. If the key is invalid or missing, it returns a `401 Unauthorized` response.
-pub fn create_key_auth_plugin(cfg: JsonValue) -> ProxyResult<Arc<dyn ProxyPlugin>> {
+pub fn create_key_auth_plugin(
+    cfg: JsonValue,
+    _defaults: &crate::config::EffectiveDefaults,
+) -> ProxyResult<Arc<dyn ProxyPlugin>> {
     let config = PluginConfig::try_from(cfg)?;
     let key_digests = config
         .get_valid_keys()
@@ -214,6 +217,7 @@ impl PluginKeyAuth {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::utils::encryption::KeyringService;
     use crate::utils::encryption::{EncryptFields, SecretOp, CIPHERTEXT_PREFIX};
 
     #[test]
@@ -224,7 +228,8 @@ mod tests {
             "keys": ["a", "b"],
         });
         // Encryption disabled → plaintext pass-through.
-        PluginConfig::transform_secrets(&mut cfg, SecretOp::Decrypt).unwrap();
+        PluginConfig::transform_secrets(&mut cfg, SecretOp::Decrypt, &KeyringService::global())
+            .unwrap();
         assert_eq!(cfg["header"], "apikey");
         assert_eq!(cfg["key"], "single-secret");
         assert_eq!(cfg["keys"], serde_json::json!(["a", "b"]));
@@ -237,7 +242,9 @@ mod tests {
             "keys": [format!("{CIPHERTEXT_PREFIX}deadbeef"), "plain"],
         });
         // Ciphertext with encryption disabled proves the array walk ran.
-        let err = PluginConfig::transform_secrets(&mut cfg, SecretOp::Decrypt).unwrap_err();
+        let err =
+            PluginConfig::transform_secrets(&mut cfg, SecretOp::Decrypt, &KeyringService::global())
+                .unwrap_err();
         assert!(
             err.to_string().contains("data_encryption is disabled")
                 || err.to_string().contains("Encrypted value"),
@@ -249,8 +256,13 @@ mod tests {
     fn secrets_transform_const_matches_trait_method() {
         let mut via_const = serde_json::json!({ "keys": ["s"] });
         let mut via_trait = via_const.clone();
-        (SECRETS_TRANSFORM)(&mut via_const, SecretOp::Decrypt).unwrap();
-        PluginConfig::transform_secrets(&mut via_trait, SecretOp::Decrypt).unwrap();
+        (SECRETS_TRANSFORM)(&mut via_const, SecretOp::Decrypt, &KeyringService::global()).unwrap();
+        PluginConfig::transform_secrets(
+            &mut via_trait,
+            SecretOp::Decrypt,
+            &KeyringService::global(),
+        )
+        .unwrap();
         assert_eq!(via_const, via_trait);
     }
 

@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use log;
-use matchit::{InsertError, Router as MatchRouter};
+use matchit::Router as MatchRouter;
 use pingora::listeners::TlsAccept;
 use pingora::tls::ext;
 use pingora::tls::pkey::PKey;
@@ -15,7 +15,7 @@ use crate::{
     core::ProxyError,
 };
 
-use super::runtime::RUNTIME;
+use super::runtime::RuntimeStore;
 
 static DEFAULT_SERVER_NAME: &str = "*";
 
@@ -31,6 +31,22 @@ impl TryFrom<config::SSL> for ProxySSL {
     type Error = ProxyError;
 
     fn try_from(value: config::SSL) -> std::result::Result<Self, Self::Error> {
+        for sni in &value.snis {
+            let wildcard_count = sni.bytes().filter(|b| *b == b'*').count();
+            let valid_wildcard = sni == "*"
+                || (wildcard_count == 1
+                    && sni.starts_with("*.")
+                    && sni.len() > 2
+                    && !sni[2..].starts_with('.')
+                    && !sni.ends_with('.'));
+            if wildcard_count > 0 && !valid_wildcard {
+                return Err(ProxyError::Configuration(format!(
+                    "Unsupported TLS wildcard SNI '{sni}' for '{}'; use '*' or '*.example.com'",
+                    value.id
+                )));
+            }
+        }
+
         let parsed_cert = X509::from_pem(value.cert.as_bytes()).map_err(|e| {
             ProxyError::Configuration(format!("Failed to parse cert for '{}': {e}", value.id))
         })?;
@@ -79,9 +95,25 @@ impl ProxySSL {
     }
 }
 
+/// TLS SNI matcher.
+///
+/// Wildcard SNI patterns (`*.example.com`) match exactly **one** DNS label,
+/// mirroring standard certificate wildcard semantics (RFC 6125): a request
+/// for `a.b.example.com` does NOT match a `*.example.com` certificate. HTTP
+/// route host wildcards intentionally keep broader (multi-label) semantics;
+/// that is a separate product decision and lives in `route.rs`.
 #[derive(Default)]
 pub struct MatchEntry {
+    /// Exact (non-wildcard) SNI hosts, stored reversed so matchit matches by
+    /// suffix. An exact entry always beats any wildcard.
     snis: MatchRouter<Arc<ProxySSL>>,
+    /// `*.suffix` wildcards. Sorted longest-suffix-first at build time so the
+    /// most specific match wins. Each matches a single label in front of
+    /// `suffix`.
+    wildcards: Vec<(String, Arc<ProxySSL>)>,
+    /// Bare `*` catch-all, matching any SNI. Lower priority than exact and any
+    /// concrete wildcard.
+    catch_all: Option<Arc<ProxySSL>>,
 }
 
 impl MatchEntry {
@@ -90,54 +122,116 @@ impl MatchEntry {
     ) -> std::result::Result<Self, ProxyError> {
         let mut matcher = Self::default();
         for ssl in ssls.values() {
-            matcher.insert_ssl(ssl.clone()).map_err(|e| {
-                ProxyError::Configuration(format!(
-                    "Failed to build SSL matcher for '{}': {e}",
-                    ssl.inner.id
-                ))
-            })?;
+            matcher.insert_ssl(ssl.clone())?;
         }
+        // Longest suffix first so the most specific wildcard wins.
+        matcher
+            .wildcards
+            .sort_by_key(|(suffix, _)| std::cmp::Reverse(suffix.len()));
         Ok(matcher)
     }
 
     /// Inserts an SSL into the match entry.
-    /// Supports wildcard SNI patterns (e.g., "*.example.com") by converting them to matchit format.
-    fn insert_ssl(&mut self, proxy_ssl: Arc<ProxySSL>) -> Result<(), InsertError> {
+    ///
+    /// Supports wildcard SNI patterns (`*.example.com`), which match exactly
+    /// one DNS label, plus the explicit bare `*` catch-all. Unsupported forms
+    /// are rejected while constructing [`ProxySSL`]. Duplicate patterns are
+    /// rejected here so certificate selection is deterministic.
+    fn insert_ssl(&mut self, proxy_ssl: Arc<ProxySSL>) -> Result<(), ProxyError> {
         for sni in proxy_ssl.get_snis() {
             let normalized = sni.to_ascii_lowercase();
-            let processed_sni = if let Some(domain_part) = normalized.strip_prefix('*') {
-                let reversed_domain: String = domain_part.chars().rev().collect();
-                format!("{reversed_domain}{{*subdomain}}")
-            } else {
-                normalized.chars().rev().collect()
-            };
-
-            self.snis.insert(processed_sni, proxy_ssl.clone())?;
+            if normalized == "*" {
+                if self.catch_all.is_some() {
+                    return Err(ProxyError::Configuration(
+                        "Duplicate TLS catch-all SNI '*'".to_string(),
+                    ));
+                }
+                self.catch_all = Some(proxy_ssl.clone());
+                continue;
+            }
+            if let Some(suffix) = normalized.strip_prefix("*.") {
+                if self
+                    .wildcards
+                    .iter()
+                    .any(|(existing, _)| existing == suffix)
+                {
+                    return Err(ProxyError::Configuration(format!(
+                        "Duplicate TLS wildcard SNI '*.{suffix}'"
+                    )));
+                }
+                self.wildcards.push((suffix.to_string(), proxy_ssl.clone()));
+                continue;
+            }
+            let reversed: String = normalized.chars().rev().collect();
+            self.snis
+                .insert(reversed, proxy_ssl.clone())
+                .map_err(|error| {
+                    ProxyError::Configuration(format!(
+                        "Failed to insert TLS SNI '{sni}' for '{}': {error}",
+                        proxy_ssl.inner.id
+                    ))
+                })?;
         }
 
         Ok(())
     }
 
-    /// Matches an SNI to an SSL (ASCII case-insensitive, same as HTTP Host matcher).
+    /// Matches an SNI to an SSL (ASCII case-insensitive).
     pub(crate) fn match_sni(&self, sni: &str) -> Option<Arc<ProxySSL>> {
         let normalized = sni.to_ascii_lowercase();
-        let reversed_sni = normalized.chars().rev().collect::<String>();
 
         log::debug!("match sni: {sni:?}");
 
-        if let Ok(v) = self.snis.at(&reversed_sni) {
+        // 1. Exact SNI (reversed, case-insensitive).
+        let reversed: String = normalized.chars().rev().collect();
+        if let Ok(v) = self.snis.at(&reversed) {
             return Some(v.value.clone());
         }
-        None
+
+        // 2. Single-label wildcard, most specific first.
+        for (suffix, ssl) in &self.wildcards {
+            if Self::host_matches_wildcard(&normalized, suffix) {
+                return Some(ssl.clone());
+            }
+        }
+
+        // 3. Bare `*` catch-all.
+        self.catch_all.clone()
+    }
+
+    /// True when `host` is exactly `<one-label>.<suffix>` with a single label
+    /// before the suffix. `api.example.com` matches `*.example.com`;
+    /// `a.b.example.com` and `example.com` do not.
+    fn host_matches_wildcard(host: &str, suffix: &str) -> bool {
+        if suffix.is_empty() {
+            return !host.is_empty() && !host.contains('.');
+        }
+        let suffix_len = suffix.len();
+        // Need at least one label + '.' + suffix.
+        if host.len() <= suffix_len + 1 {
+            return false;
+        }
+        let suffix_start = host.len() - suffix_len;
+        if host[suffix_start..] != *suffix {
+            return false;
+        }
+        // The byte immediately before the suffix must be the label separator.
+        if host.as_bytes()[suffix_start - 1] != b'.' {
+            return false;
+        }
+        // The leading label must contain no further dots (single label).
+        let label = &host[..suffix_start - 1];
+        !label.is_empty() && !label.contains('.')
     }
 }
 
 pub struct DynamicCert {
     default: Arc<ProxySSL>,
+    runtime: Arc<RuntimeStore>,
 }
 
 impl DynamicCert {
-    pub fn new(tls: &config::Tls) -> Result<Box<Self>, ProxyError> {
+    pub fn new(tls: &config::Tls, runtime: Arc<RuntimeStore>) -> Result<Box<Self>, ProxyError> {
         let cert_bytes = std::fs::read(&tls.cert_path).map_err(|e| {
             ProxyError::Configuration(format!(
                 "Failed to read TLS certificate file '{}': {}",
@@ -170,6 +264,7 @@ impl DynamicCert {
         let proxy_ssl = ProxySSL::try_from(ssl_config)?;
         Ok(Box::new(Self {
             default: Arc::new(proxy_ssl),
+            runtime,
         }))
     }
 }
@@ -181,7 +276,7 @@ impl TlsAccept for DynamicCert {
             .servername(NameType::HOST_NAME)
             .unwrap_or(DEFAULT_SERVER_NAME);
 
-        let runtime = RUNTIME.load();
+        let runtime = self.runtime.load();
         let proxy_ssl = runtime
             .ssl_matcher
             .match_sni(sni)
@@ -254,5 +349,68 @@ mod tests {
         assert!(matcher.match_sni("example.com").is_some());
         assert!(matcher.match_sni("EXAMPLE.COM").is_some());
         assert!(matcher.match_sni("other.com").is_none());
+    }
+
+    fn ssl_for(sni: &str) -> Arc<ProxySSL> {
+        Arc::new(
+            ProxySSL::try_from(SSL {
+                id: sni.into(),
+                cert: CERT.into(),
+                key: KEY.into(),
+                snis: vec![sni.into()],
+            })
+            .unwrap(),
+        )
+    }
+
+    #[test]
+    fn wildcard_matches_exactly_one_label() {
+        let mut matcher = MatchEntry::default();
+        matcher.insert_ssl(ssl_for("*.example.com")).unwrap();
+
+        assert!(matcher.match_sni("api.example.com").is_some());
+        // Wildcard must NOT match the bare suffix (no label in front).
+        assert!(matcher.match_sni("example.com").is_none());
+        // Standard certificate wildcards cover exactly one label.
+        assert!(matcher.match_sni("a.b.example.com").is_none());
+        assert!(matcher.match_sni("api.other.com").is_none());
+    }
+
+    #[test]
+    fn exact_sni_beats_wildcard() {
+        let mut matcher = MatchEntry::default();
+        matcher.insert_ssl(ssl_for("*.example.com")).unwrap();
+        matcher.insert_ssl(ssl_for("api.example.com")).unwrap();
+
+        let matched = matcher.match_sni("api.example.com").unwrap();
+        assert_eq!(matched.inner.id, "api.example.com");
+    }
+
+    #[test]
+    fn longer_wildcard_suffix_wins() {
+        let mut matcher = MatchEntry::default();
+        matcher.insert_ssl(ssl_for("*.com")).unwrap();
+        matcher.insert_ssl(ssl_for("*.example.com")).unwrap();
+        matcher
+            .wildcards
+            .sort_by_key(|(suffix, _)| std::cmp::Reverse(suffix.len()));
+
+        let matched = matcher.match_sni("api.example.com").unwrap();
+        assert_eq!(matched.inner.id, "*.example.com");
+    }
+
+    #[test]
+    fn unsupported_and_duplicate_wildcards_are_rejected() {
+        let invalid = ProxySSL::try_from(SSL {
+            id: "invalid".into(),
+            cert: CERT.into(),
+            key: KEY.into(),
+            snis: vec!["*.a.*.example.com".into()],
+        });
+        assert!(invalid.is_err());
+
+        let mut matcher = MatchEntry::default();
+        matcher.insert_ssl(ssl_for("*.example.com")).unwrap();
+        assert!(matcher.insert_ssl(ssl_for("*.example.com")).is_err());
     }
 }

@@ -21,7 +21,10 @@ pub const PLUGIN_NAME: &str = "basic-auth";
 const PRIORITY: i32 = 2520;
 
 /// Creates a Basic Auth plugin instance.
-pub fn create_basic_auth_plugin(cfg: JsonValue) -> ProxyResult<Arc<dyn ProxyPlugin>> {
+pub fn create_basic_auth_plugin(
+    cfg: JsonValue,
+    _defaults: &crate::config::EffectiveDefaults,
+) -> ProxyResult<Arc<dyn ProxyPlugin>> {
     let config = PluginConfig::try_from(cfg)?;
     let username_digest = secret_digest(&config.username);
     let password_digest = secret_digest(&config.password);
@@ -147,6 +150,7 @@ impl ProxyPlugin for PluginBasicAuth {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::utils::encryption::KeyringService;
     use crate::utils::encryption::{EncryptFields, SecretOp};
 
     fn build_plugin(username: &str, password: &str) -> PluginBasicAuth {
@@ -168,7 +172,8 @@ mod tests {
             "password": "s3cret",
         });
         // Encryption disabled → plaintext pass-through.
-        PluginConfig::transform_secrets(&mut cfg, SecretOp::Decrypt).unwrap();
+        PluginConfig::transform_secrets(&mut cfg, SecretOp::Decrypt, &KeyringService::global())
+            .unwrap();
         assert_eq!(cfg["username"], "demo");
         assert_eq!(cfg["password"], "s3cret");
     }

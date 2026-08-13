@@ -36,7 +36,10 @@ const CTX_KEY_BODY_BYTES: &str = "pingsix_client_control_body_bytes";
 pub const ERROR_PAYLOAD_TOO_LARGE: &str = "PayloadTooLarge";
 
 /// Creates a `client-control` plugin instance from JSON configuration.
-pub fn create_client_control_plugin(cfg: JsonValue) -> ProxyResult<Arc<dyn ProxyPlugin>> {
+pub fn create_client_control_plugin(
+    cfg: JsonValue,
+    _defaults: &crate::config::EffectiveDefaults,
+) -> ProxyResult<Arc<dyn ProxyPlugin>> {
     let config = PluginConfig::try_from(cfg)?;
     Ok(Arc::new(PluginClientControl { config }))
 }

@@ -4,10 +4,11 @@ use pingora::{
     apps::http_app::ServeHttp, protocols::http::ServerSession, services::listening::Service,
 };
 use serde::Serialize;
+use std::sync::Arc;
 
 use crate::{
     config::Status,
-    core::{constant_time_eq, status},
+    core::{constant_time_eq, status::StatusStore},
 };
 
 #[derive(Serialize)]
@@ -25,17 +26,19 @@ struct ReadyResponse {
 /// HTTP application for serving public probes and protected diagnostics.
 pub struct StatusHttpApp {
     config: Status,
+    status: Arc<StatusStore>,
 }
 
 impl StatusHttpApp {
-    pub fn new(cfg: &Status) -> Self {
+    pub fn new(cfg: &Status, status: Arc<StatusStore>) -> Self {
         Self {
             config: cfg.clone(),
+            status,
         }
     }
 
-    pub fn status_http_service(cfg: &Status) -> Service<Self> {
-        let app = Self::new(cfg);
+    pub fn status_http_service(cfg: &Status, status: Arc<StatusStore>) -> Service<Self> {
+        let app = Self::new(cfg, status);
         let addr = &app.config.address.to_string();
         let mut service = Service::new("Status HTTP".to_string(), app);
         service.add_tcp(addr);
@@ -62,16 +65,38 @@ impl StatusHttpApp {
     }
 }
 
+impl StatusHttpApp {
+    fn handle_ready_endpoint(&self) -> Response<Vec<u8>> {
+        let (ready, reason) = self.status.readiness();
+        let response = ReadyResponse {
+            status: if ready { "ok" } else { "error" },
+            reason,
+        };
+        json_response(
+            if ready {
+                StatusCode::OK
+            } else {
+                StatusCode::SERVICE_UNAVAILABLE
+            },
+            &response,
+        )
+    }
+
+    fn handle_config_endpoint(&self) -> Response<Vec<u8>> {
+        json_response(StatusCode::OK, &self.status.status_view())
+    }
+}
+
 #[async_trait]
 impl ServeHttp for StatusHttpApp {
     async fn response(&self, http_session: &mut ServerSession) -> Response<Vec<u8>> {
         http_session.set_keepalive(None);
         match http_session.req_header().uri.path() {
             "/status/live" => handle_live_endpoint(),
-            "/status/ready" => handle_ready_endpoint(),
+            "/status/ready" => self.handle_ready_endpoint(),
             "/status/config" if self.config.diagnostics_enabled() => {
                 if self.diagnostics_authorized(http_session) {
-                    handle_config_endpoint()
+                    self.handle_config_endpoint()
                 } else {
                     forbidden_response()
                 }
@@ -83,26 +108,6 @@ impl ServeHttp for StatusHttpApp {
 
 fn handle_live_endpoint() -> Response<Vec<u8>> {
     json_response(StatusCode::OK, &LiveResponse { status: "ok" })
-}
-
-fn handle_ready_endpoint() -> Response<Vec<u8>> {
-    let (ready, reason) = status::readiness();
-    let response = ReadyResponse {
-        status: if ready { "ok" } else { "error" },
-        reason,
-    };
-    json_response(
-        if ready {
-            StatusCode::OK
-        } else {
-            StatusCode::SERVICE_UNAVAILABLE
-        },
-        &response,
-    )
-}
-
-fn handle_config_endpoint() -> Response<Vec<u8>> {
-    json_response(StatusCode::OK, &status::status_view())
 }
 
 fn json_response<T: Serialize>(status: StatusCode, body: &T) -> Response<Vec<u8>> {

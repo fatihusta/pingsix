@@ -118,6 +118,10 @@ pub(crate) struct PluginBuildContext<'a> {
     pub upstreams: &'a HashMap<String, Arc<ProxyUpstream>>,
     pub prepared: &'a PreparedUpstreams,
     pub owner: &'a TrafficSplitOwner,
+    /// Effective `pingsix.defaults` of the owning gateway instance.
+    pub defaults: &'a crate::config::EffectiveDefaults,
+    /// DNS resolver of the owning gateway instance.
+    pub resolver: &'a Arc<hickory_resolver::TokioResolver>,
 }
 
 /// Factories that resolve upstream references at build time.
@@ -180,7 +184,16 @@ pub(crate) fn validate_plugin_config(name: &str, cfg: &JsonValue) -> ProxyResult
             None => Ok(()),
         },
         None => {
-            build_plugin(name, cfg.clone())?;
+            // Validation builds the plugin to surface config errors; defaults
+            // only affect fallback resolution (identical validation outcome).
+            build_plugin(
+                name,
+                cfg.clone(),
+                // Admin validation only checks whether a plugin config can be
+                // parsed and built. It must not inherit another gateway
+                // instance's process-global defaults.
+                &crate::config::EffectiveDefaults::default(),
+            )?;
             Ok(())
         }
     }
@@ -238,6 +251,8 @@ pub(crate) fn build_plugin_with_upstreams(
     upstreams: &HashMap<String, Arc<ProxyUpstream>>,
     prepared: &PreparedUpstreams,
     owner: &TrafficSplitOwner,
+    defaults: &crate::config::EffectiveDefaults,
+    resolver: &Arc<hickory_resolver::TokioResolver>,
 ) -> ProxyResult<Arc<dyn ProxyPlugin>> {
     // Dependency-aware plugins register here; the lookup replaces the former
     // `name == traffic-split` special case with a declarative registry entry.
@@ -246,10 +261,12 @@ pub(crate) fn build_plugin_with_upstreams(
             upstreams,
             prepared,
             owner,
+            defaults,
+            resolver,
         };
         return (capabilities.factory)(cfg, &context);
     }
-    build_plugin(name, cfg)
+    build_plugin(name, cfg, defaults)
 }
 
 /// Plugin name → secret-field transform derived from `#[encrypt]` markers.
@@ -266,9 +283,13 @@ pub(crate) static PLUGIN_ENCRYPT_FIELDS: Lazy<
     ])
 });
 
-pub fn build_plugin(name: &str, cfg: JsonValue) -> ProxyResult<Arc<dyn ProxyPlugin>> {
+pub fn build_plugin(
+    name: &str,
+    cfg: JsonValue,
+    defaults: &crate::config::EffectiveDefaults,
+) -> ProxyResult<Arc<dyn ProxyPlugin>> {
     let builder = PLUGIN_BUILDER_REGISTRY
         .get(name)
         .ok_or_else(|| ProxyError::Plugin(format!("Unknown plugin type: {name}")))?;
-    builder(cfg)
+    builder(cfg, defaults)
 }

@@ -167,6 +167,8 @@ pub(crate) fn create_traffic_split_plugin_with_context(
         context.upstreams,
         context.prepared,
         context.owner.clone(),
+        context.defaults,
+        context.resolver,
     )
 }
 
@@ -270,6 +272,8 @@ pub(crate) fn create_traffic_split_plugin_with_upstreams(
     upstreams: &HashMap<String, Arc<ProxyUpstream>>,
     prepared: &PreparedUpstreams,
     owner: TrafficSplitOwner,
+    defaults: &crate::config::EffectiveDefaults,
+    resolver: &Arc<hickory_resolver::TokioResolver>,
 ) -> ProxyResult<Arc<dyn ProxyPlugin>> {
     let config: PluginConfig =
         serde_json::from_value(cfg).map_err(|e| ProxyError::Serialization(e.to_string()))?;
@@ -333,6 +337,8 @@ pub(crate) fn create_traffic_split_plugin_with_upstreams(
                         .ok_or_else(|| ProxyError::Configuration(format!(
                             "Traffic-split inline upstream {rule_idx}/{upstream_idx} was not prepared"
                         )))?,
+                    defaults,
+                    resolver,
                 )?);
                 health_check_specs.push(HealthCheckSpec {
                     key: format!("traffic-split/{rule_idx}/{upstream_idx}"),
@@ -407,6 +413,8 @@ mod tests {
             &upstreams,
             &HashMap::new(),
             TrafficSplitOwner::Route("test".into()),
+            &crate::config::EffectiveDefaults::global(),
+            &crate::proxy::upstream::discovery::get_global_resolver_for_build().unwrap(),
         )
         .unwrap();
         let specs = plugin.health_check_specs();
@@ -433,7 +441,9 @@ mod tests {
             cfg,
             &upstreams,
             &HashMap::new(),
-            TrafficSplitOwner::Route("test".into())
+            TrafficSplitOwner::Route("test".into()),
+            &crate::config::EffectiveDefaults::global(),
+            &crate::proxy::upstream::discovery::get_global_resolver_for_build().unwrap()
         )
         .is_ok());
     }
@@ -457,7 +467,9 @@ mod tests {
             cfg,
             &upstreams,
             &HashMap::new(),
-            TrafficSplitOwner::Route("test".into())
+            TrafficSplitOwner::Route("test".into()),
+            &crate::config::EffectiveDefaults::global(),
+            &crate::proxy::upstream::discovery::get_global_resolver_for_build().unwrap()
         )
         .is_err());
     }
@@ -476,7 +488,9 @@ mod tests {
             cfg,
             &upstreams,
             &HashMap::new(),
-            TrafficSplitOwner::Route("test".into())
+            TrafficSplitOwner::Route("test".into()),
+            &crate::config::EffectiveDefaults::global(),
+            &crate::proxy::upstream::discovery::get_global_resolver_for_build().unwrap()
         )
         .is_err());
     }

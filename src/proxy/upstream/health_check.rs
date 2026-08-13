@@ -532,8 +532,12 @@ impl Service for SharedHealthCheckService {
     }
 }
 
-pub static SHARED_HEALTH_CHECK_SERVICE: Lazy<SharedHealthCheckService> =
-    Lazy::new(SharedHealthCheckService::new);
+/// Process-global health-check service retained as a migration facade and
+/// test scaffolding: production registers the per-build service from
+/// [`crate::service::GatewayState`]; this singleton backs [`RuntimeStore::new`]
+/// and legacy callers not yet instance-wired.
+pub static SHARED_HEALTH_CHECK_SERVICE: Lazy<Arc<SharedHealthCheckService>> =
+    Lazy::new(|| Arc::new(SharedHealthCheckService::new()));
 
 #[cfg(test)]
 mod tests {

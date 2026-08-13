@@ -34,7 +34,10 @@ static RATE_LIMIT_REQUESTS: Lazy<IntCounterVec> = Lazy::new(|| {
 /// This plugin enforces rate limiting on requests based on a key derived from the request
 /// (e.g., client IP, header, or custom variable). Exceeding the limit results in a configurable
 /// response (default: `503 Service Unavailable`).
-pub fn create_limit_count_plugin(cfg: JsonValue) -> ProxyResult<Arc<dyn ProxyPlugin>> {
+pub fn create_limit_count_plugin(
+    cfg: JsonValue,
+    _defaults: &crate::config::EffectiveDefaults,
+) -> ProxyResult<Arc<dyn ProxyPlugin>> {
     let config = PluginConfig::try_from(cfg)?;
 
     let rate = Rate::new(Duration::from_secs(config.time_window as u64));

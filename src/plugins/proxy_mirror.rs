@@ -10,22 +10,29 @@
 //! Only `http://`/`https://` mirror targets are supported in this release.
 
 use std::{
+    net::SocketAddr,
     sync::{
         atomic::{AtomicBool, Ordering},
-        Arc,
+        Arc, Mutex as StdMutex,
     },
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use async_trait::async_trait;
 use bytes::Bytes;
+use once_cell::sync::Lazy;
 use pingora_core::{connectors::http::Connector, upstreams::peer::HttpPeer};
 use pingora_error::Result;
 use pingora_http::RequestHeader;
 use pingora_proxy::Session;
+use prometheus::{register_int_counter_vec, IntCounterVec};
 use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
-use tokio::sync::mpsc;
+use tokio::{
+    sync::{mpsc, Notify, Semaphore},
+    task::JoinHandle,
+};
+use tokio_util::sync::CancellationToken;
 use validator::{Validate, ValidationError};
 
 use crate::core::{ProxyContext, ProxyError, ProxyPlugin, ProxyResult};
@@ -46,14 +53,202 @@ const MIRROR_QUEUE_CAPACITY: usize = 32;
 const MIRROR_CONNECT_TIMEOUT: Duration = Duration::from_secs(1);
 const MIRROR_WRITE_TIMEOUT: Duration = Duration::from_secs(1);
 
+/// Hard cap on the number of mirror tasks running concurrently across the
+/// whole process. Each sampled request previously spawned a detached task
+/// that resolved DNS and opened a connection on its own; without a global
+/// bound a high sample rate against a slow/unreachable mirror could fan out
+/// to ~RPS concurrent tasks, DNS lookups and sockets.
+const MAX_CONCURRENT_MIRRORS: usize = 64;
+
+/// Reuse a resolved mirror address without re-querying DNS for this long.
+const MIRROR_DNS_CACHE_TTL: Duration = Duration::from_secs(60);
+/// After a DNS failure, keep serving the last known address for this grace
+/// window so transient resolver errors drop only mirrors, not the cached peer.
+const MIRROR_DNS_STALE_GRACE: Duration = Duration::from_secs(300);
+
+static MIRROR_PERMITS: Lazy<Arc<Semaphore>> =
+    Lazy::new(|| Arc::new(Semaphore::new(MAX_CONCURRENT_MIRRORS)));
+
+static MIRROR_DROPPED: Lazy<IntCounterVec> = Lazy::new(|| {
+    register_int_counter_vec!(
+        "pingsix_proxy_mirror_dropped_total",
+        "Mirror requests dropped before or during shadowing",
+        &["reason"]
+    )
+    .expect("mirror metric registration must succeed")
+});
+
+fn mirror_dropped(reason: &'static str) {
+    MIRROR_DROPPED.with_label_values(&[reason]).inc();
+}
+
+/// Shared, cached DNS resolution for one mirror target. The plugin instance is
+/// reused across requests, so every sampled request for the same target shares
+/// one resolver: a fresh address is reused for [`MIRROR_DNS_CACHE_TTL`] and a
+/// stale address is served for [`MIRROR_DNS_STALE_GRACE`] after a lookup
+/// failure, instead of issuing one lookup per request.
+struct MirrorResolver {
+    target: MirrorTarget,
+    state: StdMutex<MirrorDnsState>,
+    /// Elected with CAS so the only mutex in this type is never held across
+    /// DNS I/O. `lookup_done` wakes every cache-miss follower.
+    lookup_in_flight: AtomicBool,
+    lookup_done: Notify,
+}
+
+#[derive(Default)]
+struct MirrorDnsState {
+    addr: Option<SocketAddr>,
+    resolved_at: Option<Instant>,
+    /// Published before waking followers so all waiters receive the outcome
+    /// of a failed flight instead of immediately stampeding into another one.
+    last_error: Option<&'static str>,
+}
+
+/// Clears an elected DNS flight even if its task is aborted. This is essential
+/// because mirror work is cancelled when its plugin snapshot is retired.
+struct LookupFlight<'a> {
+    resolver: &'a MirrorResolver,
+}
+
+impl Drop for LookupFlight<'_> {
+    fn drop(&mut self) {
+        self.resolver
+            .lookup_in_flight
+            .store(false, Ordering::Release);
+        self.resolver.lookup_done.notify_waiters();
+    }
+}
+
+impl MirrorResolver {
+    fn new(target: MirrorTarget) -> Self {
+        Self {
+            target,
+            state: StdMutex::new(MirrorDnsState::default()),
+            lookup_in_flight: AtomicBool::new(false),
+            lookup_done: Notify::new(),
+        }
+    }
+
+    /// Resolve the target to a connectable peer. A cache miss elects exactly
+    /// one lookup leader; followers wait for its result then consume the cache
+    /// or attempt the next flight. No `std::sync::Mutex` is held over await.
+    async fn resolve(&self) -> Result<HttpPeer, &'static str> {
+        self.resolve_with(|| async {
+            match tokio::net::lookup_host((self.target.host.as_str(), self.target.port)).await {
+                Ok(mut addresses) => addresses
+                    .next()
+                    .ok_or("mirror target resolved to no address"),
+                Err(_) => Err("mirror target DNS lookup failed"),
+            }
+        })
+        .await
+    }
+
+    async fn resolve_with<F, Fut>(&self, lookup: F) -> Result<HttpPeer, &'static str>
+    where
+        F: FnOnce() -> Fut,
+        Fut: std::future::Future<Output = Result<SocketAddr, &'static str>>,
+    {
+        let mut lookup = Some(lookup);
+        loop {
+            if let Some(peer) = self.cached_fresh() {
+                return Ok(peer);
+            }
+
+            if self
+                .lookup_in_flight
+                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+            {
+                let _flight = LookupFlight { resolver: self };
+                match lookup.take().expect("lookup leader is elected once")().await {
+                    Ok(addr) => {
+                        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+                        state.addr = Some(addr);
+                        state.resolved_at = Some(Instant::now());
+                        state.last_error = None;
+                        return Ok(HttpPeer::new(
+                            addr,
+                            self.target.tls,
+                            self.target.sni.clone(),
+                        ));
+                    }
+                    Err(error) => {
+                        self.state
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .last_error = Some(error);
+                        return self.stale_reuse().ok_or(error);
+                    }
+                }
+            }
+
+            // Register before checking the flag so a leader cannot finish in
+            // the gap and strand this waiter. If it already finished, loop.
+            let notified = self.lookup_done.notified();
+            if self.lookup_in_flight.load(Ordering::Acquire) {
+                notified.await;
+                if let Some(peer) = self.stale_reuse() {
+                    return Ok(peer);
+                }
+                if let Some(error) = self.last_error() {
+                    return Err(error);
+                }
+            }
+        }
+    }
+
+    fn cached_fresh(&self) -> Option<HttpPeer> {
+        let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        let fresh = state
+            .resolved_at
+            .is_some_and(|t| t.elapsed() < MIRROR_DNS_CACHE_TTL);
+        if fresh {
+            state
+                .addr
+                .map(|addr| HttpPeer::new(addr, self.target.tls, self.target.sni.clone()))
+        } else {
+            None
+        }
+    }
+
+    fn last_error(&self) -> Option<&'static str> {
+        self.state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .last_error
+    }
+
+    /// Serve the last known address for a short grace window after a DNS
+    /// failure so transient resolver errors do not evict a still-good peer.
+    fn stale_reuse(&self) -> Option<HttpPeer> {
+        let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        let within_grace = state.resolved_at.is_some_and(|resolved_at| {
+            resolved_at.elapsed() < MIRROR_DNS_CACHE_TTL + MIRROR_DNS_STALE_GRACE
+        });
+        if !within_grace {
+            return None;
+        }
+        state
+            .addr
+            .map(|addr| HttpPeer::new(addr, self.target.tls, self.target.sni.clone()))
+    }
+}
+
 /// Creates a `proxy-mirror` plugin instance from JSON configuration.
-pub fn create_proxy_mirror_plugin(cfg: JsonValue) -> ProxyResult<Arc<dyn ProxyPlugin>> {
+pub fn create_proxy_mirror_plugin(
+    cfg: JsonValue,
+    _defaults: &crate::config::EffectiveDefaults,
+) -> ProxyResult<Arc<dyn ProxyPlugin>> {
     let config = PluginConfig::try_from(cfg)?;
     let target = parse_mirror_target(&config.host)?;
+    let resolver = Arc::new(MirrorResolver::new(target));
     Ok(Arc::new(PluginProxyMirror {
         config,
-        target,
+        resolver,
         connector: Arc::new(Connector::new(None)),
+        tasks: MirrorTaskTracker::new(),
     }))
 }
 
@@ -170,17 +365,11 @@ fn parse_mirror_target(host: &str) -> ProxyResult<MirrorTarget> {
     })
 }
 
-/// Resolve a [`MirrorTarget`] to a connectable [`HttpPeer`]. Runs inside the
-/// mirror task so a DNS failure only drops the mirror, never the request.
-/// `HttpPeer::new` performs the resolution itself and panics on failure, so
-/// resolve first with the non-panicking async lookup.
-async fn resolve_mirror_peer(target: &MirrorTarget) -> Result<HttpPeer, &'static str> {
-    let addr = tokio::net::lookup_host((target.host.as_str(), target.port))
-        .await
-        .map_err(|_| "mirror target DNS lookup failed")?
-        .next()
-        .ok_or("mirror target resolved to no address")?;
-    Ok(HttpPeer::new(addr, target.tls, target.sni.clone()))
+/// Resolve a [`MirrorTarget`] to a connectable [`HttpPeer`] via the shared
+/// [`MirrorResolver`] (cached, stale-reusing). Used by the mirror task so a
+/// DNS failure only drops the mirror, never the request.
+async fn resolve_mirror_peer(resolver: &MirrorResolver) -> Result<HttpPeer, &'static str> {
+    resolver.resolve().await
 }
 
 impl TryFrom<JsonValue> for PluginConfig {
@@ -196,10 +385,50 @@ impl TryFrom<JsonValue> for PluginConfig {
     }
 }
 
+/// Plugin-local ownership for detached mirror work. Handles are pruned on
+/// admission and capped by the same global permit limit, so retirement never
+/// leaves an unbounded task registry. Dropping a plugin snapshot cancels and
+/// aborts all currently registered work; this cannot join tasks synchronously,
+/// so runtime shutdown remains responsible for draining Tokio itself.
+struct MirrorTaskTracker {
+    cancel: CancellationToken,
+    tasks: StdMutex<Vec<JoinHandle<()>>>,
+}
+
+impl MirrorTaskTracker {
+    fn new() -> Self {
+        Self {
+            cancel: CancellationToken::new(),
+            tasks: StdMutex::new(Vec::new()),
+        }
+    }
+
+    fn cancellation_token(&self) -> CancellationToken {
+        self.cancel.clone()
+    }
+
+    fn track(&self, task: JoinHandle<()>) {
+        let mut tasks = self.tasks.lock().unwrap_or_else(|e| e.into_inner());
+        tasks.retain(|task| !task.is_finished());
+        tasks.push(task);
+    }
+}
+
+impl Drop for MirrorTaskTracker {
+    fn drop(&mut self) {
+        self.cancel.cancel();
+        let mut tasks = self.tasks.lock().unwrap_or_else(|e| e.into_inner());
+        for task in tasks.drain(..) {
+            task.abort();
+        }
+    }
+}
+
 pub struct PluginProxyMirror {
     config: PluginConfig,
-    target: MirrorTarget,
+    resolver: Arc<MirrorResolver>,
     connector: Arc<Connector>,
+    tasks: MirrorTaskTracker,
 }
 
 #[derive(Clone)]
@@ -222,6 +451,7 @@ impl MirrorSender {
             self.active.store(false, Ordering::Relaxed);
             match error {
                 mpsc::error::TrySendError::Full(_) => {
+                    mirror_dropped("queue_full");
                     log::warn!("proxy-mirror: mirror queue is full; dropping mirror request");
                 }
                 mpsc::error::TrySendError::Closed(_) => {
@@ -294,6 +524,16 @@ impl ProxyPlugin for PluginProxyMirror {
             return Ok(());
         }
 
+        // Bound global mirror concurrency before spawning: if the process is
+        // already mirroring MAX_CONCURRENT_MIRRORS requests, drop this mirror
+        // instead of adding to an unbounded fan-out of tasks, DNS lookups and
+        // sockets.
+        let Some(permit) = MIRROR_PERMITS.clone().try_acquire_owned().ok() else {
+            mirror_dropped("concurrency_limit");
+            log::debug!("proxy-mirror: concurrency limit reached, dropping mirror");
+            return Ok(());
+        };
+
         let mirror_req = match self.build_mirror_request(upstream_request) {
             Ok(req) => req,
             Err(e) => {
@@ -312,13 +552,18 @@ impl ProxyPlugin for PluginProxyMirror {
             },
         );
         let connector = self.connector.clone();
-        let target = self.target.clone();
-        tokio::spawn(async move {
-            let result = async {
-                // Resolve inside the connect budget: an unresolvable or slow
-                // DNS target only drops the mirror, never the request.
+        let resolver = self.resolver.clone();
+        let cancelled = self.tasks.cancellation_token();
+        let task = tokio::spawn(async move {
+            // `_permit` releases the global mirror slot when the task ends.
+            let _permit = permit;
+            let result = tokio::select! {
+                _ = cancelled.cancelled() => Err("mirror task cancelled"),
+                result = async {
+                // Resolve via the shared, cached resolver: an unresolvable or
+                // slow DNS target only drops the mirror, never the request.
                 let peer =
-                    tokio::time::timeout(MIRROR_CONNECT_TIMEOUT, resolve_mirror_peer(&target))
+                    tokio::time::timeout(MIRROR_CONNECT_TIMEOUT, resolve_mirror_peer(&resolver))
                         .await
                         .map_err(|_| "mirror target DNS lookup timed out")??;
                 let (mut session, _) =
@@ -364,13 +609,26 @@ impl ProxyPlugin for PluginProxyMirror {
                     }
                 }
                 Err("request body ended without completion")
-            }
-            .await;
+                } => result,
+            };
             active.store(false, Ordering::Relaxed);
             if let Err(error) = result {
+                let reason = match error {
+                    "mirror target DNS lookup timed out" => "dns_timeout",
+                    "mirror target DNS lookup failed" | "mirror target resolved to no address" => {
+                        "dns"
+                    }
+                    "connection timed out" | "connection failed" => "connect",
+                    "header write timed out" | "header write failed" => "write_header",
+                    "body write timed out" | "body write failed" => "write_body",
+                    "body completion timed out" | "body completion failed" => "write_body",
+                    _ => "other",
+                };
+                mirror_dropped(reason);
                 log::warn!("proxy-mirror: dropping mirror request: {error}");
             }
         });
+        self.tasks.track(task);
         Ok(())
     }
 
@@ -397,6 +655,117 @@ impl ProxyPlugin for PluginProxyMirror {
 mod tests {
     use super::*;
     use pingora_http::RequestHeader;
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    };
+
+    fn test_target() -> MirrorTarget {
+        parse_mirror_target("http://127.0.0.1:9797").unwrap()
+    }
+
+    #[tokio::test]
+    async fn dns_cache_miss_is_singleflight_and_wakes_waiters() {
+        let resolver = Arc::new(MirrorResolver::new(test_target()));
+        let calls = Arc::new(AtomicUsize::new(0));
+        // Signal the leader has entered the lookup without blocking the runtime
+        // thread: a std::sync::Barrier::wait() inside a spawned task deadlocks
+        // on the default current-thread test runtime.
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let leader = {
+            let resolver = resolver.clone();
+            let calls = calls.clone();
+            tokio::spawn(async move {
+                resolver
+                    .resolve_with(|| async move {
+                        calls.fetch_add(1, Ordering::SeqCst);
+                        let _ = entered_tx.send(());
+                        tokio::time::sleep(Duration::from_millis(20)).await;
+                        Ok("127.0.0.1:9797".parse().unwrap())
+                    })
+                    .await
+            })
+        };
+        // Wait until the leader is inside the lookup closure and sleeping, so
+        // the follower below arrives while the flight is still in progress.
+        entered_rx.await.unwrap();
+        let follower = {
+            let resolver = resolver.clone();
+            let calls = calls.clone();
+            tokio::spawn(async move {
+                resolver
+                    .resolve_with(|| async move {
+                        calls.fetch_add(1, Ordering::SeqCst);
+                        Ok("127.0.0.2:9797".parse().unwrap())
+                    })
+                    .await
+            })
+        };
+
+        assert!(leader.await.unwrap().is_ok());
+        assert!(follower.await.unwrap().is_ok());
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn dns_failure_reuses_stale_address_only_within_grace() {
+        let resolver = MirrorResolver::new(test_target());
+        let address = "127.0.0.1:9797".parse().unwrap();
+        {
+            let mut state = resolver.state.lock().unwrap();
+            state.addr = Some(address);
+            state.resolved_at =
+                Some(Instant::now() - MIRROR_DNS_CACHE_TTL - Duration::from_secs(1));
+        }
+        assert!(resolver
+            .resolve_with(|| async { Err("lookup failed") })
+            .await
+            .is_ok());
+
+        {
+            let mut state = resolver.state.lock().unwrap();
+            state.resolved_at = Some(
+                Instant::now()
+                    - MIRROR_DNS_CACHE_TTL
+                    - MIRROR_DNS_STALE_GRACE
+                    - Duration::from_secs(1),
+            );
+        }
+        assert!(matches!(
+            resolver
+                .resolve_with(|| async { Err("lookup failed") })
+                .await,
+            Err("lookup failed")
+        ));
+    }
+
+    #[tokio::test]
+    async fn tracker_cancels_detached_task_when_plugin_snapshot_drops() {
+        let tracker = MirrorTaskTracker::new();
+        let cancellation = tracker.cancellation_token();
+        let task_cancellation = cancellation.clone();
+        tracker.track(tokio::spawn(async move {
+            task_cancellation.cancelled().await;
+        }));
+        drop(tracker);
+        assert!(cancellation.is_cancelled());
+    }
+
+    #[tokio::test]
+    async fn semaphore_permit_is_released_when_mirror_work_is_cancelled() {
+        let permits = Arc::new(Semaphore::new(1));
+        let held = permits.clone().try_acquire_owned().unwrap();
+        assert!(permits.clone().try_acquire_owned().is_err());
+        let cancellation = CancellationToken::new();
+        let worker_cancellation = cancellation.clone();
+        let task = tokio::spawn(async move {
+            let _permit = held;
+            worker_cancellation.cancelled().await;
+        });
+        cancellation.cancel();
+        task.await.unwrap();
+        assert!(permits.try_acquire_owned().is_ok());
+    }
 
     #[test]
     fn config_requires_http_url_host() {
@@ -490,8 +859,11 @@ mod tests {
                 path_concat_mode: PathConcatMode::Replace,
                 sample_ratio: 1.0,
             },
-            target: parse_mirror_target("http://127.0.0.1:9797").unwrap(),
+            resolver: Arc::new(MirrorResolver::new(
+                parse_mirror_target("http://127.0.0.1:9797").unwrap(),
+            )),
             connector: Arc::new(Connector::new(None)),
+            tasks: MirrorTaskTracker::new(),
         };
         let mut req = RequestHeader::build("GET", b"/original?a=1", None).unwrap();
         req.insert_header("Host", "example.com").unwrap();
@@ -508,8 +880,11 @@ mod tests {
                 path_concat_mode: PathConcatMode::Prefix,
                 sample_ratio: 1.0,
             },
-            target: parse_mirror_target("http://127.0.0.1:9797").unwrap(),
+            resolver: Arc::new(MirrorResolver::new(
+                parse_mirror_target("http://127.0.0.1:9797").unwrap(),
+            )),
             connector: Arc::new(Connector::new(None)),
+            tasks: MirrorTaskTracker::new(),
         };
         let req = RequestHeader::build("GET", b"/api/x", None).unwrap();
         let mirror = plugin.build_mirror_request(&req).unwrap();
@@ -525,8 +900,11 @@ mod tests {
                 path_concat_mode: PathConcatMode::Replace,
                 sample_ratio: 1.0,
             },
-            target: parse_mirror_target("http://127.0.0.1:9797").unwrap(),
+            resolver: Arc::new(MirrorResolver::new(
+                parse_mirror_target("http://127.0.0.1:9797").unwrap(),
+            )),
             connector: Arc::new(Connector::new(None)),
+            tasks: MirrorTaskTracker::new(),
         };
         let req = RequestHeader::build("GET", b"/api/x?b=2", None).unwrap();
         let mirror = plugin.build_mirror_request(&req).unwrap();

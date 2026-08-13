@@ -17,7 +17,10 @@ use crate::utils::request::get_direct_client_ip;
 pub const PLUGIN_NAME: &str = "redirect";
 const PRIORITY: i32 = 900;
 
-pub fn create_redirect_plugin(cfg: JsonValue) -> ProxyResult<Arc<dyn ProxyPlugin>> {
+pub fn create_redirect_plugin(
+    cfg: JsonValue,
+    _defaults: &crate::config::EffectiveDefaults,
+) -> ProxyResult<Arc<dyn ProxyPlugin>> {
     let config = PluginConfig::try_from(cfg)?;
 
     // Precompile regex patterns for regex_uri to improve performance

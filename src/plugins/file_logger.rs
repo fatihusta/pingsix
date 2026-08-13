@@ -47,7 +47,10 @@ fn redact_query(query: &str, names: &[String]) -> String {
 }
 
 /// Creates a file logger plugin instance with the given configuration.
-pub fn create_file_logger_plugin(cfg: JsonValue) -> ProxyResult<Arc<dyn ProxyPlugin>> {
+pub fn create_file_logger_plugin(
+    cfg: JsonValue,
+    _defaults: &crate::config::EffectiveDefaults,
+) -> ProxyResult<Arc<dyn ProxyPlugin>> {
     let config = PluginConfig::try_from(cfg)?;
     let log_format = LogFormat::parse(&config.log_format)?;
 

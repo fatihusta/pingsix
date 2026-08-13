@@ -59,7 +59,10 @@ impl TryFrom<JsonValue> for RawConfig {
 /// Supports CIDR notation for network ranges (e.g., `192.168.1.0/24`, `2001:db8::/32`).
 /// Handles proxy chains by examining X-Forwarded-For and X-Real-IP headers when configured.
 /// Whitelist takes precedence over blacklist for overlapping ranges.
-pub fn create_ip_restriction_plugin(cfg: JsonValue) -> ProxyResult<Arc<dyn ProxyPlugin>> {
+pub fn create_ip_restriction_plugin(
+    cfg: JsonValue,
+    _defaults: &crate::config::EffectiveDefaults,
+) -> ProxyResult<Arc<dyn ProxyPlugin>> {
     let raw_config = RawConfig::try_from(cfg)?;
 
     let whitelist = raw_config

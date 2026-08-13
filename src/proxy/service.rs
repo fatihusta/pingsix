@@ -34,6 +34,8 @@ impl ProxyService {
         service: config::Service,
         upstreams: &HashMap<String, Arc<ProxyUpstream>>,
         prepared: &PreparedUpstreams,
+        defaults: &config::EffectiveDefaults,
+        resolver: &Arc<hickory_resolver::TokioResolver>,
     ) -> ProxyResult<Self> {
         let inline_upstream = if let Some(ref upstream_config) = service.upstream {
             Some(Arc::new(
@@ -48,6 +50,8 @@ impl ProxyService {
                                 service.id
                             ))
                         })?,
+                    defaults,
+                    resolver,
                 )
                 .with_context(&format!(
                     "Failed to create upstream for service '{}'",
@@ -80,13 +84,15 @@ impl ProxyService {
         // Load configured plugins
         let owner = TrafficSplitOwner::Service(service.id.clone());
         for (name, value) in service.plugins {
-            let plugin = build_plugin_with_upstreams(&name, value, upstreams, prepared, &owner)
-                .map_err(|e| {
-                    ProxyError::Plugin(format!(
-                        "Failed to build plugin '{}' for service '{}': {}",
-                        name, service.id, e
-                    ))
-                })?;
+            let plugin = build_plugin_with_upstreams(
+                &name, value, upstreams, prepared, &owner, defaults, resolver,
+            )
+            .map_err(|e| {
+                ProxyError::Plugin(format!(
+                    "Failed to build plugin '{}' for service '{}': {}",
+                    name, service.id, e
+                ))
+            })?;
             proxy_service.plugins.push(plugin);
         }
 

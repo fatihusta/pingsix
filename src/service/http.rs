@@ -1,4 +1,4 @@
-use std::{collections::HashSet, sync::Arc, time::Duration};
+use std::{sync::Arc, time::Duration};
 
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -33,7 +33,7 @@ use crate::{
         RouteContext, UpstreamSelection,
     },
     plugins::cache::{self, CacheSettings, CTX_KEY_CACHE_SETTINGS},
-    proxy::runtime::RUNTIME,
+    proxy::runtime::RuntimeStore,
 };
 
 /// Headers that imply credentials for shared-cache safety (checked before plugins mutate them).
@@ -81,11 +81,7 @@ fn response_has_vary_star(headers: &http::HeaderMap) -> bool {
         .any(|token| token.trim().eq_ignore_ascii_case("*"))
 }
 
-// --- START: Global Cache Infrastructure ---
-// 1. Cache backend: In-memory cache for high performance
-static CACHE_BACKEND: Lazy<MemCache> = Lazy::new(MemCache::new);
-
-// 2. Default cache metadata: No caching by default unless explicitly configured
+// Default cache metadata: No caching by default unless explicitly configured
 const CACHE_DEFAULT: CacheMetaDefaults = CacheMetaDefaults::new(|_| None, 0, 0);
 
 /// Configured eviction memory budget, populated once at startup from
@@ -98,12 +94,18 @@ const FALLBACK_MAX_MEMORY_BYTES: usize = 512 * 1024 * 1024;
 /// Populates global cache capacity defaults from configuration. Must be called once
 /// at startup before the proxy serves traffic. Subsequent calls are no-ops (first
 /// value wins), keeping parallel test initialization safe.
+///
+/// Migration facade: the composition root now builds a per-instance
+/// [`CacheRuntime`] from [`config::EffectiveDefaults`]; this global remains for
+/// the legacy getter until every consumer is instance-wired.
 pub fn init_cache_defaults(cache: &CacheDefaults) {
     let _ = CACHE_MAX_MEMORY_BYTES.set(cache.max_memory_bytes);
     cache::init_default_max_object_bytes(cache.default_max_object_bytes);
 }
 
 /// Returns the effective cache memory budget, falling back to 512MB when unset.
+///
+/// Migration facade for [`EffectiveDefaults::global`].
 pub fn configured_max_memory_bytes() -> usize {
     CACHE_MAX_MEMORY_BYTES
         .get()
@@ -111,21 +113,58 @@ pub fn configured_max_memory_bytes() -> usize {
         .unwrap_or(FALLBACK_MAX_MEMORY_BYTES)
 }
 
-// 3. Eviction manager: sized from `pingsix.defaults.cache.max_memory_bytes`
-static EVICTION_MANAGER: Lazy<Manager> = Lazy::new(|| Manager::new(configured_max_memory_bytes()));
+/// Instance-owned response-cache infrastructure.
+///
+/// Pingora 0.8's `session.cache.enable` retains `'static` references for the
+/// storage backend, eviction manager, and cache lock. Those references can
+/// escape a request through Pingora-managed eviction and stale-revalidation
+/// tasks, so reclaiming these allocations after a `GatewayRuntime` drops would
+/// be unsound. They intentionally live until process exit.
+///
+/// A `GatewayState` still owns the *selection* of a distinct cache runtime:
+/// every build receives independent backing objects and therefore an isolated
+/// cache namespace. Repeated in-process builds should be reserved for testing
+/// or controlled orchestration; process restart is required to reclaim their
+/// Pingora cache allocations. This is the sole unavoidable Pingora `'static`
+/// boundary, not a general ambient-state facade.
+pub struct CacheRuntime {
+    backend: &'static MemCache,
+    eviction: &'static (dyn pingora_cache::eviction::EvictionManager + Sync),
+    lock: &'static CacheKeyLockImpl,
+}
 
-// 4. Cache lock: Timeout should be slightly larger than upstream P99 response time
-static CACHE_LOCK: Lazy<Box<CacheKeyLockImpl>> =
-    Lazy::new(|| CacheLock::new_boxed(Duration::from_secs(5)));
-// --- END: Global Cache Infrastructure ---
+impl CacheRuntime {
+    /// Build an isolated cache runtime sized from the instance's effective
+    /// cache defaults.
+    pub fn new(defaults: &CacheDefaults) -> Self {
+        let backend: &'static MemCache = Box::leak(Box::new(MemCache::new()));
+        let eviction: &'static Manager =
+            Box::leak(Box::new(Manager::new(defaults.max_memory_bytes)));
+        let lock: &'static CacheKeyLockImpl =
+            Box::leak(CacheLock::new_boxed(Duration::from_secs(5)));
+        Self {
+            backend,
+            eviction,
+            lock,
+        }
+    }
+}
 
 /// Proxy service.
 ///
 /// Manages the proxying of requests to upstream servers. Plugin composition,
 /// ordering, and phase traversal live in [`CompiledPluginPipeline`]; this type
 /// only adapts Pingora callbacks to it.
-#[derive(Default)]
-pub struct HttpService;
+pub struct HttpService {
+    runtime: Arc<RuntimeStore>,
+    cache: Arc<CacheRuntime>,
+}
+
+impl HttpService {
+    pub fn new(runtime: Arc<RuntimeStore>, cache: Arc<CacheRuntime>) -> Self {
+        Self { runtime, cache }
+    }
+}
 
 #[async_trait]
 impl ProxyHttp for HttpService {
@@ -157,7 +196,7 @@ impl ProxyHttp for HttpService {
         }
 
         // Load one immutable runtime snapshot for all data-plane configuration used here.
-        let runtime = RUNTIME.load();
+        let runtime = self.runtime.load();
         let global_plugins = runtime.global_plugins.clone();
         let (route_match, is_fallback_preflight) =
             match runtime.route_matcher.match_request(session) {
@@ -449,13 +488,10 @@ impl ProxyHttp for HttpService {
 
             // Enable caching with configured backend and eviction manager
             session.cache.enable(
-                &*CACHE_BACKEND,
-                Some(
-                    &*EVICTION_MANAGER
-                        as &'static (dyn pingora_cache::eviction::EvictionManager + Sync),
-                ),
+                self.cache.backend,
+                Some(self.cache.eviction),
                 None,
-                Some(CACHE_LOCK.as_ref()),
+                Some(self.cache.lock),
                 None,
             );
 
@@ -518,7 +554,9 @@ impl ProxyHttp for HttpService {
         };
         // Route fingerprint covers identity + response-affecting plugins;
         // upstream isolation covers origin selection (nodes, Host rewrite, TLS).
-        let namespace = format!("rf={route_fp:x}|c={policy_fp:x}|u={upstream_key}|sch={scheme}");
+        // `upstream_key` is a u64 fingerprint directly, avoiding a per-request
+        // hex `String` allocation.
+        let namespace = format!("rf={route_fp:x}|c={policy_fp:x}|u={upstream_key:x}|sch={scheme}");
         Ok(CacheKey::new(namespace, primary, ""))
     }
 
@@ -529,53 +567,52 @@ impl ProxyHttp for HttpService {
         req: &RequestHeader,
     ) -> Option<HashBinary> {
         // Only process Vary headers when cache settings are present
-        if let Some(settings) = ctx.get::<Arc<CacheSettings>>(CTX_KEY_CACHE_SETTINGS) {
-            let mut key = VarianceBuilder::new();
-            let mut vary_headers: HashSet<String> = HashSet::new();
+        let settings = ctx.get::<Arc<CacheSettings>>(CTX_KEY_CACHE_SETTINGS)?;
 
-            // `Vary: *` responses must never enter a shared cache. The response
-            // filter enforces that rule; this is a defensive guard against ever
-            // constructing a stable variance for the literal `*` header name.
-            if response_has_vary_star(meta.headers()) {
-                return None;
-            }
-
-            // 1. Add headers from origin's `Vary` response header
-            meta.headers()
-                .get_all(VARY)
-                .iter()
-                .flat_map(|v| v.to_str().unwrap_or("").split(','))
-                .for_each(|h| {
-                    let trimmed = h.trim().to_lowercase();
-                    if !trimmed.is_empty() {
-                        vary_headers.insert(trimmed);
-                    }
-                });
-
-            // 2. Add headers from plugin's pre-normalized `vary` configuration
-            for h in settings.vary.iter() {
-                vary_headers.insert(h.clone());
-            }
-
-            // 3. Build the variance key
-            if vary_headers.is_empty() {
-                return None; // No vary headers, no variance key
-            }
-
-            for header_name in &vary_headers {
-                key.add_value(
-                    header_name,
-                    req.headers
-                        .get(header_name)
-                        .map(|v| v.as_bytes())
-                        .unwrap_or(&[]),
-                );
-            }
-
-            return key.finalize();
+        // `Vary: *` responses must never enter a shared cache. The response
+        // filter enforces that rule; this is a defensive guard against ever
+        // constructing a stable variance for the literal `*` header name.
+        if response_has_vary_star(meta.headers()) {
+            return None;
         }
 
-        None
+        // Collect Vary header names into a small Vec instead of a HashSet:
+        // typical responses carry 0-3 names, where sort+dedup on a Vec is
+        // cheaper than a hashed container, and we avoid cloning already-
+        // lowercase configured names.
+        let mut vary_headers: Vec<String> = Vec::new();
+        // 1. Headers from the origin's `Vary` response header (arbitrary case).
+        meta.headers()
+            .get_all(VARY)
+            .iter()
+            .flat_map(|v| v.to_str().unwrap_or("").split(','))
+            .for_each(|h| {
+                let trimmed = h.trim().to_ascii_lowercase();
+                if !trimmed.is_empty() {
+                    vary_headers.push(trimmed);
+                }
+            });
+        // 2. Headers from the plugin's pre-normalized (lowercase, sorted,
+        //    deduped) `vary` configuration.
+        vary_headers.extend(settings.vary.iter().cloned());
+
+        // 3. Build the variance key.
+        if vary_headers.is_empty() {
+            return None;
+        }
+        vary_headers.sort_unstable();
+        vary_headers.dedup();
+        let mut key = VarianceBuilder::new();
+        for header_name in &vary_headers {
+            key.add_value(
+                header_name,
+                req.headers
+                    .get(header_name)
+                    .map(|v| v.as_bytes())
+                    .unwrap_or(&[]),
+            );
+        }
+        key.finalize()
     }
 
     fn response_cache_filter(
@@ -779,6 +816,23 @@ fn ensure_max_age(cc: Option<CacheControl>, settings: &CacheSettings) -> Option<
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cache_runtime_instances_are_isolated() {
+        // Two gateway instances must own distinct cache backends/evictors so
+        // cached responses never leak across instances in one process.
+        let a = CacheRuntime::new(&CacheDefaults {
+            max_memory_bytes: 100,
+            default_max_object_bytes: 50,
+        });
+        let b = CacheRuntime::new(&CacheDefaults {
+            max_memory_bytes: 200,
+            default_max_object_bytes: 60,
+        });
+        assert!(!std::ptr::eq(a.backend, b.backend));
+        assert!(!std::ptr::eq(a.eviction, b.eviction));
+        assert!(!std::ptr::eq(a.lock, b.lock));
+    }
 
     #[test]
     fn vary_star_is_detected_across_all_header_lines() {

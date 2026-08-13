@@ -61,7 +61,7 @@ fn dynamic_cert_loads_testdata_certs() {
         key_path: key_path.to_string_lossy().into_owned(),
     };
 
-    let result = DynamicCert::new(&tls_config);
+    let result = DynamicCert::new(&tls_config, pingsix::proxy::runtime::RuntimeStore::global());
     assert!(
         result.is_ok(),
         "DynamicCert should load testdata certs: {:?}",

@@ -29,7 +29,10 @@ const DEFAULT_JWT_COOKIE: &str = "jwt";
 /// Creates a JWT Auth plugin instance with the given configuration.
 /// This plugin validates JWTs from HTTP headers, query parameters, or cookies, and optionally
 /// stores the JWT payload in the request context or hides credentials after validation.
-pub fn create_jwt_auth_plugin(cfg: JsonValue) -> ProxyResult<Arc<dyn ProxyPlugin>> {
+pub fn create_jwt_auth_plugin(
+    cfg: JsonValue,
+    _defaults: &crate::config::EffectiveDefaults,
+) -> ProxyResult<Arc<dyn ProxyPlugin>> {
     let config = PluginConfig::try_from(cfg)?;
     let decoding_key = config.get_decoding_key().map_err(|e| {
         ProxyError::Configuration(format!("Failed to create JWT decoding key: {e}"))
@@ -379,6 +382,7 @@ impl PluginJWTAuth {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::utils::encryption::KeyringService;
     use crate::utils::encryption::{EncryptFields, SecretOp, CIPHERTEXT_PREFIX};
     use jsonwebtoken::{encode, EncodingKey, Header};
     use serde::Serialize;
@@ -435,7 +439,8 @@ mod tests {
             "header": "authorization",
         });
         // Encryption disabled → plaintext pass-through.
-        PluginConfig::transform_secrets(&mut cfg, SecretOp::Decrypt).unwrap();
+        PluginConfig::transform_secrets(&mut cfg, SecretOp::Decrypt, &KeyringService::global())
+            .unwrap();
         assert_eq!(cfg["secret"], "hmac-secret");
         assert_eq!(
             cfg["public_key"],
@@ -450,7 +455,9 @@ mod tests {
             "secret": format!("{CIPHERTEXT_PREFIX}deadbeef"),
             "public_key": "-----BEGIN PUBLIC KEY-----\nABC\n-----END PUBLIC KEY-----",
         });
-        let err = PluginConfig::transform_secrets(&mut cfg, SecretOp::Decrypt).unwrap_err();
+        let err =
+            PluginConfig::transform_secrets(&mut cfg, SecretOp::Decrypt, &KeyringService::global())
+                .unwrap_err();
         assert!(
             err.to_string().contains("data_encryption is disabled")
                 || err.to_string().contains("Encrypted value"),
@@ -467,8 +474,13 @@ mod tests {
     fn secrets_transform_const_matches_trait_method() {
         let mut via_const = serde_json::json!({ "secret": "s" });
         let mut via_trait = via_const.clone();
-        (SECRETS_TRANSFORM)(&mut via_const, SecretOp::Decrypt).unwrap();
-        PluginConfig::transform_secrets(&mut via_trait, SecretOp::Decrypt).unwrap();
+        (SECRETS_TRANSFORM)(&mut via_const, SecretOp::Decrypt, &KeyringService::global()).unwrap();
+        PluginConfig::transform_secrets(
+            &mut via_trait,
+            SecretOp::Decrypt,
+            &KeyringService::global(),
+        )
+        .unwrap();
         assert_eq!(via_const, via_trait);
     }
 

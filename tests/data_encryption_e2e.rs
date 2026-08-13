@@ -8,6 +8,7 @@
 //! The process-wide keyring is a write-once global, so this lives in its own
 //! integration binary where enabling encryption cannot poison other tests.
 
+use pingsix::config::KeyringService;
 use pingsix::config::{init_data_encryption, transform_resource_secrets, SecretOp};
 use pingsix::proxy::graph_mutation::{redact, restore_redacted_secrets, ResourceKind};
 
@@ -49,7 +50,13 @@ fn route_secret_lifecycle_encrypt_redact_reload() {
 
     // 1) Admin PUT encrypts marked fields before storage.
     let mut stored = plaintext.clone();
-    transform_resource_secrets("routes", &mut stored, SecretOp::Encrypt).unwrap();
+    transform_resource_secrets(
+        &KeyringService::global(),
+        "routes",
+        &mut stored,
+        SecretOp::Encrypt,
+    )
+    .unwrap();
 
     // Raw-etcd confidentiality: secrets are ciphertext; non-secrets untouched.
     assert!(is_ciphertext(&stored["plugins"]["basic-auth"]["password"]));
@@ -60,9 +67,15 @@ fn route_secret_lifecycle_encrypt_redact_reload() {
 
     // 2) GET/LIST view: decrypt the logical resource, then redact secrets.
     let mut view = stored.clone();
-    transform_resource_secrets("routes", &mut view, SecretOp::Decrypt).unwrap();
+    transform_resource_secrets(
+        &KeyringService::global(),
+        "routes",
+        &mut view,
+        SecretOp::Decrypt,
+    )
+    .unwrap();
     let mut shown = view;
-    redact(ResourceKind::Route, &mut shown);
+    redact(ResourceKind::Route, &mut shown, &KeyringService::global());
 
     assert_eq!(shown["plugins"]["basic-auth"]["password"], "***");
     assert_eq!(shown["upstream"]["tls"]["client_key"], "***");
@@ -75,7 +88,13 @@ fn route_secret_lifecycle_encrypt_redact_reload() {
 
     // 3) Control-plane reload decrypts back to plaintext for the data plane.
     let mut reloaded = stored.clone();
-    transform_resource_secrets("routes", &mut reloaded, SecretOp::Decrypt).unwrap();
+    transform_resource_secrets(
+        &KeyringService::global(),
+        "routes",
+        &mut reloaded,
+        SecretOp::Decrypt,
+    )
+    .unwrap();
     assert_eq!(reloaded["plugins"]["basic-auth"]["password"], "s3cret");
     assert_eq!(
         reloaded["upstream"]["tls"]["client_key"],
@@ -95,14 +114,26 @@ fn ssl_key_lifecycle_encrypt_redact_reload() {
     });
 
     let mut stored = plaintext.clone();
-    transform_resource_secrets("ssls", &mut stored, SecretOp::Encrypt).unwrap();
+    transform_resource_secrets(
+        &KeyringService::global(),
+        "ssls",
+        &mut stored,
+        SecretOp::Encrypt,
+    )
+    .unwrap();
     assert!(is_ciphertext(&stored["key"]));
     assert_eq!(stored["cert"], "cert-pem");
 
     let mut view = stored.clone();
-    transform_resource_secrets("ssls", &mut view, SecretOp::Decrypt).unwrap();
+    transform_resource_secrets(
+        &KeyringService::global(),
+        "ssls",
+        &mut view,
+        SecretOp::Decrypt,
+    )
+    .unwrap();
     let mut shown = view;
-    redact(ResourceKind::Ssl, &mut shown);
+    redact(ResourceKind::Ssl, &mut shown, &KeyringService::global());
     assert_eq!(shown["key"], "***");
     assert_eq!(shown["cert"], "cert-pem");
     assert!(!serde_json::to_string(&shown)
@@ -110,7 +141,13 @@ fn ssl_key_lifecycle_encrypt_redact_reload() {
         .contains(ENVELOPE_SCHEME));
 
     let mut reloaded = stored.clone();
-    transform_resource_secrets("ssls", &mut reloaded, SecretOp::Decrypt).unwrap();
+    transform_resource_secrets(
+        &KeyringService::global(),
+        "ssls",
+        &mut reloaded,
+        SecretOp::Decrypt,
+    )
+    .unwrap();
     assert_eq!(reloaded["key"], plaintext["key"]);
 }
 
@@ -129,11 +166,27 @@ fn resaving_redacted_body_preserves_secret() {
 
     // Stored (encrypted) then read back as the redacted view a client would GET.
     let mut stored = plaintext.clone();
-    transform_resource_secrets("ssls", &mut stored, SecretOp::Encrypt).unwrap();
+    transform_resource_secrets(
+        &KeyringService::global(),
+        "ssls",
+        &mut stored,
+        SecretOp::Encrypt,
+    )
+    .unwrap();
     let mut view = stored.clone();
-    transform_resource_secrets("ssls", &mut view, SecretOp::Decrypt).unwrap();
+    transform_resource_secrets(
+        &KeyringService::global(),
+        "ssls",
+        &mut view,
+        SecretOp::Decrypt,
+    )
+    .unwrap();
     let mut redacted_get = view;
-    redact(ResourceKind::Ssl, &mut redacted_get);
+    redact(
+        ResourceKind::Ssl,
+        &mut redacted_get,
+        &KeyringService::global(),
+    );
     assert_eq!(redacted_get["key"], "***");
 
     // Client edits a non-secret and PUTs the redacted body back. Restoration
@@ -141,7 +194,12 @@ fn resaving_redacted_body_preserves_secret() {
     let existing_plaintext = plaintext.clone();
     let mut resave = redacted_get;
     resave["cert"] = serde_json::json!("cert-pem-v2");
-    restore_redacted_secrets(ResourceKind::Ssl, &mut resave, &existing_plaintext);
+    restore_redacted_secrets(
+        ResourceKind::Ssl,
+        &mut resave,
+        &existing_plaintext,
+        &KeyringService::global(),
+    );
 
     assert_eq!(resave["key"], plaintext["key"]);
     assert_eq!(resave["cert"], "cert-pem-v2");
@@ -168,24 +226,51 @@ fn plaintext_in_etcd_becomes_ciphertext_on_resave() {
     // GET with encryption now ON: decrypt-for-read is a no-op on plaintext,
     // then redaction masks the key.
     let mut view = stored_plaintext.clone();
-    transform_resource_secrets("ssls", &mut view, SecretOp::Decrypt).unwrap();
+    transform_resource_secrets(
+        &KeyringService::global(),
+        "ssls",
+        &mut view,
+        SecretOp::Decrypt,
+    )
+    .unwrap();
     assert_eq!(view["key"], stored_plaintext["key"]);
     let mut redacted_get = view;
-    redact(ResourceKind::Ssl, &mut redacted_get);
+    redact(
+        ResourceKind::Ssl,
+        &mut redacted_get,
+        &KeyringService::global(),
+    );
     assert_eq!(redacted_get["key"], "***");
 
     // Client resaves the redacted body verbatim. Restore pulls the still-plaintext
     // stored key back in (the "in-memory" value)...
     let mut resave = redacted_get;
-    restore_redacted_secrets(ResourceKind::Ssl, &mut resave, &stored_plaintext);
+    restore_redacted_secrets(
+        ResourceKind::Ssl,
+        &mut resave,
+        &stored_plaintext,
+        &KeyringService::global(),
+    );
     assert_eq!(resave["key"], stored_plaintext["key"]);
 
     // ...and the write path encrypts it: etcd now transitions to ciphertext.
-    transform_resource_secrets("ssls", &mut resave, SecretOp::Encrypt).unwrap();
+    transform_resource_secrets(
+        &KeyringService::global(),
+        "ssls",
+        &mut resave,
+        SecretOp::Encrypt,
+    )
+    .unwrap();
     assert!(is_ciphertext(&resave["key"]));
 
     // Round-trips back to the original secret on the next load.
     let mut reloaded = resave.clone();
-    transform_resource_secrets("ssls", &mut reloaded, SecretOp::Decrypt).unwrap();
+    transform_resource_secrets(
+        &KeyringService::global(),
+        "ssls",
+        &mut reloaded,
+        SecretOp::Decrypt,
+    )
+    .unwrap();
     assert_eq!(reloaded["key"], stored_plaintext["key"]);
 }

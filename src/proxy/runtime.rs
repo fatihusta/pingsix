@@ -14,7 +14,7 @@ use once_cell::sync::Lazy;
 
 use crate::{
     config,
-    core::{ProxyPluginExecutor, ProxyResult},
+    core::{status::StatusStore, ProxyPluginExecutor, ProxyResult},
 };
 
 use super::{
@@ -26,7 +26,7 @@ use super::{
     upstream::{
         health_check::{
             HealthCheckFingerprint, HealthCheckRegistration, HealthCheckSpec,
-            SHARED_HEALTH_CHECK_SERVICE,
+            SharedHealthCheckService, SHARED_HEALTH_CHECK_SERVICE,
         },
         ProxyUpstream,
     },
@@ -206,14 +206,43 @@ pub struct RuntimeStore {
     current: ArcSwap<RuntimeSnapshot>,
     health_checks: Mutex<ActiveHealthCheckSet>,
     publish_lock: Mutex<()>,
+    /// Instance-owned readiness store: publish records the published revision
+    /// here (not on the process-global facade).
+    status: Arc<StatusStore>,
+    /// Instance-owned health-check registry/service: publish registers and
+    /// unregisters upstream probes here (not on the process-global
+    /// [`SHARED_HEALTH_CHECK_SERVICE`] facade).
+    health_check: Arc<SharedHealthCheckService>,
+}
+
+impl Default for RuntimeStore {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl RuntimeStore {
-    fn new() -> Self {
+    /// Create a store recording published revisions on the process-global
+    /// status facade and registering health checks on the process-global
+    /// health-check service (migration defaults). Prefer
+    /// [`RuntimeStore::with_state`] so the runtime, graph, etcd sync, and
+    /// status app share one instance.
+    pub fn new() -> Self {
+        Self::with_state(StatusStore::global(), SHARED_HEALTH_CHECK_SERVICE.clone())
+    }
+
+    /// Create a store recording published revisions on `status` and
+    /// registering health checks through `health_check`.
+    pub fn with_state(
+        status: Arc<StatusStore>,
+        health_check: Arc<SharedHealthCheckService>,
+    ) -> Self {
         Self {
             current: ArcSwap::from_pointee(RuntimeSnapshot::empty()),
             health_checks: Mutex::new(ActiveHealthCheckSet::new()),
             publish_lock: Mutex::new(()),
+            status,
+            health_check,
         }
     }
 
@@ -258,7 +287,8 @@ impl RuntimeStore {
                 }
             }
 
-            let (registration, maybe_displaced) = SHARED_HEALTH_CHECK_SERVICE
+            let (registration, maybe_displaced) = self
+                .health_check
                 .register_upstream(spec.key.clone(), spec.service.clone());
             if let Some(d) = maybe_displaced {
                 displaced.push(d);
@@ -288,13 +318,13 @@ impl RuntimeStore {
 
         let snapshot = Arc::new(snapshot);
         self.current.store(snapshot.clone());
-        crate::core::status::set_published_revision(snapshot.revision);
+        self.status.set_published_revision(snapshot.revision);
 
         for d in displaced {
             d.discard();
         }
         for (key, registration) in removed {
-            SHARED_HEALTH_CHECK_SERVICE.unregister_upstream(&key, registration);
+            self.health_check.unregister_upstream(&key, registration);
         }
 
         active.entries = next_entries;
@@ -313,7 +343,20 @@ impl RuntimeStore {
     }
 }
 
-pub static RUNTIME: Lazy<RuntimeStore> = Lazy::new(RuntimeStore::new);
+/// Process-global runtime store retained as test scaffolding and a migration
+/// facade. Production wiring uses per-build [`RuntimeStore`] instances via
+/// [`RuntimeStore::with_state`]; the singleton stays for tests that publish
+/// through `RUNTIME` under [`RUNTIME_TEST_LOCK`] (control-plane, graph worker,
+/// and runtime unit tests) and for legacy callers not yet instance-wired.
+pub static RUNTIME: Lazy<Arc<RuntimeStore>> = Lazy::new(|| Arc::new(RuntimeStore::new()));
+
+impl RuntimeStore {
+    /// The migration-period process-global store used by the legacy facade
+    /// and by the composition root until every consumer is instance-wired.
+    pub fn global() -> Arc<RuntimeStore> {
+        RUNTIME.clone()
+    }
+}
 
 /// Serializes tests that publish to the process-global [`RUNTIME`].
 #[cfg(test)]
@@ -347,6 +390,30 @@ mod tests {
             upstream_host: None,
             tls: None,
         }
+    }
+
+    #[test]
+    fn per_instance_health_check_registries_are_isolated() {
+        use crate::proxy::control_plane::{CandidateSnapshot, ResourceConfigSet};
+
+        let status_a = Arc::new(crate::core::status::StatusStore::new());
+        let status_b = Arc::new(crate::core::status::StatusStore::new());
+        let service_a = Arc::new(SharedHealthCheckService::new());
+        let service_b = Arc::new(SharedHealthCheckService::new());
+        let store_a = RuntimeStore::with_state(status_a, service_a.clone());
+        let store_b = RuntimeStore::with_state(status_b, service_b.clone());
+
+        let mut set = ResourceConfigSet::default();
+        set.upstreams
+            .insert("u1".into(), sample_upstream("u1", &[("127.0.0.1:80", 1)]));
+        let snap = RuntimeSnapshot::compile(CandidateSnapshot::build(set).unwrap(), 1).unwrap();
+        store_a.publish(snap).unwrap();
+
+        // Registration landed only on A's registry: B (and its tasks) see nothing.
+        assert_eq!(service_a.registry().get_all_upstreams().len(), 1);
+        assert!(service_b.registry().get_all_upstreams().is_empty());
+        assert!(store_a.health_check_generation("upstream/u1").is_some());
+        assert_eq!(store_b.health_check_generation("upstream/u1"), None);
     }
 
     #[test]

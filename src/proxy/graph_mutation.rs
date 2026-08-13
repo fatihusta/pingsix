@@ -6,7 +6,7 @@
 //! I/O stays behind the [`GraphStore`] seam in [`crate::config::etcd`].
 
 use std::{
-    collections::HashMap,
+    collections::{BTreeMap, HashMap},
     fmt,
     sync::{Arc, Mutex},
 };
@@ -14,22 +14,27 @@ use std::{
 use async_trait::async_trait;
 use once_cell::sync::Lazy;
 use prometheus::{register_int_counter_vec, register_int_gauge, IntCounterVec, IntGauge};
+use serde::Serialize;
 use tokio::sync::{mpsc, Mutex as AsyncMutex};
 use tokio_util::sync::CancellationToken;
 use validator::Validate;
 
 use crate::{
-    config::{self, Config, GlobalRule, Identifiable, Route, Service, Upstream, SSL},
-    core::{status, ProxyError, ProxyResult},
+    config::{
+        self, Config, EffectiveDefaults, GlobalRule, Identifiable, Route, Service, Upstream, SSL,
+    },
+    core::{status, status::StatusStore, ProxyError, ProxyResult},
     proxy::{
         control_plane::{
             prepare_candidate, validate_config_set, CandidateSnapshot, ResourceConfigSet,
         },
-        runtime::{RuntimeSnapshot, RUNTIME},
+        runtime::{RuntimeSnapshot, RuntimeStore, RUNTIME},
         ssl::ProxySSL,
     },
-    utils::encryption::SecretOp,
+    utils::encryption::{KeyringService, SecretOp},
 };
+
+use hickory_resolver::TokioResolver;
 
 static PREPARATION_ATTEMPTS: Lazy<IntCounterVec> = Lazy::new(|| {
     register_int_counter_vec!(
@@ -298,11 +303,12 @@ impl std::error::Error for GraphError {}
 pub(crate) fn decode_graph(
     graph: &StoredGraph,
     mode: SecretMode,
+    keyring: &KeyringService,
 ) -> ProxyResult<ResourceConfigSet> {
     let decrypt = mode == SecretMode::DecryptForRuntime;
     let mut set = ResourceConfigSet::default();
     for (key, resource) in &graph.resources {
-        insert_resource(&mut set, key, &resource.value, decrypt)?;
+        insert_resource(&mut set, key, &resource.value, decrypt, keyring)?;
     }
     Ok(set)
 }
@@ -312,30 +318,34 @@ fn insert_resource(
     key: &ResourceKey,
     value: &[u8],
     decrypt: bool,
+    keyring: &KeyringService,
 ) -> ProxyResult<()> {
     match key.kind {
         ResourceKind::Upstream => {
-            let mut resource = resource_from_stored::<Upstream>(value, "upstreams", decrypt)?;
+            let mut resource =
+                resource_from_stored::<Upstream>(value, "upstreams", decrypt, keyring)?;
             resource.set_id(key.id.clone());
             set.upstreams.insert(key.id.clone(), resource);
         }
         ResourceKind::Service => {
-            let mut resource = resource_from_stored::<Service>(value, "services", decrypt)?;
+            let mut resource =
+                resource_from_stored::<Service>(value, "services", decrypt, keyring)?;
             resource.set_id(key.id.clone());
             set.services.insert(key.id.clone(), resource);
         }
         ResourceKind::GlobalRule => {
-            let mut resource = resource_from_stored::<GlobalRule>(value, "global_rules", decrypt)?;
+            let mut resource =
+                resource_from_stored::<GlobalRule>(value, "global_rules", decrypt, keyring)?;
             resource.set_id(key.id.clone());
             set.global_rules.insert(key.id.clone(), resource);
         }
         ResourceKind::Route => {
-            let mut resource = resource_from_stored::<Route>(value, "routes", decrypt)?;
+            let mut resource = resource_from_stored::<Route>(value, "routes", decrypt, keyring)?;
             resource.set_id(key.id.clone());
             set.routes.insert(key.id.clone(), resource);
         }
         ResourceKind::Ssl => {
-            let mut resource = resource_from_stored::<SSL>(value, "ssls", decrypt)?;
+            let mut resource = resource_from_stored::<SSL>(value, "ssls", decrypt, keyring)?;
             resource.set_id(key.id.clone());
             set.ssls.insert(key.id.clone(), resource);
         }
@@ -347,12 +357,16 @@ fn resource_from_stored<T: serde::de::DeserializeOwned>(
     value: &[u8],
     resource_type: &str,
     decrypt: bool,
+    keyring: &KeyringService,
 ) -> ProxyResult<T> {
     let mut json = serde_json::from_slice::<serde_json::Value>(value)
         .map_err(|e| ProxyError::serialization_error("Failed to parse resource JSON", e))?;
     if decrypt {
-        config::transform_resource_secrets(resource_type, &mut json, SecretOp::Decrypt)?;
+        config::transform_resource_secrets(keyring, resource_type, &mut json, SecretOp::Decrypt)?;
     }
+    // Warn about likely typos of known behavior fields (e.g. `retry_timout`)
+    // before the unknown field is silently dropped by the typed deserializer.
+    config::warn_unrecognized_fields(resource_type, &json);
     serde_json::from_value(json)
         .map_err(|e| ProxyError::serialization_error("Failed to deserialize resource", e))
 }
@@ -385,6 +399,7 @@ pub(crate) fn plan_put_mutation(
     snapshot: &StoredGraph,
     key: &ResourceKey,
     stored_value: Vec<u8>,
+    keyring: &KeyringService,
 ) -> Result<GraphCommit, GraphError> {
     let mut candidate = snapshot.clone();
     candidate.resources.insert(
@@ -395,7 +410,7 @@ pub(crate) fn plan_put_mutation(
             mod_revision: 0,
         },
     );
-    let set = decode_graph(&candidate, SecretMode::PreserveStored)
+    let set = decode_graph(&candidate, SecretMode::PreserveStored, keyring)
         .map_err(|e| GraphError::InvalidCandidate { source: e })?;
     validate_config_set(&set).map_err(|e| GraphError::InvalidCandidate { source: e })?;
     let expected_target_mod_revision = snapshot.resources.get(key).map(|r| r.mod_revision);
@@ -413,6 +428,7 @@ pub(crate) fn plan_put_mutation(
 pub(crate) fn plan_delete_mutation(
     snapshot: &StoredGraph,
     key: &ResourceKey,
+    keyring: &KeyringService,
 ) -> Result<GraphCommit, GraphError> {
     let existing = snapshot
         .resources
@@ -420,7 +436,7 @@ pub(crate) fn plan_delete_mutation(
         .ok_or_else(|| GraphError::NotFound { key: key.clone() })?;
     let mut candidate = snapshot.clone();
     candidate.resources.remove(key);
-    let set = decode_graph(&candidate, SecretMode::PreserveStored)
+    let set = decode_graph(&candidate, SecretMode::PreserveStored, keyring)
         .map_err(|e| GraphError::ReferentialConflict { source: e })?;
     validate_config_set(&set).map_err(|e| GraphError::ReferentialConflict { source: e })?;
     Ok(GraphCommit {
@@ -437,6 +453,97 @@ pub(crate) fn plan_delete_mutation(
 /// Sentinel [`redact`] writes over secrets; on write it means "keep the stored
 /// value" rather than "set the secret to this literal string".
 const REDACTED_SENTINEL: &str = "***";
+const PUBLICATION_REGISTRY_CAPACITY: usize = 128;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PublicationState {
+    Pending,
+    Published,
+    Rejected,
+    Superseded,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct PublicationView {
+    pub state: PublicationState,
+    pub published_revision: Option<i64>,
+    pub error: Option<String>,
+}
+
+#[derive(Clone, Debug)]
+struct PublicationRecord {
+    state: PublicationState,
+    error: Option<String>,
+}
+
+#[derive(Default)]
+struct PublicationRegistry {
+    records: BTreeMap<i64, PublicationRecord>,
+    published_revision: Option<i64>,
+}
+
+impl PublicationRegistry {
+    fn pending(&mut self, revision: i64) {
+        if revision > 0 {
+            self.records.entry(revision).or_insert(PublicationRecord {
+                state: PublicationState::Pending,
+                error: None,
+            });
+            self.trim();
+        }
+    }
+    fn supersede_pending_except(&mut self, revision: i64) {
+        for (candidate, record) in &mut self.records {
+            if *candidate != revision && record.state == PublicationState::Pending {
+                record.state = PublicationState::Superseded;
+                record.error = None;
+            }
+        }
+    }
+    fn published(&mut self, revision: i64) {
+        self.pending(revision);
+        if let Some(record) = self.records.get_mut(&revision) {
+            record.state = PublicationState::Published;
+            record.error = None;
+        }
+        self.published_revision = Some(revision);
+        self.trim();
+    }
+    fn rejected(&mut self, revision: i64, error: String) {
+        if let Some(record) = self.records.get_mut(&revision) {
+            if record.state == PublicationState::Pending {
+                record.state = PublicationState::Rejected;
+                record.error = Some(error);
+            }
+        }
+    }
+    fn view(&self, revision: i64) -> Option<PublicationView> {
+        self.records.get(&revision).map(|record| PublicationView {
+            state: record.state,
+            published_revision: self.published_revision,
+            error: record.error.clone(),
+        })
+    }
+    fn trim(&mut self) {
+        while self.records.len() > PUBLICATION_REGISTRY_CAPACITY {
+            let Some(revision) = self.records.iter().find_map(|(revision, record)| {
+                (record.state != PublicationState::Pending).then_some(*revision)
+            }) else {
+                break;
+            };
+            self.records.remove(&revision);
+        }
+    }
+}
+
+fn safe_preparation_error(permanent: bool) -> String {
+    if permanent {
+        "candidate rejected during runtime preparation".into()
+    } else {
+        "candidate preparation temporarily unavailable".into()
+    }
+}
 
 /// The single authority over stored and pending configuration graph state.
 ///
@@ -474,6 +581,23 @@ enum Lifecycle {
 
 struct Inner {
     store: Arc<dyn GraphStore>,
+    /// Instance-owned readiness store; published revisions and preparation
+    /// errors are recorded here (not on the process-global facade).
+    status: Arc<StatusStore>,
+    /// Instance-owned runtime store; candidate publications land here (not on
+    /// the process-global [`RUNTIME`] facade).
+    runtime: Arc<RuntimeStore>,
+    /// Effective `pingsix.defaults` resolved at startup; candidate
+    /// preparation and compilation bake these in.
+    defaults: EffectiveDefaults,
+    /// Instance-owned encryption service; secret encrypt/decrypt/redact paths
+    /// use this instead of the process-global [`crate::utils::encryption`]
+    /// facade.
+    keyring: Arc<KeyringService>,
+    /// Instance-owned DNS resolver; candidate preparation resolves through
+    /// this instead of the process-global [`crate::proxy::upstream::discovery`]
+    /// facade.
+    resolver: Arc<TokioResolver>,
     committed: Mutex<Option<CommittedGraph>>,
     target: Mutex<Option<PendingGraph>>,
     /// Serializes only short raw-candidate creation and fenced publish commits.
@@ -486,6 +610,7 @@ struct Inner {
     worker_task: Mutex<Option<tokio::task::JoinHandle<()>>>,
     active_cancellation: Mutex<Option<CancellationToken>>,
     lifecycle: Mutex<Lifecycle>,
+    publications: Mutex<PublicationRegistry>,
 }
 
 /// Outcome of one preparation/compile attempt in the sole worker.
@@ -502,10 +627,42 @@ enum PrepareOutcome {
 }
 
 impl ConfigurationGraph {
+    /// Create a graph bound to the process-global status, runtime, and
+    /// defaults (migration facade). Prefer [`ConfigurationGraph::with_state`]
+    /// so the graph, etcd sync, runtime publisher, and status app share
+    /// instances.
     pub fn new(store: Arc<dyn GraphStore>) -> Self {
+        Self::with_state(
+            store,
+            StatusStore::global(),
+            RUNTIME.clone(),
+            EffectiveDefaults::global(),
+            Arc::new(KeyringService::global()),
+            crate::proxy::upstream::discovery::get_global_resolver_for_build()
+                .expect("DNS resolver construction must succeed"),
+        )
+    }
+
+    /// Create a graph publishing readiness through `status`, runtime snapshots
+    /// through `runtime`, applying instance defaults `defaults` during
+    /// candidate preparation/compilation, handling secrets through `keyring`,
+    /// and resolving DNS through `resolver`.
+    pub fn with_state(
+        store: Arc<dyn GraphStore>,
+        status: Arc<StatusStore>,
+        runtime: Arc<RuntimeStore>,
+        defaults: EffectiveDefaults,
+        keyring: Arc<KeyringService>,
+        resolver: Arc<TokioResolver>,
+    ) -> Self {
         Self {
             inner: Arc::new(Inner {
                 store,
+                status,
+                runtime,
+                defaults,
+                keyring,
+                resolver,
                 committed: Mutex::new(None),
                 target: Mutex::new(None),
                 write_lock: Mutex::new(()),
@@ -515,6 +672,7 @@ impl ConfigurationGraph {
                 worker_task: Mutex::new(None),
                 active_cancellation: Mutex::new(None),
                 lifecycle: Mutex::new(Lifecycle::Running),
+                publications: Mutex::new(PublicationRegistry::default()),
             }),
         }
     }
@@ -533,8 +691,12 @@ impl ConfigurationGraph {
             .write_lock
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        let logical = decode_graph(&snapshot, SecretMode::DecryptForRuntime)
-            .map_err(|e| GraphError::InvalidCandidate { source: e })?;
+        let logical = decode_graph(
+            &snapshot,
+            SecretMode::DecryptForRuntime,
+            &self.inner.keyring,
+        )
+        .map_err(|e| GraphError::InvalidCandidate { source: e })?;
         validate_config_set(&logical).map_err(|e| GraphError::InvalidCandidate { source: e })?;
         self.submit(snapshot, logical)
     }
@@ -556,7 +718,7 @@ impl ConfigurationGraph {
             .write_lock
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        let published = RUNTIME.load().revision;
+        let published = self.inner.runtime.load().revision;
         if batch.revision < published {
             return Err(GraphError::StaleRevision {
                 incoming: batch.revision,
@@ -580,7 +742,7 @@ impl ConfigurationGraph {
                     .unwrap_or_default()
             });
         let stored = apply_watch_batch(&base, &batch)?;
-        let logical = decode_graph(&stored, SecretMode::DecryptForRuntime)
+        let logical = decode_graph(&stored, SecretMode::DecryptForRuntime, &self.inner.keyring)
             .map_err(|e| GraphError::InvalidCandidate { source: e })?;
         validate_config_set(&logical).map_err(|e| GraphError::InvalidCandidate { source: e })?;
         self.submit(stored, logical)
@@ -640,8 +802,15 @@ impl ConfigurationGraph {
     ///
     /// Unlike the dynamic path, preparation must finish before listeners start;
     /// unresolvable DNS-only upstreams fail the process. The candidate passes
-    /// the same whole-graph validation as the dynamic path.
-    pub fn load_static(config: &Config) -> ProxyResult<Arc<RuntimeSnapshot>> {
+    /// the same whole-graph validation as the dynamic path. All state is
+    /// injected: nothing here touches the process-global facades.
+    pub fn load_static(
+        config: &Config,
+        status: &StatusStore,
+        runtime: &RuntimeStore,
+        defaults: &EffectiveDefaults,
+        resolver: &Arc<TokioResolver>,
+    ) -> ProxyResult<Arc<RuntimeSnapshot>> {
         let resources = ResourceConfigSet::from_yaml_config(config);
         validate_config_set(&resources)?;
         let rt = tokio::runtime::Builder::new_current_thread()
@@ -652,7 +821,7 @@ impl ConfigurationGraph {
             })?;
         // The pre-publish runtime is the reuse baseline for the static path; at
         // boot it is the empty snapshot, so every occurrence is prepared.
-        let previous = RUNTIME.load();
+        let previous = runtime.load();
         let prepared = rt.block_on(async {
             #[cfg(unix)]
             {
@@ -661,7 +830,7 @@ impl ConfigurationGraph {
                     ProxyError::Configuration(format!("Failed to install SIGTERM handler: {e}"))
                 })?;
                 tokio::select! {
-                    result = prepare_candidate(&resources, &previous) => result,
+                    result = prepare_candidate(&resources, &previous, defaults, resolver) => result,
                     _ = sigterm.recv() => Err(ProxyError::Configuration(
                         "Static configuration DNS preparation cancelled by SIGTERM".into(),
                     )),
@@ -669,14 +838,16 @@ impl ConfigurationGraph {
             }
             #[cfg(not(unix))]
             {
-                prepare_candidate(&resources, &previous).await
+                prepare_candidate(&resources, &previous, defaults, resolver).await
             }
         })?;
         let (plan, prepared) = prepared;
-        let candidate = CandidateSnapshot::build_prepared(resources, &plan, &prepared, &previous)?;
+        let candidate = CandidateSnapshot::build_prepared(
+            resources, &plan, &prepared, &previous, defaults, resolver,
+        )?;
         let snapshot = RuntimeSnapshot::compile(candidate, 0)?;
-        let published = RUNTIME.publish(snapshot)?;
-        status::mark_ready(status::ConfigSource::Yaml);
+        let published = runtime.publish(snapshot)?;
+        status.mark_ready(status::ConfigSource::Yaml);
         Ok(published)
     }
 
@@ -719,7 +890,10 @@ impl ConfigurationGraph {
                         PrepareOutcome::Settled => break,
                         PrepareOutcome::Transient(error) => {
                             PREPARATION_ATTEMPTS.with_label_values(&["failed"]).inc();
-                            status::record_preparation_error(error.to_string());
+                            graph
+                                .inner
+                                .status
+                                .record_preparation_error(safe_preparation_error(false));
                             log::warn!(
                                 "Control-plane candidate preparation failed; retrying in {}s: {error}",
                                 retry_delay.as_secs()
@@ -742,7 +916,11 @@ impl ConfigurationGraph {
                         }
                         PrepareOutcome::Permanent(error) => {
                             PREPARATION_ATTEMPTS.with_label_values(&["failed"]).inc();
-                            status::record_preparation_error(error.to_string());
+                            let summary = safe_preparation_error(true);
+                            if let Some((failed_generation, _)) = attempted.as_ref() {
+                                graph.reject_publication(*failed_generation, summary.clone());
+                            }
+                            graph.inner.status.record_preparation_error(summary);
                             log::error!(
                                 "Control-plane candidate rejected permanently; waiting for a new revision: {error}"
                             );
@@ -782,6 +960,15 @@ impl ConfigurationGraph {
             *generation
         };
         let revision = stored.revision;
+        {
+            let mut publications = self
+                .inner
+                .publications
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            publications.pending(revision);
+            publications.supersede_pending_except(revision);
+        }
         let cancellation = CancellationToken::new();
         if let Some(previous) = self
             .inner
@@ -856,14 +1043,37 @@ impl ConfigurationGraph {
             logical,
             cancellation,
         } = target;
-        let previous = RUNTIME.load();
+        let previous = self.inner.runtime.load();
         let prepared = tokio::select! {
-            result = prepare_candidate(&logical, &previous) => match result {
+            result = prepare_candidate(&logical, &previous, &self.inner.defaults, &self.inner.resolver) => match result {
                 Ok((plan, prepared)) => (plan, prepared),
                 Err(error) => return PrepareOutcome::Transient(error),
             },
             _ = cancellation.cancelled() => return PrepareOutcome::Settled,
         };
+        // Heavy CPU work (plugin/route/matcher/SSL build, route matcher
+        // construction) runs OUTSIDE write_lock so a slow candidate compile
+        // does not block new watch/list submissions. The generation fence
+        // below discards the result if a newer generation superseded this one
+        // while it was compiling.
+        let (plan, prepared) = prepared;
+        let candidate = match CandidateSnapshot::build_prepared(
+            logical.clone(),
+            &plan,
+            &prepared,
+            &previous,
+            &self.inner.defaults,
+            &self.inner.resolver,
+        ) {
+            Ok(candidate) => candidate,
+            Err(error) => return PrepareOutcome::Permanent(error),
+        };
+        let compiled = match RuntimeSnapshot::compile(candidate, revision) {
+            Ok(compiled) => compiled,
+            Err(error) => return PrepareOutcome::Permanent(error),
+        };
+        // Acquire write_lock only for the generation fence + atomic publish +
+        // committed-graph update.
         let _writer = self
             .inner
             .write_lock
@@ -879,20 +1089,10 @@ impl ConfigurationGraph {
         {
             return PrepareOutcome::Settled;
         }
-        if revision < RUNTIME.load().revision {
+        if revision < self.inner.runtime.load().revision {
             return PrepareOutcome::Settled;
         }
-        let (plan, prepared) = prepared;
-        let candidate =
-            match CandidateSnapshot::build_prepared(logical.clone(), &plan, &prepared, &previous) {
-                Ok(candidate) => candidate,
-                Err(error) => return PrepareOutcome::Permanent(error),
-            };
-        let compiled = match RuntimeSnapshot::compile(candidate, revision) {
-            Ok(compiled) => compiled,
-            Err(error) => return PrepareOutcome::Permanent(error),
-        };
-        let published = match RUNTIME.publish(compiled) {
+        let published = match self.inner.runtime.publish(compiled) {
             Ok(published) => published,
             Err(error) => return PrepareOutcome::Permanent(error),
         };
@@ -901,6 +1101,7 @@ impl ConfigurationGraph {
             .committed
             .lock()
             .unwrap_or_else(|e| e.into_inner()) = Some(CommittedGraph { stored });
+        self.publish_revision(revision);
         PENDING_REVISION.set(0);
         PREPARATION_ATTEMPTS.with_label_values(&["published"]).inc();
         log::debug!(
@@ -908,6 +1109,50 @@ impl ConfigurationGraph {
             published.revision
         );
         PrepareOutcome::Settled
+    }
+
+    /// Return the authority-owned outcome for a retained revision. `None`
+    /// means unknown or aged out; it is never inferred from runtime revision.
+    pub fn publication(&self, revision: i64) -> Option<PublicationView> {
+        self.inner
+            .publications
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .view(revision)
+    }
+
+    fn record_pending_publication(&self, revision: i64) {
+        self.inner
+            .publications
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .pending(revision);
+    }
+
+    fn publish_revision(&self, revision: i64) {
+        self.inner
+            .publications
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .published(revision);
+    }
+
+    fn reject_publication(&self, generation: u64, error: String) {
+        let revision = self
+            .inner
+            .target
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref()
+            .filter(|target| target.generation == generation)
+            .map(|target| target.revision);
+        if let Some(revision) = revision {
+            self.inner
+                .publications
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .rejected(revision, error);
+        }
     }
 
     /// Read one stored resource, decrypted and redacted, for the Admin API.
@@ -922,12 +1167,14 @@ impl ConfigurationGraph {
             return Ok(None);
         };
         let mut json = parse_stored_resource(key, &resource.value)?;
-        decrypt_for_read(key.kind, &mut json).map_err(|source| GraphError::Secret {
-            key: key.clone(),
-            operation: SecretOperation::Decrypt,
-            source,
+        decrypt_for_read(key.kind, &mut json, &self.inner.keyring).map_err(|source| {
+            GraphError::Secret {
+                key: key.clone(),
+                operation: SecretOperation::Decrypt,
+                source,
+            }
         })?;
-        redact(key.kind, &mut json);
+        redact(key.kind, &mut json, &self.inner.keyring);
         Ok(Some(ResourceView {
             key: key.clone(),
             value: json,
@@ -950,12 +1197,14 @@ impl ConfigurationGraph {
                 continue;
             }
             let mut json = parse_stored_resource(key, &resource.value)?;
-            decrypt_for_read(kind, &mut json).map_err(|source| GraphError::Secret {
-                key: key.clone(),
-                operation: SecretOperation::Decrypt,
-                source,
+            decrypt_for_read(kind, &mut json, &self.inner.keyring).map_err(|source| {
+                GraphError::Secret {
+                    key: key.clone(),
+                    operation: SecretOperation::Decrypt,
+                    source,
+                }
             })?;
-            redact(kind, &mut json);
+            redact(kind, &mut json, &self.inner.keyring);
             views.push(ResourceView {
                 key: key.clone(),
                 value: json,
@@ -1003,12 +1252,14 @@ impl ConfigurationGraph {
         if contains_redaction_sentinel(&value) {
             if let Some(stored) = snapshot.resources.get(&key) {
                 let mut existing = parse_stored_resource(&key, &stored.value)?;
-                decrypt_for_read(key.kind, &mut existing).map_err(|source| GraphError::Secret {
-                    key: key.clone(),
-                    operation: SecretOperation::Restore,
-                    source,
-                })?;
-                restore_redacted_secrets(key.kind, &mut value, &existing);
+                decrypt_for_read(key.kind, &mut existing, &self.inner.keyring).map_err(
+                    |source| GraphError::Secret {
+                        key: key.clone(),
+                        operation: SecretOperation::Restore,
+                        source,
+                    },
+                )?;
+                restore_redacted_secrets(key.kind, &mut value, &existing, &self.inner.keyring);
             }
         }
 
@@ -1018,18 +1269,31 @@ impl ConfigurationGraph {
         })?;
 
         let stored =
-            encrypt_for_storage(key.kind, &mut value).map_err(|source| GraphError::Secret {
-                key: key.clone(),
-                operation: SecretOperation::Encrypt,
-                source,
+            encrypt_for_storage(key.kind, &mut value, &self.inner.keyring).map_err(|source| {
+                GraphError::Secret {
+                    key: key.clone(),
+                    operation: SecretOperation::Encrypt,
+                    source,
+                }
             })?;
 
-        let commit = plan_put_mutation(&snapshot, &key, stored)?;
-        self.inner
+        let commit = plan_put_mutation(&snapshot, &key, stored, &self.inner.keyring)?;
+        let revision = self
+            .inner
             .store
             .compare_and_swap(commit)
             .await
-            .map_err(map_store_error)
+            .map_err(map_store_error)?;
+        self.record_pending_publication(revision.0);
+        Ok(revision)
+    }
+
+    /// Last runtime-published revision from this graph's status store.
+    ///
+    /// Reads the injected [`StatusStore`] so the Admin API reflects the same
+    /// per-build state as the status app, never the process-global facade.
+    pub fn published_revision(&self) -> i64 {
+        self.inner.status.published_revision()
     }
 
     /// Validate and commit an Admin DELETE against the whole graph.
@@ -1040,12 +1304,15 @@ impl ConfigurationGraph {
             .snapshot()
             .await
             .map_err(GraphError::Store)?;
-        let commit = plan_delete_mutation(&snapshot, &key)?;
-        self.inner
+        let commit = plan_delete_mutation(&snapshot, &key, &self.inner.keyring)?;
+        let revision = self
+            .inner
             .store
             .compare_and_swap(commit)
             .await
-            .map_err(map_store_error)
+            .map_err(map_store_error)?;
+        self.record_pending_publication(revision.0);
+        Ok(revision)
     }
 }
 
@@ -1067,6 +1334,9 @@ fn parse_stored_resource(key: &ResourceKey, value: &[u8]) -> Result<serde_json::
 /// configurations, deterministic upstream mTLS material, and (for SSL)
 /// certificate/key material.
 fn validate_resource_json(kind: ResourceKind, value: &serde_json::Value) -> ProxyResult<()> {
+    // Admin writes bypass stored-resource decoding, so they must use the same
+    // compatibility-preserving warning path before serde drops unknown fields.
+    config::warn_unrecognized_fields(kind.as_str(), value);
     match kind {
         ResourceKind::Upstream => {
             let resource: Upstream =
@@ -1139,8 +1409,8 @@ fn validate_plugins(plugins: &HashMap<String, serde_json::Value>) -> ProxyResult
 ///
 /// Reuses the exact same `#[encrypt]` field walk as encrypt/decrypt, so the
 /// masked set is the single source of truth. Performs no crypto and cannot fail.
-pub fn redact(kind: ResourceKind, value: &mut serde_json::Value) {
-    config::transform_resource_secrets(kind.as_str(), value, SecretOp::Redact)
+pub fn redact(kind: ResourceKind, value: &mut serde_json::Value, keyring: &KeyringService) {
+    config::transform_resource_secrets(keyring, kind.as_str(), value, SecretOp::Redact)
         .expect("redaction performs no fallible crypto");
 }
 
@@ -1166,9 +1436,10 @@ pub fn restore_redacted_secrets(
     kind: ResourceKind,
     incoming: &mut serde_json::Value,
     existing_plaintext: &serde_json::Value,
+    keyring: &KeyringService,
 ) {
     let mut secret_map = existing_plaintext.clone();
-    redact(kind, &mut secret_map);
+    redact(kind, &mut secret_map, keyring);
     restore_walk(incoming, existing_plaintext, &secret_map);
 }
 
@@ -1212,9 +1483,13 @@ fn restore_walk(
 
 /// Compact a validated resource to storage bytes, encrypting sensitive fields
 /// first when data encryption is enabled. No-op when encryption is disabled.
-fn encrypt_for_storage(kind: ResourceKind, value: &mut serde_json::Value) -> ProxyResult<Vec<u8>> {
-    if crate::utils::encryption::is_enabled() {
-        config::transform_resource_secrets(kind.as_str(), value, SecretOp::Encrypt)?;
+fn encrypt_for_storage(
+    kind: ResourceKind,
+    value: &mut serde_json::Value,
+    keyring: &KeyringService,
+) -> ProxyResult<Vec<u8>> {
+    if keyring.is_enabled() {
+        config::transform_resource_secrets(keyring, kind.as_str(), value, SecretOp::Encrypt)?;
     }
     serde_json::to_vec(value)
         .map_err(|e| ProxyError::serialization_error("Failed to serialize resource for storage", e))
@@ -1222,9 +1497,13 @@ fn encrypt_for_storage(kind: ResourceKind, value: &mut serde_json::Value) -> Pro
 
 /// Decrypt a resource's secret fields for the read API (GET/LIST). Fail-closed:
 /// an undecryptable value surfaces an error rather than leaking ciphertext.
-fn decrypt_for_read(kind: ResourceKind, value: &mut serde_json::Value) -> ProxyResult<()> {
-    if crate::utils::encryption::is_enabled() {
-        config::transform_resource_secrets(kind.as_str(), value, SecretOp::Decrypt)?;
+fn decrypt_for_read(
+    kind: ResourceKind,
+    value: &mut serde_json::Value,
+    keyring: &KeyringService,
+) -> ProxyResult<()> {
+    if keyring.is_enabled() {
+        config::transform_resource_secrets(keyring, kind.as_str(), value, SecretOp::Decrypt)?;
     }
     Ok(())
 }
@@ -1334,6 +1613,66 @@ mod pure_graph_tests {
     }
 
     #[test]
+    fn admin_validation_accepts_unknown_fields_after_warning() {
+        let value = serde_json::json!({
+            "id": "u1",
+            "nodes": { "127.0.0.1:80": 1 },
+            "retry_timout": 10,
+            "checks": {
+                "active": {
+                    "healthy": { "sucesses": 2 },
+                },
+            },
+        });
+
+        // The Admin validation path invokes the warning helper but preserves
+        // forward-compatible unknown fields rather than rejecting the write.
+        assert!(validate_resource_json(ResourceKind::Upstream, &value).is_ok());
+    }
+
+    #[test]
+    fn preparation_errors_are_safe_summaries() {
+        assert_eq!(
+            safe_preparation_error(false),
+            "candidate preparation temporarily unavailable"
+        );
+        assert_eq!(
+            safe_preparation_error(true),
+            "candidate rejected during runtime preparation"
+        );
+    }
+
+    #[test]
+    fn publication_registry_tracks_terminal_states_and_bounds_history() {
+        let mut registry = PublicationRegistry::default();
+        registry.pending(10);
+        registry.published(10);
+        assert_eq!(
+            registry.view(10).unwrap().state,
+            PublicationState::Published
+        );
+
+        registry.pending(11);
+        registry.supersede_pending_except(12);
+        assert_eq!(
+            registry.view(11).unwrap().state,
+            PublicationState::Superseded
+        );
+
+        registry.pending(12);
+        registry.rejected(12, "safe summary".into());
+        let rejected = registry.view(12).unwrap();
+        assert_eq!(rejected.state, PublicationState::Rejected);
+        assert_eq!(rejected.error.as_deref(), Some("safe summary"));
+
+        for revision in 13..(13 + PUBLICATION_REGISTRY_CAPACITY as i64 + 5) {
+            registry.pending(revision);
+            registry.published(revision);
+        }
+        assert!(registry.records.len() <= PUBLICATION_REGISTRY_CAPACITY);
+    }
+
+    #[test]
     fn resource_kind_parse_round_trips() {
         for kind in [
             ResourceKind::Upstream,
@@ -1365,7 +1704,12 @@ mod pure_graph_tests {
     #[test]
     fn decode_graph_round_trips_all_kinds_and_uses_key_id() {
         let graph = sample_graph();
-        let set = decode_graph(&graph, SecretMode::PreserveStored).unwrap();
+        let set = decode_graph(
+            &graph,
+            SecretMode::PreserveStored,
+            &KeyringService::global(),
+        )
+        .unwrap();
 
         // IDs come from the storage key, never the JSON body.
         assert_eq!(set.upstreams.get("u1").unwrap().id, "u1");
@@ -1393,7 +1737,12 @@ mod pure_graph_tests {
                 .unwrap(),
             ),
         );
-        let set = decode_graph(&graph, SecretMode::PreserveStored).unwrap();
+        let set = decode_graph(
+            &graph,
+            SecretMode::PreserveStored,
+            &KeyringService::global(),
+        )
+        .unwrap();
         assert_eq!(
             set.ssls["t1"].key, "$pingsix-enc:v1$ciphertext",
             "validation path must not touch secret values"
@@ -1416,7 +1765,12 @@ mod pure_graph_tests {
                 .unwrap(),
             ),
         );
-        let err = decode_graph(&graph, SecretMode::DecryptForRuntime).unwrap_err();
+        let err = decode_graph(
+            &graph,
+            SecretMode::DecryptForRuntime,
+            &KeyringService::global(),
+        )
+        .unwrap_err();
         assert!(
             err.to_string().contains("Encrypted value found"),
             "unexpected error: {err}"
@@ -1483,7 +1837,8 @@ mod pure_graph_tests {
             ],
         };
         let next = apply_watch_batch(&base, &batch).unwrap();
-        let decoded = decode_graph(&next, SecretMode::PreserveStored).unwrap();
+        let decoded =
+            decode_graph(&next, SecretMode::PreserveStored, &KeyringService::global()).unwrap();
         assert_eq!(decoded.routes["r2"].uri.as_deref(), Some("/v2"));
     }
 
@@ -1524,7 +1879,13 @@ mod pure_graph_tests {
     fn plan_put_create_uses_absent_target_expectation() {
         let snapshot = sample_graph();
         let key = ResourceKey::new(ResourceKind::Route, "r2").unwrap();
-        let commit = plan_put_mutation(&snapshot, &key, stored_route_json("r2", "u1")).unwrap();
+        let commit = plan_put_mutation(
+            &snapshot,
+            &key,
+            stored_route_json("r2", "u1"),
+            &KeyringService::global(),
+        )
+        .unwrap();
         assert_eq!(commit.expected_target_mod_revision, None);
         assert_eq!(
             commit.expected_guard_mod_revision,
@@ -1543,8 +1904,13 @@ mod pure_graph_tests {
     fn plan_put_replace_uses_exact_mod_revision() {
         let snapshot = sample_graph();
         let key = ResourceKey::new(ResourceKind::Upstream, "u1").unwrap();
-        let commit =
-            plan_put_mutation(&snapshot, &key, stored_upstream_json("u1", "127.0.0.1:81")).unwrap();
+        let commit = plan_put_mutation(
+            &snapshot,
+            &key,
+            stored_upstream_json("u1", "127.0.0.1:81"),
+            &KeyringService::global(),
+        )
+        .unwrap();
         assert_eq!(
             commit.expected_target_mod_revision,
             Some(snapshot.resources[&key].mod_revision)
@@ -1555,8 +1921,13 @@ mod pure_graph_tests {
     fn plan_put_rejects_dangling_upstream_id() {
         let snapshot = sample_graph();
         let key = ResourceKey::new(ResourceKind::Route, "bad").unwrap();
-        let err =
-            plan_put_mutation(&snapshot, &key, stored_route_json("bad", "missing")).unwrap_err();
+        let err = plan_put_mutation(
+            &snapshot,
+            &key,
+            stored_route_json("bad", "missing"),
+            &KeyringService::global(),
+        )
+        .unwrap_err();
         assert!(
             matches!(err, GraphError::InvalidCandidate { .. }),
             "got {err:?}"
@@ -1567,7 +1938,7 @@ mod pure_graph_tests {
     fn plan_delete_missing_target_is_not_found() {
         let snapshot = sample_graph();
         let key = ResourceKey::new(ResourceKind::Route, "ghost").unwrap();
-        let err = plan_delete_mutation(&snapshot, &key).unwrap_err();
+        let err = plan_delete_mutation(&snapshot, &key, &KeyringService::global()).unwrap_err();
         assert!(matches!(err, GraphError::NotFound { .. }), "got {err:?}");
     }
 
@@ -1575,7 +1946,7 @@ mod pure_graph_tests {
     fn plan_delete_referenced_upstream_conflicts() {
         let snapshot = sample_graph();
         let key = ResourceKey::new(ResourceKind::Upstream, "u1").unwrap();
-        let err = plan_delete_mutation(&snapshot, &key).unwrap_err();
+        let err = plan_delete_mutation(&snapshot, &key, &KeyringService::global()).unwrap_err();
         assert!(
             matches!(err, GraphError::ReferentialConflict { .. }),
             "got {err:?}"
@@ -1591,7 +1962,7 @@ mod pure_graph_tests {
             u2.clone(),
             stored(u2.clone(), stored_upstream_json("u2", "127.0.0.1:82")),
         );
-        let commit = plan_delete_mutation(&snapshot, &u2).unwrap();
+        let commit = plan_delete_mutation(&snapshot, &u2, &KeyringService::global()).unwrap();
         assert_eq!(
             commit.expected_target_mod_revision,
             Some(snapshot.resources[&u2].mod_revision)
@@ -1610,7 +1981,12 @@ mod pure_graph_tests {
                 b"not-json".to_vec(),
             ),
         );
-        assert!(decode_graph(&graph, SecretMode::PreserveStored).is_err());
+        assert!(decode_graph(
+            &graph,
+            SecretMode::PreserveStored,
+            &KeyringService::global()
+        )
+        .is_err());
     }
 }
 
@@ -2057,7 +2433,7 @@ mod authority_tests {
             "cert": "-----BEGIN CERTIFICATE-----\ncert\n-----END CERTIFICATE-----",
             "key": "-----BEGIN PRIVATE KEY-----\nsecret\n-----END PRIVATE KEY-----",
         });
-        redact(ResourceKind::Ssl, &mut input);
+        redact(ResourceKind::Ssl, &mut input, &KeyringService::global());
         assert_eq!(
             input["cert"],
             "-----BEGIN CERTIFICATE-----\ncert\n-----END CERTIFICATE-----"
@@ -2068,7 +2444,7 @@ mod authority_tests {
     #[test]
     fn redact_jwt_secret() {
         let mut input = serde_json::json!({ "plugins": { "jwt-auth": { "secret": "abc" } } });
-        redact(ResourceKind::Route, &mut input);
+        redact(ResourceKind::Route, &mut input, &KeyringService::global());
         assert_eq!(input["plugins"]["jwt-auth"]["secret"], "***");
     }
 
@@ -2077,7 +2453,7 @@ mod authority_tests {
         let mut input = serde_json::json!({
             "plugins": { "basic-auth": { "username": "u", "password": "p" } },
         });
-        redact(ResourceKind::Route, &mut input);
+        redact(ResourceKind::Route, &mut input, &KeyringService::global());
         assert_eq!(input["plugins"]["basic-auth"]["username"], "u");
         assert_eq!(input["plugins"]["basic-auth"]["password"], "***");
     }
@@ -2087,7 +2463,7 @@ mod authority_tests {
         let mut input = serde_json::json!({
             "plugins": { "key-auth": { "key": "k0", "keys": ["k1", "k2"] } },
         });
-        redact(ResourceKind::Route, &mut input);
+        redact(ResourceKind::Route, &mut input, &KeyringService::global());
         assert_eq!(input["plugins"]["key-auth"]["key"], "***");
         assert_eq!(
             input["plugins"]["key-auth"]["keys"],
@@ -2098,7 +2474,11 @@ mod authority_tests {
     #[test]
     fn redact_csrf_key() {
         let mut input = serde_json::json!({ "plugins": { "csrf": { "key": "secret-csrf" } } });
-        redact(ResourceKind::GlobalRule, &mut input);
+        redact(
+            ResourceKind::GlobalRule,
+            &mut input,
+            &KeyringService::global(),
+        );
         assert_eq!(input["plugins"]["csrf"]["key"], "***");
     }
 
@@ -2112,20 +2492,28 @@ mod authority_tests {
                 }
             }
         });
-        redact(ResourceKind::Route, &mut input);
+        redact(ResourceKind::Route, &mut input, &KeyringService::global());
         assert_eq!(input["upstream"]["tls"]["client_key"], "***");
         assert_eq!(input["upstream"]["tls"]["client_cert"], "cert-data");
         let mut service = serde_json::json!({
             "upstream": { "tls": { "client_key": "k", "client_cert": "c" } }
         });
-        redact(ResourceKind::Service, &mut service);
+        redact(
+            ResourceKind::Service,
+            &mut service,
+            &KeyringService::global(),
+        );
         assert_eq!(service["upstream"]["tls"]["client_key"], "***");
     }
 
     #[test]
     fn redact_preserves_upstream_hash_on_key() {
         let mut input = serde_json::json!({ "key": "uri", "type": "roundrobin" });
-        redact(ResourceKind::Upstream, &mut input);
+        redact(
+            ResourceKind::Upstream,
+            &mut input,
+            &KeyringService::global(),
+        );
         assert_eq!(input["key"], "uri");
         assert_eq!(input["type"], "roundrobin");
     }
@@ -2140,7 +2528,11 @@ mod authority_tests {
                 "client_cert": "cert-data",
             },
         });
-        redact(ResourceKind::Upstream, &mut input);
+        redact(
+            ResourceKind::Upstream,
+            &mut input,
+            &KeyringService::global(),
+        );
         assert_eq!(input["key"], "uri");
         assert_eq!(input["tls"]["client_key"], "***");
         assert_eq!(input["tls"]["client_cert"], "cert-data");
@@ -2155,7 +2547,7 @@ mod authority_tests {
             "upstream_id": "u1",
         });
         let original = input.clone();
-        redact(ResourceKind::Route, &mut input);
+        redact(ResourceKind::Route, &mut input, &KeyringService::global());
         assert_eq!(input, original);
     }
 
@@ -2171,7 +2563,12 @@ mod authority_tests {
             "cert": "cert-pem",
             "key": "***",
         });
-        restore_redacted_secrets(ResourceKind::Ssl, &mut resave, &existing);
+        restore_redacted_secrets(
+            ResourceKind::Ssl,
+            &mut resave,
+            &existing,
+            &KeyringService::global(),
+        );
         assert_eq!(resave["key"], existing["key"]);
 
         let mut rotate = serde_json::json!({
@@ -2179,7 +2576,12 @@ mod authority_tests {
             "cert": "cert-pem",
             "key": "-----BEGIN PRIVATE KEY-----\nnew\n-----END PRIVATE KEY-----",
         });
-        restore_redacted_secrets(ResourceKind::Ssl, &mut rotate, &existing);
+        restore_redacted_secrets(
+            ResourceKind::Ssl,
+            &mut rotate,
+            &existing,
+            &KeyringService::global(),
+        );
         assert_eq!(
             rotate["key"],
             "-----BEGIN PRIVATE KEY-----\nnew\n-----END PRIVATE KEY-----"
@@ -2213,7 +2615,12 @@ mod authority_tests {
                 "tls": { "client_cert": "cert-pem", "client_key": "***" },
             },
         });
-        restore_redacted_secrets(ResourceKind::Route, &mut resave, &existing);
+        restore_redacted_secrets(
+            ResourceKind::Route,
+            &mut resave,
+            &existing,
+            &KeyringService::global(),
+        );
         assert_eq!(resave["plugins"]["basic-auth"]["username"], "changed");
         assert_eq!(resave["plugins"]["basic-auth"]["password"], "s3cret");
         assert_eq!(resave["plugins"]["key-auth"]["key"], "k0");
@@ -2232,7 +2639,12 @@ mod authority_tests {
     fn restore_ignores_non_secret_sentinel() {
         let existing = serde_json::json!({ "uri": "/old", "id": "r1" });
         let mut resave = serde_json::json!({ "uri": "***", "id": "r1" });
-        restore_redacted_secrets(ResourceKind::Route, &mut resave, &existing);
+        restore_redacted_secrets(
+            ResourceKind::Route,
+            &mut resave,
+            &existing,
+            &KeyringService::global(),
+        );
         assert_eq!(resave["uri"], "***");
     }
 
@@ -2244,7 +2656,8 @@ mod authority_tests {
             "key": "-----BEGIN PRIVATE KEY-----\nsecret\n-----END PRIVATE KEY-----",
             "snis": ["example.com"],
         });
-        let out = encrypt_for_storage(ResourceKind::Ssl, &mut input).unwrap();
+        let out =
+            encrypt_for_storage(ResourceKind::Ssl, &mut input, &KeyringService::global()).unwrap();
         let parsed: serde_json::Value = serde_json::from_slice(&out).unwrap();
         assert_eq!(parsed["key"], input["key"]);
         // Output is compacted even when encryption is disabled.
@@ -2265,7 +2678,8 @@ mod authority_tests {
                 "tls": { "client_cert": "cert", "client_key": "key-material" }
             }
         });
-        let out = encrypt_for_storage(ResourceKind::Route, &mut input).unwrap();
+        let out = encrypt_for_storage(ResourceKind::Route, &mut input, &KeyringService::global())
+            .unwrap();
         let parsed: serde_json::Value = serde_json::from_slice(&out).unwrap();
         assert_eq!(parsed["plugins"]["basic-auth"]["password"], "s3cret");
         assert_eq!(parsed["upstream"]["tls"]["client_key"], "key-material");
@@ -2899,12 +3313,19 @@ mod worker_tests {
     #[test]
     fn load_static_publishes_empty_config() {
         let _guard = RUNTIME_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        // `load_static` marks readiness on the process-global status; hold the
-        // shared status lock so this never races with status unit tests.
+        let status = StatusStore::global();
         let _status_guard = crate::core::status::STATUS_TEST_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        let snapshot = ConfigurationGraph::load_static(&config::Config::default()).unwrap();
+        let resolver = crate::proxy::upstream::discovery::get_global_resolver_for_build().unwrap();
+        let snapshot = ConfigurationGraph::load_static(
+            &config::Config::default(),
+            &status,
+            &RUNTIME,
+            &EffectiveDefaults::global(),
+            &resolver,
+        )
+        .unwrap();
         assert!(snapshot.routes.is_empty());
         crate::core::status::reset();
     }

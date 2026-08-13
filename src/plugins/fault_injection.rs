@@ -18,7 +18,10 @@ const PRIORITY: i32 = 11000;
 
 /// Creates a Fault Injection plugin instance with the given configuration.
 /// This plugin allows you to inject faults (delays and aborts) into requests for testing purposes.
-pub fn create_fault_injection_plugin(cfg: JsonValue) -> ProxyResult<Arc<dyn ProxyPlugin>> {
+pub fn create_fault_injection_plugin(
+    cfg: JsonValue,
+    _defaults: &crate::config::EffectiveDefaults,
+) -> ProxyResult<Arc<dyn ProxyPlugin>> {
     let config = PluginConfig::try_from(cfg)?;
     Ok(Arc::new(PluginFaultInjection { config }))
 }

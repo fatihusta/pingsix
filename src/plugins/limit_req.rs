@@ -11,7 +11,8 @@
 //! `incoming()` so behavior matches APISIX with `policy: local`.
 
 use std::{
-    collections::HashMap,
+    collections::{BTreeMap, HashMap},
+    hash::{Hash, Hasher},
     sync::{Arc, Mutex},
     time::{Duration, Instant},
 };
@@ -37,12 +38,32 @@ const PRIORITY: i32 = 1001;
 /// Upper bound on tracked keys before idle entries are swept.
 const MAX_KEYS: usize = 4096;
 
+/// Number of independent shards the bucket map is split across so requests
+/// with different keys do not all serialize on one mutex. Total entry bound
+/// stays `MAX_KEYS` (`PER_SHARD_MAX * LIMIT_SHARDS`), and any sweep only
+/// touches one shard.
+const LIMIT_SHARDS: usize = 16;
+const PER_SHARD_MAX: usize = MAX_KEYS / LIMIT_SHARDS;
+/// One slot is reserved for the stable overflow bucket.
+const PER_SHARD_REGULAR_MAX: usize = PER_SHARD_MAX - 1;
+/// Cleanup examines at most this many oldest entries per request.
+const CLEANUP_BUDGET: usize = 8;
+
+fn shard_idx(key: &str) -> usize {
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    key.hash(&mut hasher);
+    (hasher.finish() as usize) % LIMIT_SHARDS
+}
+
 /// Creates a `limit-req` plugin instance from JSON configuration.
-pub fn create_limit_req_plugin(cfg: JsonValue) -> ProxyResult<Arc<dyn ProxyPlugin>> {
+pub fn create_limit_req_plugin(
+    cfg: JsonValue,
+    _defaults: &crate::config::EffectiveDefaults,
+) -> ProxyResult<Arc<dyn ProxyPlugin>> {
     let config = PluginConfig::try_from(cfg)?;
     Ok(Arc::new(PluginLimitReq {
         config,
-        buckets: Mutex::new(HashMap::new()),
+        buckets: std::array::from_fn(|_| Mutex::new(BucketShard::default())),
     }))
 }
 
@@ -51,6 +72,49 @@ struct Bucket {
     excess: f64,
     last: Instant,
     initialized: bool,
+    touch: u64,
+}
+
+#[derive(Default)]
+struct BucketShard {
+    entries: HashMap<String, Bucket>,
+    oldest: BTreeMap<u64, String>,
+    next_touch: u64,
+}
+
+impl BucketShard {
+    fn touch(&mut self, key: &str) {
+        if let Some(bucket) = self.entries.get(key) {
+            self.oldest.remove(&bucket.touch);
+        }
+        self.next_touch = self.next_touch.wrapping_add(1);
+        if self.next_touch == 0 {
+            self.next_touch = 1;
+        }
+        let touch = self.next_touch;
+        self.entries
+            .get_mut(key)
+            .expect("touched bucket exists")
+            .touch = touch;
+        self.oldest.insert(touch, key.to_string());
+    }
+
+    /// Remove no more than `CLEANUP_BUDGET` oldest drained buckets.
+    fn sweep_drained(&mut self, now: Instant, rate: f64) {
+        for _ in 0..CLEANUP_BUDGET {
+            let Some((touch, key)) = self.oldest.pop_first() else {
+                break;
+            };
+            let drained = self.entries.get(&key).is_some_and(|bucket| {
+                now.duration_since(bucket.last).as_secs_f64() * rate >= bucket.excess
+            });
+            if drained {
+                self.entries.remove(&key);
+            } else {
+                self.oldest.insert(touch, key);
+            }
+        }
+    }
 }
 
 /// Pure leaky-bucket transition (unit-testable).
@@ -169,7 +233,7 @@ impl TryFrom<JsonValue> for PluginConfig {
 /// Leaky-bucket rate limiting plugin implementation.
 pub struct PluginLimitReq {
     config: PluginConfig,
-    buckets: Mutex<HashMap<String, Bucket>>,
+    buckets: [Mutex<BucketShard>; LIMIT_SHARDS],
 }
 
 impl PluginLimitReq {
@@ -208,25 +272,38 @@ impl ProxyPlugin for PluginLimitReq {
         // The lock is held only for the pure state transition; sleeping and
         // response writes happen after the bucket state is updated.
         let (delay, rejected) = {
-            let mut buckets = self.buckets.lock().unwrap_or_else(|e| e.into_inner());
-            if !buckets.contains_key(key.as_ref()) && buckets.len() >= MAX_KEYS {
-                // Sweep fully-drained buckets to bound memory from ephemeral keys.
-                buckets.retain(|_, b| {
-                    now.duration_since(b.last).as_secs_f64() * self.config.rate >= b.excess
-                });
+            let mut buckets = self.buckets[shard_idx(key.as_ref())]
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            if !buckets.entries.contains_key(key.as_ref())
+                && buckets.entries.len() >= PER_SHARD_REGULAR_MAX
+            {
+                // Fixed work budget; no request can scan the full map.
+                buckets.sweep_drained(now, self.config.rate);
             }
-            // Preserve every extant bucket. When full, new keys share a stable
-            // overflow bucket rather than resetting active/hot key state.
-            let storage_key = if buckets.contains_key(key.as_ref()) || buckets.len() < MAX_KEYS {
+            // Preserve extant buckets. Once regular capacity is exhausted, new
+            // keys share a stable overflow bucket rather than resetting state.
+            let storage_key = if buckets.entries.contains_key(key.as_ref())
+                || buckets.entries.len() < PER_SHARD_REGULAR_MAX
+            {
                 key.into_owned()
             } else {
                 "__pingsix_limit_req_overflow__".to_string()
             };
-            let bucket = buckets.entry(storage_key).or_insert_with(|| Bucket {
-                excess: 0.0,
-                last: now,
-                initialized: false,
-            });
+            buckets
+                .entries
+                .entry(storage_key.clone())
+                .or_insert(Bucket {
+                    excess: 0.0,
+                    last: now,
+                    initialized: false,
+                    touch: 0,
+                });
+            buckets.touch(&storage_key);
+            let bucket = buckets
+                .entries
+                .get_mut(&storage_key)
+                .expect("inserted bucket exists");
             if !bucket.initialized {
                 bucket.initialized = true;
                 bucket.last = now;
@@ -316,6 +393,27 @@ mod tests {
         // excess 2, rate 1: after 1.5s the new excess is 1.5, which
         // exceeds burst 1 and is rejected.
         assert_eq!(leaky_bucket_step(2.0, 1.5, 1.0, 1.0, false), Err(()));
+    }
+
+    #[test]
+    fn bounded_sweep_removes_at_most_budget_entries() {
+        let now = Instant::now();
+        let mut shard = BucketShard::default();
+        for i in 0..CLEANUP_BUDGET + 2 {
+            let key = i.to_string();
+            shard.entries.insert(
+                key.clone(),
+                Bucket {
+                    excess: 0.0,
+                    last: now - Duration::from_secs(1),
+                    initialized: true,
+                    touch: 0,
+                },
+            );
+            shard.touch(&key);
+        }
+        shard.sweep_drained(now, 1.0);
+        assert_eq!(shard.entries.len(), 2);
     }
 
     #[test]

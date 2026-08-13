@@ -30,6 +30,8 @@ impl ProxyGlobalRule {
         rule: config::GlobalRule,
         upstreams: &HashMap<String, Arc<ProxyUpstream>>,
         prepared: &PreparedUpstreams,
+        defaults: &config::EffectiveDefaults,
+        resolver: &Arc<hickory_resolver::TokioResolver>,
     ) -> ProxyResult<Self> {
         let mut proxy_global_rule = ProxyGlobalRule {
             inner: rule.clone(),
@@ -45,6 +47,8 @@ impl ProxyGlobalRule {
                 upstreams,
                 prepared,
                 &TrafficSplitOwner::GlobalRule(rule.id.clone()),
+                defaults,
+                resolver,
             )
             .map_err(|e| {
                 ProxyError::Plugin(format!(
