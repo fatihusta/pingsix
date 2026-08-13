@@ -16,6 +16,8 @@ WORKDIR /app
 COPY Cargo.toml Cargo.lock ./
 RUN mkdir ./pingsix-macros
 COPY pingsix-macros ./pingsix-macros
+# Cargo.toml declares [[bench]] targets; cargo needs the files present to parse the manifest.
+COPY benches ./benches
 
 RUN mkdir src && \
     echo "fn main() {}" > src/main.rs && \
