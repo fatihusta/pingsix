@@ -305,11 +305,6 @@ impl ProxyPluginExecutor {
         &self.plugins
     }
 
-    /// Whether any plugin in this executor processes response body chunks.
-    pub fn has_response_body_filter(&self) -> bool {
-        !self.response_body.is_empty()
-    }
-
     /// Returns shared empty executor instance to minimize memory allocation.
     pub fn default_shared() -> Arc<Self> {
         DEFAULT_PLUGIN_EXECUTOR.clone()
@@ -595,9 +590,8 @@ mod tests {
     }
 
     #[test]
-    fn test_executor_detects_response_body_filter() {
+    fn test_executor_partitions_response_body_phase() {
         let executor = ProxyPluginExecutor::new(vec![Arc::new(BodyFilterPlugin)]);
-        assert!(executor.has_response_body_filter());
         assert!(executor.request.is_empty());
         assert_eq!(executor.response_body.len(), 1);
     }

@@ -160,14 +160,6 @@ pub trait ProxyPlugin: Send + Sync {
         Ok(())
     }
 
-    /// Whether this plugin implements response body filtering.
-    ///
-    /// Executors use this capability to skip body-filter traversal when no
-    /// configured plugin needs it.
-    fn has_response_body_filter(&self) -> bool {
-        self.phases().contains(PluginPhases::RESPONSE_BODY)
-    }
-
     /// Handle request body chunks as they stream from the downstream.
     ///
     /// Use this for: WAF inspection, upload size limits, and body validation.
