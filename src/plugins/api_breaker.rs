@@ -27,7 +27,8 @@ use serde_json::Value as JsonValue;
 use validator::{Validate, ValidationError};
 
 use crate::{
-    core::{ProxyContext, ProxyError, ProxyPlugin, ProxyResult},
+    core::{PluginPhases, ProxyContext, ProxyError, ProxyPlugin, ProxyResult},
+    plugins::config::parse_and_validate_plugin_config,
     utils::{request::render_apisix_request_template, response::ResponseBuilder},
 };
 
@@ -247,9 +248,8 @@ impl TryFrom<JsonValue> for PluginConfig {
     type Error = ProxyError;
 
     fn try_from(value: JsonValue) -> Result<Self, Self::Error> {
-        let config: PluginConfig = serde_json::from_value(value)
-            .map_err(|e| ProxyError::serialization_error("Invalid api-breaker plugin config", e))?;
-        config.validate()?;
+        let config: PluginConfig =
+            parse_and_validate_plugin_config(value, "Invalid api-breaker plugin config")?;
         // APISIX requires non-empty, unique status lists in their respective ranges.
         if config.unhealthy.http_statuses.is_empty()
             || config.healthy.http_statuses.is_empty()
@@ -379,6 +379,9 @@ impl ProxyPlugin for PluginApiBreaker {
 
     fn priority(&self) -> i32 {
         PRIORITY
+    }
+    fn phases(&self) -> PluginPhases {
+        PluginPhases::REQUEST | PluginPhases::RESPONSE
     }
 
     async fn request_filter(&self, session: &mut Session, ctx: &mut ProxyContext) -> Result<bool> {

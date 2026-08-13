@@ -11,8 +11,13 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
 use validator::{Validate, ValidationError};
 
-use crate::core::{apply_regex_uri_template, ProxyContext, ProxyError, ProxyPlugin, ProxyResult};
 use crate::utils::request::get_direct_client_ip;
+use crate::{
+    core::{
+        apply_regex_uri_template, PluginPhases, ProxyContext, ProxyError, ProxyPlugin, ProxyResult,
+    },
+    plugins::config::parse_and_validate_plugin_config,
+};
 
 pub const PLUGIN_NAME: &str = "redirect";
 const PRIORITY: i32 = 900;
@@ -115,10 +120,8 @@ impl TryFrom<JsonValue> for PluginConfig {
     type Error = ProxyError;
 
     fn try_from(value: JsonValue) -> Result<Self, Self::Error> {
-        let config: PluginConfig = serde_json::from_value(value)
-            .map_err(|e| ProxyError::serialization_error("Invalid redirect plugin config", e))?;
-
-        config.validate()?;
+        let config: PluginConfig =
+            parse_and_validate_plugin_config(value, "Invalid redirect plugin config")?;
 
         if config.http_to_https {
             let host = config.redirect_host.as_deref().map(str::trim).unwrap_or("");
@@ -149,6 +152,9 @@ impl ProxyPlugin for PluginRedirect {
 
     fn priority(&self) -> i32 {
         PRIORITY
+    }
+    fn phases(&self) -> PluginPhases {
+        PluginPhases::REQUEST
     }
 
     async fn request_filter(&self, session: &mut Session, _ctx: &mut ProxyContext) -> Result<bool> {

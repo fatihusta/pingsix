@@ -57,12 +57,21 @@ aes-gcm = "0.10"
 argon2 = "0.5"
 
 [dev-dependencies]
+criterion = "0.5"
 etcd-client = { version = "0.18.0", features = ["tls"] }
 jsonwebtoken = "9.3.1"
 rustls = "0.23"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 tokio = { version = "1.41.1", features = ["rt", "rt-multi-thread", "macros"] }
+
+[[bench]]
+name = "plugin_pipeline"
+harness = false
+
+[[bench]]
+name = "route_matching"
+harness = false
 
 [profile.release]
 lto = "thin"

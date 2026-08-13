@@ -11,7 +11,8 @@ use serde_json::Value as JsonValue;
 use validator::{Validate, ValidationError};
 
 use crate::{
-    core::{ProxyContext, ProxyError, ProxyPlugin, ProxyResult},
+    core::{PluginPhases, ProxyContext, ProxyError, ProxyPlugin, ProxyResult},
+    plugins::config::parse_and_validate_plugin_config,
     utils::request,
 };
 
@@ -175,11 +176,8 @@ impl TryFrom<JsonValue> for PluginConfig {
     type Error = ProxyError;
 
     fn try_from(value: JsonValue) -> Result<Self, Self::Error> {
-        let config: PluginConfig = serde_json::from_value(value).map_err(|e| {
-            ProxyError::serialization_error("Failed to parse CORS plugin config", e)
-        })?;
-
-        config.validate()?;
+        let config: PluginConfig =
+            parse_and_validate_plugin_config(value, "Failed to parse CORS plugin config")?;
 
         Ok(config)
     }
@@ -340,6 +338,9 @@ impl ProxyPlugin for PluginCors {
 
     fn priority(&self) -> i32 {
         PRIORITY
+    }
+    fn phases(&self) -> PluginPhases {
+        PluginPhases::REQUEST | PluginPhases::RESPONSE
     }
 
     async fn request_filter(&self, session: &mut Session, _ctx: &mut ProxyContext) -> Result<bool> {

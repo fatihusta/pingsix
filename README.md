@@ -85,7 +85,7 @@ curl http://localhost:8080/get
 
 ## 🔌 Plugin Ecosystem
 
-PingSIX includes 20 built-in plugins organized by category:
+PingSIX includes 25 built-in plugins organized by category:
 
 ### 🔐 Authentication & Security
 - **`jwt-auth`** - JWT token validation with multiple algorithms
@@ -128,7 +128,7 @@ PingSIX includes 20 built-in plugins organized by category:
 PingSIX is built on a modular architecture with the following key components:
 
 - **Core Engine**: Built on Cloudflare's Pingora framework for high-performance HTTP handling
-- **Plugin System**: Extensible plugin architecture with 20 built-in plugins
+- **Plugin System**: Extensible plugin architecture with 25 built-in plugins
 - **Configuration Management**: Support for both static YAML and dynamic etcd-based configuration
 - **Admin API**: RESTful API for runtime configuration management
 - **Observability**: Built-in metrics, logging, and error tracking
@@ -244,7 +244,7 @@ cargo run -- -c config.yaml
 
 ```rust
 use async_trait::async_trait;
-use crate::plugins::ProxyPlugin;
+use crate::core::{PluginPhases, ProxyPlugin};
 
 pub struct MyCustomPlugin {
     config: MyPluginConfig,
@@ -260,6 +260,11 @@ impl ProxyPlugin for MyCustomPlugin {
         1000
     }
 
+    // Required: hooks whose phase is not declared are never executed.
+    fn phases(&self) -> PluginPhases {
+        PluginPhases::REQUEST
+    }
+
     async fn request_filter(
         &self,
         session: &mut Session,
@@ -271,7 +276,14 @@ impl ProxyPlugin for MyCustomPlugin {
 }
 ```
 
-> 📖 For plugin development guide, see [Plugin Development](USER_GUIDE.md#plugins)
+> **Breaking plugin contract:** `ProxyPlugin::phases()` is fail-closed. A hook
+> is invoked only when its corresponding `PluginPhases` bit is returned. Existing
+> source plugins must declare every hook they implement before upgrading.
+> `ProxyContext::selected` is now `Option<SelectedUpstream>` after Pingora takes
+> ownership of the peer; use its `upstream`, `backend`, `sni`, and `node` fields
+> rather than accessing `HttpPeer`.
+>
+> 📖 For plugin development guide, see [Plugin Development](USER_GUIDE.md#plugin-development)
 
 ## 📄 License
 

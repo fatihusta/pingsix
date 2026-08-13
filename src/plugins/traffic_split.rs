@@ -7,14 +7,15 @@ use serde_json::Value as JsonValue;
 use std::{collections::HashMap, sync::Arc};
 use validator::Validate;
 
-use crate::config::{Upstream, UpstreamHashOn};
+use crate::config::Upstream;
 use crate::core::{
-    HealthCheckSpec, ProxyContext, ProxyError, ProxyPlugin, ProxyResult, UpstreamSelector,
+    HealthCheckSpec, PluginPhases, ProxyContext, ProxyError, ProxyPlugin, ProxyResult,
+    UpstreamSelector,
 };
 use crate::proxy::upstream::{
     PreparedUpstreams, ProxyUpstream, TrafficSplitOwner, UpstreamOccurrence,
 };
-use crate::utils::request::request_selector_key;
+use crate::utils::apisix_vars::match_apisix_vars;
 
 pub const PLUGIN_NAME: &str = "traffic-split";
 const PRIORITY: i32 = 966;
@@ -67,6 +68,9 @@ impl ProxyPlugin for PluginTrafficSplit {
     fn priority(&self) -> i32 {
         PRIORITY
     }
+    fn phases(&self) -> PluginPhases {
+        PluginPhases::REQUEST
+    }
 
     fn health_check_specs(&self) -> Vec<HealthCheckSpec> {
         self.health_check_specs
@@ -81,7 +85,7 @@ impl ProxyPlugin for PluginTrafficSplit {
 
     async fn request_filter(&self, session: &mut Session, ctx: &mut ProxyContext) -> Result<bool> {
         for (rule_idx, rule) in self.config.rules.iter().enumerate() {
-            if self.match_vars(session, &rule.vars) {
+            if match_apisix_vars(session, &rule.vars) {
                 match self.pick_upstream(rule_idx) {
                     Some(WeightedTarget::Upstream(selected)) => {
                         ctx.upstream_override = Some(selected);
@@ -99,42 +103,6 @@ impl ProxyPlugin for PluginTrafficSplit {
 }
 
 impl PluginTrafficSplit {
-    fn match_vars(&self, session: &mut Session, vars: &[Vec<String>]) -> bool {
-        if vars.is_empty() {
-            return true;
-        }
-
-        for v in vars {
-            if v.len() < 3 {
-                continue;
-            }
-            let var_name = &v[0];
-            let op = &v[1];
-            let val = &v[2];
-
-            let actual_val = if let Some(header_name) = var_name.strip_prefix("http_") {
-                request_selector_key(session, &UpstreamHashOn::HEAD, header_name)
-            } else {
-                request_selector_key(session, &UpstreamHashOn::VARS, var_name)
-            };
-
-            match op.as_str() {
-                "==" => {
-                    if actual_val != *val {
-                        return false;
-                    }
-                }
-                "!=" => {
-                    if actual_val == *val {
-                        return false;
-                    }
-                }
-                _ => return false,
-            }
-        }
-        true
-    }
-
     fn pick_upstream(&self, rule_idx: usize) -> Option<WeightedTarget> {
         let rule = &self.rules[rule_idx];
         if rule.total_weight == 0 {
@@ -413,8 +381,8 @@ mod tests {
             &upstreams,
             &HashMap::new(),
             TrafficSplitOwner::Route("test".into()),
-            &crate::config::EffectiveDefaults::global(),
-            &crate::proxy::upstream::discovery::get_global_resolver_for_build().unwrap(),
+            &crate::config::EffectiveDefaults::default(),
+            &crate::proxy::upstream::discovery::build_resolver_for_state().unwrap(),
         )
         .unwrap();
         let specs = plugin.health_check_specs();
@@ -442,8 +410,8 @@ mod tests {
             &upstreams,
             &HashMap::new(),
             TrafficSplitOwner::Route("test".into()),
-            &crate::config::EffectiveDefaults::global(),
-            &crate::proxy::upstream::discovery::get_global_resolver_for_build().unwrap()
+            &crate::config::EffectiveDefaults::default(),
+            &crate::proxy::upstream::discovery::build_resolver_for_state().unwrap()
         )
         .is_ok());
     }
@@ -468,8 +436,8 @@ mod tests {
             &upstreams,
             &HashMap::new(),
             TrafficSplitOwner::Route("test".into()),
-            &crate::config::EffectiveDefaults::global(),
-            &crate::proxy::upstream::discovery::get_global_resolver_for_build().unwrap()
+            &crate::config::EffectiveDefaults::default(),
+            &crate::proxy::upstream::discovery::build_resolver_for_state().unwrap()
         )
         .is_err());
     }
@@ -489,8 +457,8 @@ mod tests {
             &upstreams,
             &HashMap::new(),
             TrafficSplitOwner::Route("test".into()),
-            &crate::config::EffectiveDefaults::global(),
-            &crate::proxy::upstream::discovery::get_global_resolver_for_build().unwrap()
+            &crate::config::EffectiveDefaults::default(),
+            &crate::proxy::upstream::discovery::build_resolver_for_state().unwrap()
         )
         .is_err());
     }

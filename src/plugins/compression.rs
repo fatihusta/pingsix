@@ -16,7 +16,7 @@ use pingora_proxy::Session;
 use serde::Deserialize;
 use serde_json::Value as JsonValue;
 
-use crate::core::{ProxyContext, ProxyError, ProxyPlugin, ProxyResult};
+use crate::core::{PluginPhases, ProxyContext, ProxyError, ProxyPlugin, ProxyResult};
 
 /// Compression plugin parameterized by algorithm and level range.
 pub(crate) struct CompressionPlugin {
@@ -78,6 +78,9 @@ impl ProxyPlugin for CompressionPlugin {
 
     fn priority(&self) -> i32 {
         self.priority
+    }
+    fn phases(&self) -> PluginPhases {
+        PluginPhases::EARLY_REQUEST
     }
 
     async fn early_request_filter(

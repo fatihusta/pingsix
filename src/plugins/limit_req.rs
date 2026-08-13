@@ -11,8 +11,7 @@
 //! `incoming()` so behavior matches APISIX with `policy: local`.
 
 use std::{
-    collections::{BTreeMap, HashMap},
-    hash::{Hash, Hasher},
+    collections::HashMap,
     sync::{Arc, Mutex},
     time::{Duration, Instant},
 };
@@ -26,7 +25,10 @@ use serde_json::Value as JsonValue;
 use validator::{Validate, ValidationError};
 
 use crate::{
-    core::{ProxyContext, ProxyError, ProxyPlugin, ProxyResult},
+    core::{PluginPhases, ProxyContext, ProxyError, ProxyPlugin, ProxyResult},
+    plugins::limiter_shards::{
+        shard_idx, TouchOrder, CLEANUP_BUDGET, LIMIT_SHARDS, PER_SHARD_REGULAR_MAX,
+    },
     utils::{request::apisix_key, response::ResponseBuilder},
 };
 
@@ -34,26 +36,6 @@ pub const PLUGIN_NAME: &str = "limit-req";
 
 /// APISIX `limit-req` runs at priority 1001 (before limit-count 1002).
 const PRIORITY: i32 = 1001;
-
-/// Upper bound on tracked keys before idle entries are swept.
-const MAX_KEYS: usize = 4096;
-
-/// Number of independent shards the bucket map is split across so requests
-/// with different keys do not all serialize on one mutex. Total entry bound
-/// stays `MAX_KEYS` (`PER_SHARD_MAX * LIMIT_SHARDS`), and any sweep only
-/// touches one shard.
-const LIMIT_SHARDS: usize = 16;
-const PER_SHARD_MAX: usize = MAX_KEYS / LIMIT_SHARDS;
-/// One slot is reserved for the stable overflow bucket.
-const PER_SHARD_REGULAR_MAX: usize = PER_SHARD_MAX - 1;
-/// Cleanup examines at most this many oldest entries per request.
-const CLEANUP_BUDGET: usize = 8;
-
-fn shard_idx(key: &str) -> usize {
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    key.hash(&mut hasher);
-    (hasher.finish() as usize) % LIMIT_SHARDS
-}
 
 /// Creates a `limit-req` plugin instance from JSON configuration.
 pub fn create_limit_req_plugin(
@@ -72,37 +54,23 @@ struct Bucket {
     excess: f64,
     last: Instant,
     initialized: bool,
-    touch: u64,
 }
 
 #[derive(Default)]
 struct BucketShard {
     entries: HashMap<String, Bucket>,
-    oldest: BTreeMap<u64, String>,
-    next_touch: u64,
+    touch_order: TouchOrder,
 }
 
 impl BucketShard {
     fn touch(&mut self, key: &str) {
-        if let Some(bucket) = self.entries.get(key) {
-            self.oldest.remove(&bucket.touch);
-        }
-        self.next_touch = self.next_touch.wrapping_add(1);
-        if self.next_touch == 0 {
-            self.next_touch = 1;
-        }
-        let touch = self.next_touch;
-        self.entries
-            .get_mut(key)
-            .expect("touched bucket exists")
-            .touch = touch;
-        self.oldest.insert(touch, key.to_string());
+        self.touch_order.touch(key);
     }
 
     /// Remove no more than `CLEANUP_BUDGET` oldest drained buckets.
     fn sweep_drained(&mut self, now: Instant, rate: f64) {
         for _ in 0..CLEANUP_BUDGET {
-            let Some((touch, key)) = self.oldest.pop_first() else {
+            let Some((touch, key)) = self.touch_order.pop_oldest() else {
                 break;
             };
             let drained = self.entries.get(&key).is_some_and(|bucket| {
@@ -111,7 +79,7 @@ impl BucketShard {
             if drained {
                 self.entries.remove(&key);
             } else {
-                self.oldest.insert(touch, key);
+                self.touch_order.restore(touch, key);
             }
         }
     }
@@ -259,6 +227,9 @@ impl ProxyPlugin for PluginLimitReq {
     fn priority(&self) -> i32 {
         PRIORITY
     }
+    fn phases(&self) -> PluginPhases {
+        PluginPhases::REQUEST
+    }
 
     async fn request_filter(&self, session: &mut Session, _ctx: &mut ProxyContext) -> Result<bool> {
         let key = apisix_key(
@@ -297,7 +268,6 @@ impl ProxyPlugin for PluginLimitReq {
                     excess: 0.0,
                     last: now,
                     initialized: false,
-                    touch: 0,
                 });
             buckets.touch(&storage_key);
             let bucket = buckets
@@ -396,6 +366,42 @@ mod tests {
     }
 
     #[test]
+    fn full_shard_uses_stable_overflow_bucket() {
+        let now = Instant::now();
+        let mut shard = BucketShard::default();
+        for i in 0..PER_SHARD_REGULAR_MAX {
+            let key = i.to_string();
+            shard.entries.insert(
+                key.clone(),
+                Bucket {
+                    excess: 1.0,
+                    last: now,
+                    initialized: true,
+                },
+            );
+            shard.touch(&key);
+        }
+        shard.sweep_drained(now, 1.0);
+        let storage_key = if shard.entries.len() < PER_SHARD_REGULAR_MAX {
+            "new-key"
+        } else {
+            "__pingsix_limit_req_overflow__"
+        };
+        shard.entries.insert(
+            storage_key.into(),
+            Bucket {
+                excess: 0.0,
+                last: now,
+                initialized: false,
+            },
+        );
+        shard.touch(storage_key);
+
+        assert_eq!(storage_key, "__pingsix_limit_req_overflow__");
+        assert_eq!(shard.entries.len(), PER_SHARD_REGULAR_MAX + 1);
+    }
+
+    #[test]
     fn bounded_sweep_removes_at_most_budget_entries() {
         let now = Instant::now();
         let mut shard = BucketShard::default();
@@ -407,7 +413,6 @@ mod tests {
                     excess: 0.0,
                     last: now - Duration::from_secs(1),
                     initialized: true,
-                    touch: 0,
                 },
             );
             shard.touch(&key);

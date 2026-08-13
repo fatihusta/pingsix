@@ -10,7 +10,6 @@ use std::{
 };
 
 use arc_swap::ArcSwap;
-use once_cell::sync::Lazy;
 
 use crate::{
     config,
@@ -26,7 +25,7 @@ use super::{
     upstream::{
         health_check::{
             HealthCheckFingerprint, HealthCheckRegistration, HealthCheckSpec,
-            SharedHealthCheckService, SHARED_HEALTH_CHECK_SERVICE,
+            SharedHealthCheckService,
         },
         ProxyUpstream,
     },
@@ -46,7 +45,7 @@ pub struct RuntimeSnapshot {
 }
 
 impl RuntimeSnapshot {
-    fn empty() -> Self {
+    pub(crate) fn empty() -> Self {
         Self {
             revision: 0,
             routes: Arc::new(HashMap::new()),
@@ -207,11 +206,10 @@ pub struct RuntimeStore {
     health_checks: Mutex<ActiveHealthCheckSet>,
     publish_lock: Mutex<()>,
     /// Instance-owned readiness store: publish records the published revision
-    /// here (not on the process-global facade).
+    /// here.
     status: Arc<StatusStore>,
     /// Instance-owned health-check registry/service: publish registers and
-    /// unregisters upstream probes here (not on the process-global
-    /// [`SHARED_HEALTH_CHECK_SERVICE`] facade).
+    /// unregisters upstream probes here.
     health_check: Arc<SharedHealthCheckService>,
 }
 
@@ -222,13 +220,14 @@ impl Default for RuntimeStore {
 }
 
 impl RuntimeStore {
-    /// Create a store recording published revisions on the process-global
-    /// status facade and registering health checks on the process-global
-    /// health-check service (migration defaults). Prefer
-    /// [`RuntimeStore::with_state`] so the runtime, graph, etcd sync, and
-    /// status app share one instance.
+    /// Create a store with a private status store and health-check service.
+    /// Production uses [`RuntimeStore::with_state`] so the runtime shares the
+    /// owning [`crate::service::GatewayState`].
     pub fn new() -> Self {
-        Self::with_state(StatusStore::global(), SHARED_HEALTH_CHECK_SERVICE.clone())
+        Self::with_state(
+            Arc::new(StatusStore::new()),
+            Arc::new(SharedHealthCheckService::new()),
+        )
     }
 
     /// Create a store recording published revisions on `status` and
@@ -343,25 +342,6 @@ impl RuntimeStore {
     }
 }
 
-/// Process-global runtime store retained as test scaffolding and a migration
-/// facade. Production wiring uses per-build [`RuntimeStore`] instances via
-/// [`RuntimeStore::with_state`]; the singleton stays for tests that publish
-/// through `RUNTIME` under [`RUNTIME_TEST_LOCK`] (control-plane, graph worker,
-/// and runtime unit tests) and for legacy callers not yet instance-wired.
-pub static RUNTIME: Lazy<Arc<RuntimeStore>> = Lazy::new(|| Arc::new(RuntimeStore::new()));
-
-impl RuntimeStore {
-    /// The migration-period process-global store used by the legacy facade
-    /// and by the composition root until every consumer is instance-wired.
-    pub fn global() -> Arc<RuntimeStore> {
-        RUNTIME.clone()
-    }
-}
-
-/// Serializes tests that publish to the process-global [`RUNTIME`].
-#[cfg(test)]
-pub(crate) static RUNTIME_TEST_LOCK: Mutex<()> = Mutex::new(());
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -449,22 +429,34 @@ mod tests {
         );
     }
 
+    fn publish_set(
+        store: &RuntimeStore,
+        set: &crate::proxy::control_plane::ResourceConfigSet,
+        revision: i64,
+    ) {
+        use crate::proxy::control_plane::CandidateSnapshot;
+        let previous = store.load();
+        let snap = RuntimeSnapshot::compile(
+            CandidateSnapshot::build_against(set.clone(), &previous).unwrap(),
+            revision,
+        )
+        .unwrap();
+        store.publish(snap).unwrap();
+    }
+
     #[test]
     fn unchanged_upstream_keeps_health_check_generation_across_publish() {
-        let _guard = RUNTIME_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        use crate::proxy::control_plane::{CandidateSnapshot, ResourceConfigSet};
+        use crate::proxy::control_plane::ResourceConfigSet;
 
+        let store = RuntimeStore::new();
         let mut set = ResourceConfigSet::default();
         set.upstreams
             .insert("u1".into(), sample_upstream("u1", &[("10.0.0.1:80", 1)]));
-        let snap1 =
-            RuntimeSnapshot::compile(CandidateSnapshot::build(set.clone()).unwrap(), 1).unwrap();
-        RUNTIME.publish(snap1).unwrap();
-        let gen1 = RUNTIME
+        publish_set(&store, &set, 1);
+        let gen1 = store
             .health_check_generation("upstream/u1")
             .expect("hc registered");
 
-        // Route-only addition; upstream config unchanged.
         set.routes.insert(
             "r1".into(),
             crate::config::Route {
@@ -484,9 +476,8 @@ mod tests {
                 enable_websocket: false,
             },
         );
-        let snap2 = RuntimeSnapshot::compile(CandidateSnapshot::build(set).unwrap(), 2).unwrap();
-        RUNTIME.publish(snap2).unwrap();
-        let gen2 = RUNTIME
+        publish_set(&store, &set, 2);
+        let gen2 = store
             .health_check_generation("upstream/u1")
             .expect("hc still registered");
         assert_eq!(gen1, gen2);
@@ -494,19 +485,14 @@ mod tests {
 
     #[test]
     fn route_only_update_reuses_upstream_arc_and_keeps_backends_selectable() {
-        let _guard = RUNTIME_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        use crate::proxy::control_plane::{CandidateSnapshot, ResourceConfigSet};
+        use crate::proxy::control_plane::ResourceConfigSet;
 
+        let store = RuntimeStore::new();
         let mut set = ResourceConfigSet::default();
         set.upstreams
             .insert("u1".into(), sample_upstream("u1", &[("10.0.0.1:80", 1)]));
-        RUNTIME
-            .publish(
-                RuntimeSnapshot::compile(CandidateSnapshot::build(set.clone()).unwrap(), 1)
-                    .unwrap(),
-            )
-            .unwrap();
-        let before = RUNTIME.load().upstreams.get("u1").cloned().unwrap();
+        publish_set(&store, &set, 1);
+        let before = store.load().upstreams.get("u1").cloned().unwrap();
         assert!(
             before.select_backend_for_test().is_some(),
             "eager discovery must populate backends before publish"
@@ -531,10 +517,8 @@ mod tests {
                 enable_websocket: false,
             },
         );
-        RUNTIME
-            .publish(RuntimeSnapshot::compile(CandidateSnapshot::build(set).unwrap(), 2).unwrap())
-            .unwrap();
-        let after = RUNTIME.load().upstreams.get("u1").cloned().unwrap();
+        publish_set(&store, &set, 2);
+        let after = store.load().upstreams.get("u1").cloned().unwrap();
         assert!(
             Arc::ptr_eq(&before, &after),
             "route-only publish must reuse ProxyUpstream Arc so HC stays bound to the live LB"
@@ -547,29 +531,21 @@ mod tests {
 
     #[test]
     fn weight_only_upstream_change_replaces_health_check_generation() {
-        let _guard = RUNTIME_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        use crate::proxy::control_plane::{CandidateSnapshot, ResourceConfigSet};
+        use crate::proxy::control_plane::ResourceConfigSet;
 
+        let store = RuntimeStore::new();
         let mut set = ResourceConfigSet::default();
         set.upstreams
             .insert("u1".into(), sample_upstream("u1", &[("10.0.0.1:80", 1)]));
-        RUNTIME
-            .publish(
-                RuntimeSnapshot::compile(CandidateSnapshot::build(set.clone()).unwrap(), 1)
-                    .unwrap(),
-            )
-            .unwrap();
-        let gen1 = RUNTIME.health_check_generation("upstream/u1").unwrap();
-        let before = RUNTIME.load().upstreams.get("u1").cloned().unwrap();
+        publish_set(&store, &set, 1);
+        let gen1 = store.health_check_generation("upstream/u1").unwrap();
+        let before = store.load().upstreams.get("u1").cloned().unwrap();
 
-        // Weight is ignored by HC fingerprint but still rebuilds the LB.
         set.upstreams
             .insert("u1".into(), sample_upstream("u1", &[("10.0.0.1:80", 99)]));
-        RUNTIME
-            .publish(RuntimeSnapshot::compile(CandidateSnapshot::build(set).unwrap(), 2).unwrap())
-            .unwrap();
-        let after = RUNTIME.load().upstreams.get("u1").cloned().unwrap();
-        let gen2 = RUNTIME.health_check_generation("upstream/u1").unwrap();
+        publish_set(&store, &set, 2);
+        let after = store.load().upstreams.get("u1").cloned().unwrap();
+        let gen2 = store.health_check_generation("upstream/u1").unwrap();
         assert!(!Arc::ptr_eq(&before, &after));
         assert_eq!(
             fingerprint_upstream_for_health_check(&before.inner),
@@ -584,26 +560,19 @@ mod tests {
 
     #[test]
     fn upstream_node_change_replaces_health_check_generation() {
-        let _guard = RUNTIME_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        use crate::proxy::control_plane::{CandidateSnapshot, ResourceConfigSet};
+        use crate::proxy::control_plane::ResourceConfigSet;
 
+        let store = RuntimeStore::new();
         let mut set = ResourceConfigSet::default();
         set.upstreams
             .insert("u1".into(), sample_upstream("u1", &[("10.0.0.1:80", 1)]));
-        RUNTIME
-            .publish(
-                RuntimeSnapshot::compile(CandidateSnapshot::build(set.clone()).unwrap(), 1)
-                    .unwrap(),
-            )
-            .unwrap();
-        let gen1 = RUNTIME.health_check_generation("upstream/u1").unwrap();
+        publish_set(&store, &set, 1);
+        let gen1 = store.health_check_generation("upstream/u1").unwrap();
 
         set.upstreams
             .insert("u1".into(), sample_upstream("u1", &[("10.0.0.2:80", 1)]));
-        RUNTIME
-            .publish(RuntimeSnapshot::compile(CandidateSnapshot::build(set).unwrap(), 2).unwrap())
-            .unwrap();
-        let gen2 = RUNTIME.health_check_generation("upstream/u1").unwrap();
+        publish_set(&store, &set, 2);
+        let gen2 = store.health_check_generation("upstream/u1").unwrap();
         assert_ne!(gen1, gen2);
     }
 }

@@ -4,17 +4,12 @@
 //! runtime, injectable into the configuration graph, etcd sync, and status
 //! HTTP app so tests and repeated in-process builds never share state.
 //!
-//! Migration note: the historical process-global free functions
-//! (`mark_ready`, `status_view`, …) remain as a thin facade forwarding to
-//! [`StatusStore::global`], the default singleton. New code should hold and
-//! inject an explicit `Arc<StatusStore>`; the facade is kept for callers that
-//! are not yet wired (and for Pingora `'static` edges that cannot hold an
-//! instance).
+//! Hold an explicit [`StatusStore`] per gateway runtime. Tests construct
+//! independent stores; they never share process-global readiness state.
 
-use std::sync::{Arc, Mutex};
+use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
-use once_cell::sync::Lazy;
 use serde::Serialize;
 
 /// Configuration source type for better error reporting
@@ -104,21 +99,11 @@ pub struct StatusStore {
     inner: Mutex<RuntimeStatusInner>,
 }
 
-/// The migration-period process-global store. The free-function facade
-/// (`mark_ready`, `status_view`, …) forwards here; the composition root also
-/// injects this singleton until every consumer is instance-wired.
-static DEFAULT_STATUS: Lazy<Arc<StatusStore>> = Lazy::new(|| Arc::new(StatusStore::new()));
-
 impl StatusStore {
     pub fn new() -> Self {
         Self {
             inner: Mutex::new(RuntimeStatusInner::default()),
         }
-    }
-
-    /// The default singleton used by the legacy free-function facade.
-    pub fn global() -> Arc<StatusStore> {
-        DEFAULT_STATUS.clone()
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, RuntimeStatusInner> {
@@ -336,176 +321,79 @@ fn is_stale(status: &RuntimeStatusInner) -> bool {
         .is_some_and(|t| t.elapsed() > status.config_stale_after)
 }
 
-// =============================================================================
-// Legacy process-global facade
-//
-// All free functions below forward to [`StatusStore::global`]. They preserve
-// the pre-injection API for tests and for callers not yet wired to an
-// instance; the migration plan removes them once every consumer holds a store.
-// =============================================================================
-
-/// Configure stale-sync readiness behavior (typically from YAML status section).
-pub fn configure_status_policy(config_stale_after_secs: u64, fail_readiness_when_stale: bool) {
-    DEFAULT_STATUS.configure_policy(config_stale_after_secs, fail_readiness_when_stale);
-}
-
-/// Mark the service as ready after successful configuration loading.
-pub fn mark_ready(source: ConfigSource) {
-    DEFAULT_STATUS.mark_ready(source);
-}
-
-pub fn mark_etcd_connected(connected: bool) {
-    DEFAULT_STATUS.mark_etcd_connected(connected);
-}
-
-/// Identify etcd as the active configuration source without claiming a valid
-/// snapshot has been published yet.
-pub fn begin_etcd_sync() {
-    DEFAULT_STATUS.begin_etcd_sync();
-}
-
-pub fn set_revision(revision: Option<i64>) {
-    DEFAULT_STATUS.set_revision(revision);
-}
-
-pub fn set_published_revision(revision: i64) {
-    DEFAULT_STATUS.set_published_revision(revision);
-}
-
-/// Record etcd list/watch progress. This deliberately does not restore readiness:
-/// only a successfully published configuration snapshot can do that.
-pub fn record_sync_success(revision: i64) {
-    DEFAULT_STATUS.record_sync_success(revision);
-}
-
-pub fn record_sync_error(error: String) {
-    DEFAULT_STATUS.record_sync_error(error);
-}
-
-/// Record a rejected async candidate without conflating it with etcd transport health.
-pub fn record_preparation_error(error: String) {
-    DEFAULT_STATUS.record_preparation_error(error);
-}
-
-/// Check if the service is ready to handle traffic.
-pub fn is_ready() -> bool {
-    DEFAULT_STATUS.is_ready()
-}
-
-pub fn is_live() -> bool {
-    true
-}
-
-/// Readiness and its stable public reason from one consistent state snapshot.
-pub fn readiness() -> (bool, Option<&'static str>) {
-    DEFAULT_STATUS.readiness()
-}
-
-pub fn status_view() -> RuntimeStatusView {
-    DEFAULT_STATUS.status_view()
-}
-
-/// Last runtime-published configuration revision. `0` before the first
-/// publish (e.g. static YAML, or etcd mode before the first candidate
-/// publishes). Used by the Admin API to distinguish the storage commit
-/// revision from the revision actually active on the data plane.
-pub fn published_revision() -> i64 {
-    DEFAULT_STATUS.published_revision()
-}
-
-/// Reset readiness status (useful for testing)
-#[cfg(test)]
-pub fn reset() {
-    DEFAULT_STATUS.reset();
-}
-
-/// Serializes tests that mutate the process-global readiness state from other
-/// modules (e.g. control-plane tests that call [`reset`]). The status unit
-/// tests use this same lock, so every writer of the global status state is
-/// serialized regardless of which test module it lives in.
-#[cfg(test)]
-pub(crate) static STATUS_TEST_LOCK: Mutex<()> = Mutex::new(());
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
     fn test_initial_state_not_ready() {
-        let _guard = STATUS_TEST_LOCK.lock().unwrap();
-        reset();
-        assert!(!is_ready());
+        let store = StatusStore::new();
+        assert!(!store.is_ready());
     }
 
     #[test]
     fn test_mark_ready_yaml() {
-        let _guard = STATUS_TEST_LOCK.lock().unwrap();
-        reset();
-        assert!(!is_ready());
-        mark_ready(ConfigSource::Yaml);
-        assert!(is_ready());
+        let store = StatusStore::new();
+        assert!(!store.is_ready());
+        store.mark_ready(ConfigSource::Yaml);
+        assert!(store.is_ready());
     }
 
     #[test]
     fn test_mark_ready_etcd() {
-        let _guard = STATUS_TEST_LOCK.lock().unwrap();
-        reset();
-        assert!(!is_ready());
-        mark_ready(ConfigSource::Etcd);
-        assert!(is_ready());
+        let store = StatusStore::new();
+        assert!(!store.is_ready());
+        store.mark_ready(ConfigSource::Etcd);
+        assert!(store.is_ready());
     }
 
     #[test]
     fn test_multiple_marks_stay_ready() {
-        let _guard = STATUS_TEST_LOCK.lock().unwrap();
-        reset();
-        mark_ready(ConfigSource::Yaml);
-        assert!(is_ready());
-        mark_ready(ConfigSource::Etcd);
-        assert!(is_ready());
+        let store = StatusStore::new();
+        store.mark_ready(ConfigSource::Yaml);
+        assert!(store.is_ready());
+        store.mark_ready(ConfigSource::Etcd);
+        assert!(store.is_ready());
     }
 
     #[test]
     fn stale_fails_readiness_by_default() {
-        let _guard = STATUS_TEST_LOCK.lock().unwrap();
-        reset();
-        configure_status_policy(0, true);
-        mark_ready(ConfigSource::Etcd);
-        mark_etcd_connected(false);
+        let store = StatusStore::new();
+        store.configure_policy(0, true);
+        store.mark_ready(ConfigSource::Etcd);
+        store.mark_etcd_connected(false);
         // Disconnected etcd with zero threshold: any elapsed time is stale.
         std::thread::sleep(Duration::from_millis(5));
-        assert!(!is_ready());
-        configure_status_policy(300, true);
+        assert!(!store.is_ready());
+        store.configure_policy(300, true);
     }
 
     #[test]
     fn watch_progress_does_not_restore_readiness_without_publish() {
-        let _guard = STATUS_TEST_LOCK.lock().unwrap();
-        reset();
-        configure_status_policy(0, true);
-        begin_etcd_sync();
-        record_sync_success(10);
-        mark_etcd_connected(false);
+        let store = StatusStore::new();
+        store.configure_policy(0, true);
+        store.begin_etcd_sync();
+        store.record_sync_success(10);
+        store.mark_etcd_connected(false);
         std::thread::sleep(Duration::from_millis(5));
-        assert!(!is_ready());
-        record_sync_success(11);
-        assert!(!is_ready());
-        set_published_revision(11);
-        assert!(is_ready());
-        configure_status_policy(300, true);
+        assert!(!store.is_ready());
+        store.record_sync_success(11);
+        assert!(!store.is_ready());
+        store.set_published_revision(11);
+        assert!(store.is_ready());
+        store.configure_policy(300, true);
     }
 
     #[test]
     fn reconnect_awaiting_publish_is_degraded_with_reason() {
-        let _guard = STATUS_TEST_LOCK.lock().unwrap();
-        reset();
-        begin_etcd_sync();
-        mark_ready(ConfigSource::Etcd);
-        mark_etcd_connected(true);
-        mark_etcd_connected(false);
+        let store = StatusStore::new();
+        store.begin_etcd_sync();
+        store.mark_ready(ConfigSource::Etcd);
+        store.mark_etcd_connected(true);
+        store.mark_etcd_connected(false);
         // Reconnect proves transport health but not a published graph.
-        record_sync_success(10);
-        let view = status_view();
+        store.record_sync_success(10);
+        let view = store.status_view();
         assert!(!view.ready, "ready must stay closed until publish");
         assert!(
             view.degraded,
@@ -515,11 +403,14 @@ mod tests {
             view.degraded_reason.as_deref(),
             Some("awaiting publish after reconnect")
         );
-        assert_eq!(readiness().1, Some("awaiting_publish_after_reconnect"));
+        assert_eq!(
+            store.readiness().1,
+            Some("awaiting_publish_after_reconnect")
+        );
 
         // A successful publish clears the awaiting state and restores readiness.
-        set_published_revision(10);
-        let view = status_view();
+        store.set_published_revision(10);
+        let view = store.status_view();
         assert!(view.ready);
         assert!(!view.degraded);
         assert_eq!(view.degraded_reason, None);
@@ -527,52 +418,48 @@ mod tests {
 
     #[test]
     fn idle_but_connected_etcd_watch_is_not_stale() {
-        let _guard = STATUS_TEST_LOCK.lock().unwrap();
-        reset();
-        configure_status_policy(0, true);
-        mark_ready(ConfigSource::Etcd);
-        mark_etcd_connected(true);
+        let store = StatusStore::new();
+        store.configure_policy(0, true);
+        store.mark_ready(ConfigSource::Etcd);
+        store.mark_etcd_connected(true);
         std::thread::sleep(Duration::from_millis(5));
-        assert!(is_ready());
-        assert!(!status_view().degraded);
-        configure_status_policy(300, false);
+        assert!(store.is_ready());
+        assert!(!store.status_view().degraded);
+        store.configure_policy(300, false);
     }
 
     #[test]
     fn short_disconnection_keeps_last_known_good_ready() {
-        let _guard = STATUS_TEST_LOCK.lock().unwrap();
-        reset();
-        configure_status_policy(60, true);
-        mark_ready(ConfigSource::Etcd);
-        mark_etcd_connected(true);
-        mark_etcd_connected(false);
-        assert!(is_ready());
-        configure_status_policy(300, true);
+        let store = StatusStore::new();
+        store.configure_policy(60, true);
+        store.mark_ready(ConfigSource::Etcd);
+        store.mark_etcd_connected(true);
+        store.mark_etcd_connected(false);
+        assert!(store.is_ready());
+        store.configure_policy(300, true);
     }
 
     #[test]
     fn disconnected_etcd_becomes_stale_after_threshold() {
-        let _guard = STATUS_TEST_LOCK.lock().unwrap();
-        reset();
-        configure_status_policy(0, true);
-        mark_ready(ConfigSource::Etcd);
-        mark_etcd_connected(true);
-        assert!(is_ready());
-        mark_etcd_connected(false);
+        let store = StatusStore::new();
+        store.configure_policy(0, true);
+        store.mark_ready(ConfigSource::Etcd);
+        store.mark_etcd_connected(true);
+        assert!(store.is_ready());
+        store.mark_etcd_connected(false);
         std::thread::sleep(Duration::from_millis(5));
-        assert!(!is_ready());
-        configure_status_policy(300, false);
+        assert!(!store.is_ready());
+        store.configure_policy(300, false);
     }
 
     #[test]
     fn preparation_error_has_stable_diagnostic_category() {
-        let _guard = STATUS_TEST_LOCK.lock().unwrap();
-        reset();
-        begin_etcd_sync();
-        mark_ready(ConfigSource::Etcd);
-        mark_etcd_connected(true);
-        record_preparation_error("resolver leaked internal.example".into());
-        let view = status_view();
+        let store = StatusStore::new();
+        store.begin_etcd_sync();
+        store.mark_ready(ConfigSource::Etcd);
+        store.mark_etcd_connected(true);
+        store.record_preparation_error("resolver leaked internal.example".into());
+        let view = store.status_view();
         assert_eq!(view.error_kind, Some(ConfigErrorKind::CandidateInvalid));
         assert_eq!(
             view.degraded_reason.as_deref(),
@@ -582,13 +469,11 @@ mod tests {
 
     #[test]
     fn yaml_source_never_becomes_stale() {
-        let _guard = STATUS_TEST_LOCK.lock().unwrap();
-        reset();
-        configure_status_policy(0, true);
-        mark_ready(ConfigSource::Yaml);
+        let store = StatusStore::new();
+        store.configure_policy(0, true);
+        store.mark_ready(ConfigSource::Yaml);
         std::thread::sleep(Duration::from_millis(5));
-        assert!(is_ready());
-        configure_status_policy(300, false);
+        assert!(store.is_ready());
     }
 
     // --- Instance-level tests (no shared state) ---

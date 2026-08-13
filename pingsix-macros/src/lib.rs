@@ -5,7 +5,7 @@
 //! when persisting plugin config to etcd.
 //!
 //! Add `#[encrypt_fields(export)]` on the **root** config struct to emit a
-//! module-level `SECRETS_TRANSFORM` for `PLUGIN_ENCRYPT_FIELDS` registration.
+//! module-level `SECRETS_TRANSFORM` for `PluginMeta` registration.
 
 use proc_macro::TokenStream;
 use quote::quote;
@@ -20,7 +20,7 @@ use syn::{
 /// - `#[encrypt(nested)]` — recurse into a nested struct that also derives
 ///   `EncryptFields` (supports `Option<T>` and plain `T`)
 /// - `#[encrypt(plugins)]` — treat this field as a `name -> config` map and
-///   transform each entry via the `PLUGIN_ENCRYPT_FIELDS` registry
+///   transform each entry via the plugin metadata inventory
 /// - `#[encrypt_fields(export)]` on the struct — emit module-level
 ///   `pub(crate) const SECRETS_TRANSFORM` (use once per module, on the root)
 ///
@@ -56,7 +56,7 @@ enum EncryptKind {
     /// Nested object that implements `EncryptFields`.
     Nested { ty: Box<Type> },
     /// Map of `plugin name -> config` (e.g. a resource's `plugins`); each entry
-    /// is transformed via the `PLUGIN_ENCRYPT_FIELDS` registry.
+    /// is transformed via the plugin metadata inventory.
     Plugins,
 }
 
@@ -125,11 +125,12 @@ fn expand_encrypt_fields(input: &DeriveInput) -> Result<proc_macro2::TokenStream
                     if let Some(__plugins) = __obj.get_mut(#json_name) {
                         if let Some(__map) = __plugins.as_object_mut() {
                             for (__name, __cfg) in __map.iter_mut() {
-                                if let Some(__transform) =
-                                    crate::plugins::PLUGIN_ENCRYPT_FIELDS.get(__name.as_str())
-                                {
-                                    __transform(__cfg, __op, __keyring)?;
-                                }
+                                crate::plugins::transform_plugin_secrets(
+                                    __name.as_str(),
+                                    __cfg,
+                                    __op,
+                                    __keyring,
+                                )?;
                             }
                         }
                     }
@@ -140,7 +141,7 @@ fn expand_encrypt_fields(input: &DeriveInput) -> Result<proc_macro2::TokenStream
 
     let export_tokens = if export {
         quote! {
-            /// Module-level `fn` pointer for `PLUGIN_ENCRYPT_FIELDS`.
+            /// Module-level `fn` pointer for `PluginMeta` registration.
             ///
             /// Emitted by `#[encrypt_fields(export)]`
             pub(crate) const SECRETS_TRANSFORM: crate::utils::encryption::PluginSecretsTransform =

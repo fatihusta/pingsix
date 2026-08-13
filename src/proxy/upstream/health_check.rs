@@ -8,7 +8,6 @@ use std::{
 
 use async_trait::async_trait;
 use dashmap::DashMap;
-use once_cell::sync::Lazy;
 use pingora_core::{
     server::ShutdownWatch,
     services::{background::BackgroundService, Service},
@@ -531,13 +530,6 @@ impl Service for SharedHealthCheckService {
         Some(1)
     }
 }
-
-/// Process-global health-check service retained as a migration facade and
-/// test scaffolding: production registers the per-build service from
-/// [`crate::service::GatewayState`]; this singleton backs [`RuntimeStore::new`]
-/// and legacy callers not yet instance-wired.
-pub static SHARED_HEALTH_CHECK_SERVICE: Lazy<Arc<SharedHealthCheckService>> =
-    Lazy::new(|| Arc::new(SharedHealthCheckService::new()));
 
 #[cfg(test)]
 mod tests {

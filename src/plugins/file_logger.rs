@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
 
 use crate::{
-    core::{ProxyContext, ProxyError, ProxyPlugin, ProxyResult},
+    core::{PluginPhases, ProxyContext, ProxyError, ProxyPlugin, ProxyResult},
     utils::request,
 };
 
@@ -104,6 +104,9 @@ impl ProxyPlugin for PluginFileLogger {
 
     fn priority(&self) -> i32 {
         PRIORITY
+    }
+    fn phases(&self) -> PluginPhases {
+        PluginPhases::LOGGING
     }
 
     async fn logging(&self, session: &mut Session, e: Option<&Error>, ctx: &mut ProxyContext) {

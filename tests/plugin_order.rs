@@ -34,7 +34,9 @@ use pingora_http::RequestHeader;
 use pingora_proxy::Session;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
-use pingsix::core::{CompiledPluginPipeline, ProxyContext, ProxyPlugin, ProxyPluginExecutor};
+use pingsix::core::{
+    CompiledPluginPipeline, PluginPhases, ProxyContext, ProxyPlugin, ProxyPluginExecutor,
+};
 
 // ---------------------------------------------------------------------------
 // Minimal downstream stream so we can construct a `pingora_proxy::Session`
@@ -134,6 +136,10 @@ impl ProxyPlugin for GlobalShortCircuit {
         1000
     }
 
+    fn phases(&self) -> PluginPhases {
+        PluginPhases::REQUEST
+    }
+
     async fn request_filter(
         &self,
         _session: &mut Session,
@@ -162,6 +168,32 @@ struct RouteAuthRecorder {
     called: Arc<AtomicBool>,
 }
 
+/// Deliberately implements a hook without declaring its phase. Phase metadata
+/// is an explicit, fail-closed plugin contract: this hook must not run.
+struct UndeclaredRequestHook {
+    called: Arc<AtomicBool>,
+}
+
+#[async_trait]
+impl ProxyPlugin for UndeclaredRequestHook {
+    fn name(&self) -> &str {
+        "undeclared-request-hook"
+    }
+
+    fn priority(&self) -> i32 {
+        50
+    }
+
+    async fn request_filter(
+        &self,
+        _session: &mut Session,
+        _ctx: &mut ProxyContext,
+    ) -> Result<bool> {
+        self.called.store(true, Ordering::SeqCst);
+        Ok(false)
+    }
+}
+
 #[async_trait]
 impl ProxyPlugin for RouteAuthRecorder {
     fn name(&self) -> &str {
@@ -170,6 +202,10 @@ impl ProxyPlugin for RouteAuthRecorder {
 
     fn priority(&self) -> i32 {
         100
+    }
+
+    fn phases(&self) -> PluginPhases {
+        PluginPhases::REQUEST
     }
 
     async fn request_filter(
@@ -209,6 +245,10 @@ impl ProxyPlugin for RecordingPlugin {
 
     fn priority(&self) -> i32 {
         500
+    }
+
+    fn phases(&self) -> PluginPhases {
+        PluginPhases::ALL
     }
 
     async fn early_request_filter(
@@ -263,10 +303,6 @@ impl ProxyPlugin for RecordingPlugin {
         Ok(())
     }
 
-    fn has_response_body_filter(&self) -> bool {
-        true
-    }
-
     async fn logging(
         &self,
         _session: &mut Session,
@@ -308,6 +344,30 @@ async fn global_short_circuit_skips_route_plugins() {
     assert!(
         !auth_called.load(Ordering::SeqCst),
         "route auth plugin must NOT execute when a global plugin short-circuits"
+    );
+}
+
+#[tokio::test]
+async fn undeclared_phase_hook_is_not_executed() {
+    let called = Arc::new(AtomicBool::new(false));
+    let pipeline = CompiledPluginPipeline::new(
+        Arc::new(ProxyPluginExecutor::default()),
+        Arc::new(ProxyPluginExecutor::new(vec![Arc::new(
+            UndeclaredRequestHook {
+                called: called.clone(),
+            },
+        )])),
+    );
+    let mut session = make_session();
+    let mut ctx = ProxyContext::default();
+
+    assert!(!pipeline
+        .request_filter(&mut session, &mut ctx)
+        .await
+        .expect("undeclared hook must be skipped without error"));
+    assert!(
+        !called.load(Ordering::SeqCst),
+        "a hook without its declared PluginPhases bit must never execute"
     );
 }
 

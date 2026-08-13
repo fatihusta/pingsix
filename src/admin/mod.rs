@@ -23,34 +23,39 @@ use crate::{
 
 #[derive(Debug)]
 enum ApiError {
-    EtcdGetError(String),
     ValidationError(String),
     MissingParameter(String),
     InvalidRequest(String),
     RequestBodyReadError(String),
     /// Resource does not exist (maps to 404).
     NotFound(String),
-    /// Optimistic-concurrency (CAS) conflict or referential-integrity violation
-    /// on delete (maps to 409).
-    Conflict(String),
     /// Preserves the original ProxyError with full context
     ProxyError(ProxyError),
-    /// Internal control-plane failure not attributable to the request (500).
-    Internal(String),
+    /// A categorized graph-authority failure. The category is exposed as a
+    /// stable JSON code while the server logs retain the original source.
+    Graph {
+        status: StatusCode,
+        code: &'static str,
+        message: &'static str,
+        source: Box<GraphError>,
+    },
 }
 
 impl fmt::Display for ApiError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            ApiError::EtcdGetError(msg) => write!(f, "Etcd get error: {msg}"),
             ApiError::ValidationError(msg) => write!(f, "Validation error: {msg}"),
             ApiError::MissingParameter(msg) => write!(f, "Missing parameter: {msg}"),
             ApiError::InvalidRequest(msg) => write!(f, "Invalid request: {msg}"),
             ApiError::RequestBodyReadError(msg) => write!(f, "Request body read error: {msg}"),
             ApiError::NotFound(msg) => write!(f, "Not found: {msg}"),
-            ApiError::Conflict(msg) => write!(f, "Conflict: {msg}"),
             ApiError::ProxyError(err) => write!(f, "{err}"),
-            ApiError::Internal(msg) => write!(f, "Internal error: {msg}"),
+            ApiError::Graph {
+                code,
+                message,
+                source,
+                ..
+            } => write!(f, "graph {code}: {message} ({source})"),
         }
     }
 }
@@ -59,6 +64,7 @@ impl Error for ApiError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
             ApiError::ProxyError(err) => Some(err),
+            ApiError::Graph { source, .. } => Some(source),
             _ => None,
         }
     }
@@ -72,22 +78,46 @@ impl From<ProxyError> for ApiError {
 
 impl From<GraphError> for ApiError {
     fn from(err: GraphError) -> Self {
-        match err {
-            GraphError::NotFound { .. } => ApiError::NotFound(err.to_string()),
-            GraphError::CasConflict | GraphError::ReferentialConflict { .. } => {
-                ApiError::Conflict(err.to_string())
+        let (status, code, message) = match &err {
+            GraphError::NotFound { .. } => {
+                (StatusCode::NOT_FOUND, "not_found", "Resource not found")
             }
+            GraphError::CasConflict => (
+                StatusCode::CONFLICT,
+                "cas_conflict",
+                "Configuration changed concurrently",
+            ),
+            GraphError::ReferentialConflict { .. } => (
+                StatusCode::CONFLICT,
+                "referential_conflict",
+                "Resource is still referenced",
+            ),
             GraphError::InvalidKey { .. }
             | GraphError::InvalidResource { .. }
             | GraphError::InvalidCandidate { .. }
-            | GraphError::Secret { .. } => ApiError::ValidationError(err.to_string()),
-            GraphError::Store(_) => {
-                ApiError::EtcdGetError("configuration store unavailable".into())
-            }
-            // Not reachable from Admin operations; fail closed as internal.
-            GraphError::StaleRevision { .. } | GraphError::WorkerStopped => {
-                ApiError::Internal(err.to_string())
-            }
+            | GraphError::Secret { .. } => (
+                StatusCode::BAD_REQUEST,
+                "validation_failed",
+                "Configuration validation failed",
+            ),
+            GraphError::Store(_) => (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "store_unavailable",
+                "Backend configuration store unavailable",
+            ),
+            // These states are not normally reachable from Admin mutations;
+            // expose only a stable internal category if they are.
+            GraphError::StaleRevision { .. } | GraphError::WorkerStopped => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "internal_error",
+                "Internal server error",
+            ),
+        };
+        ApiError::Graph {
+            status,
+            code,
+            message,
+            source: Box::new(err),
         }
     }
 }
@@ -96,18 +126,36 @@ impl ApiError {
     fn into_response(self) -> ApiResponse {
         use ApiError::*;
         match self {
-            EtcdGetError(msg) => {
-                log::error!("Admin etcd get error: {msg}");
-                CommonErrors::internal_server_error("Backend configuration store unavailable")
-            }
             RequestBodyReadError(_) => CommonErrors::bad_request("Failed to read request body"),
             NotFound(_) => ResponseBuilder::error_http(StatusCode::NOT_FOUND, &self.to_string()),
-            Conflict(_) => ResponseBuilder::error_http(StatusCode::CONFLICT, &self.to_string()),
             ValidationError(_) | MissingParameter(_) | InvalidRequest(_) => {
                 CommonErrors::bad_request(&self.to_string())
             }
             ProxyError(proxy_err) => Self::proxy_error_response(&proxy_err),
-            Internal(_) => CommonErrors::internal_server_error("Internal server error"),
+            Graph {
+                status,
+                code,
+                message,
+                source,
+            } => {
+                if status.is_server_error() {
+                    log::error!("Admin graph error ({code}): {source}");
+                } else {
+                    log::warn!("Admin graph error ({code}): {source}");
+                }
+                Response::builder()
+                    .status(status)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(
+                        serde_json::json!({ "code": code, "error": message })
+                            .to_string()
+                            .into_bytes(),
+                    )
+                    .unwrap_or_else(|build_error| {
+                        log::error!("Failed to build Admin graph error response: {build_error}");
+                        CommonErrors::internal_server_error("Internal server error")
+                    })
+            }
         }
     }
 
@@ -609,22 +657,55 @@ mod tests {
         assert!(admin.validate().is_err());
     }
 
-    #[test]
-    fn not_found_maps_to_404() {
-        let resp = ApiError::NotFound("Resource not found".into()).into_response();
-        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    fn assert_error_response(response: ApiResponse, status: StatusCode, code: &str) {
+        assert_eq!(response.status(), status);
+        assert_eq!(response.headers()[header::CONTENT_TYPE], "application/json");
+        let body: serde_json::Value = serde_json::from_slice(response.body()).unwrap();
+        assert_eq!(body["code"], code);
     }
 
     #[test]
-    fn conflict_maps_to_409() {
-        let resp = ApiError::Conflict("resource is referenced".into()).into_response();
-        assert_eq!(resp.status(), StatusCode::CONFLICT);
+    fn graph_not_found_returns_safe_machine_readable_error() {
+        let key = ResourceKey::new(ResourceKind::Route, "missing").unwrap();
+        let response = ApiError::from(GraphError::NotFound { key }).into_response();
+        assert_error_response(response, StatusCode::NOT_FOUND, "not_found");
     }
 
     #[test]
-    fn cas_conflict_proxy_error_maps_to_409() {
-        let resp =
-            ApiError::from(ProxyError::CasConflict("mod_revision mismatch".into())).into_response();
-        assert_eq!(resp.status(), StatusCode::CONFLICT);
+    fn graph_cas_conflict_returns_safe_machine_readable_error() {
+        let response = ApiError::from(GraphError::CasConflict).into_response();
+        assert_error_response(response, StatusCode::CONFLICT, "cas_conflict");
+    }
+
+    #[test]
+    fn graph_referential_conflict_returns_safe_machine_readable_error() {
+        let response = ApiError::from(GraphError::ReferentialConflict {
+            source: ProxyError::Configuration("route still references upstream".into()),
+        })
+        .into_response();
+        assert_error_response(response, StatusCode::CONFLICT, "referential_conflict");
+    }
+
+    #[test]
+    fn graph_validation_failure_returns_safe_machine_readable_error() {
+        let response = ApiError::from(GraphError::InvalidKey {
+            key: "routes/bad/id".into(),
+            reason: "resource id must not contain '/'".into(),
+        })
+        .into_response();
+        assert_error_response(response, StatusCode::BAD_REQUEST, "validation_failed");
+    }
+
+    #[test]
+    fn graph_store_failure_returns_safe_machine_readable_error() {
+        let response = ApiError::from(GraphError::Store(
+            crate::proxy::graph_mutation::StoreError::UnsupportedProtocol,
+        ))
+        .into_response();
+        assert_error_response(
+            response,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "store_unavailable",
+        );
     }
 }

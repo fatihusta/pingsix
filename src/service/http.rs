@@ -1,24 +1,22 @@
 use std::{sync::Arc, time::Duration};
 
+#[cfg(test)]
+use crate::plugins::cache::http::response_has_vary_star;
 use async_trait::async_trait;
 use bytes::Bytes;
-use http::{
-    header::{SET_COOKIE, VARY},
-    StatusCode,
-};
-use once_cell::sync::{Lazy, OnceCell};
+#[cfg(test)]
+use http::header::VARY;
+use http::StatusCode;
+use once_cell::sync::Lazy;
 use pingora::modules::http::{
     HttpModules,
     {compression::ResponseCompressionBuilder, grpc_web::GrpcWeb},
 };
 use pingora_cache::{
-    cache_control::{CacheControl, DirectiveMap, DirectiveValue},
     eviction::simple_lru::Manager,
-    filters::resp_cacheable,
     key::{CacheKey, HashBinary},
     lock::{CacheKeyLockImpl, CacheLock},
-    CacheMeta, CacheMetaDefaults, CachePhase, MemCache, NoCacheReason, RespCacheable,
-    VarianceBuilder,
+    CacheMeta, CachePhase, MemCache, RespCacheable,
 };
 use pingora_core::upstreams::peer::HttpPeer;
 use pingora_error::{Error, ErrorSource, ErrorType, Result};
@@ -32,16 +30,15 @@ use crate::{
         CompiledPluginPipeline, PassiveOutcome, ProxyContext, ProxyError, ProxyPluginExecutor,
         RouteContext, UpstreamSelection,
     },
-    plugins::cache::{self, CacheSettings, CTX_KEY_CACHE_SETTINGS},
+    plugins::cache::{
+        http::{
+            cache_key, cache_vary, error_status, headers_indicate_shared_cache_credentials,
+            response_cacheability, should_enable_request_cache,
+        },
+        CacheSettings, CTX_KEY_CACHE_SETTINGS,
+    },
     proxy::runtime::RuntimeStore,
 };
-
-/// Headers that imply credentials for shared-cache safety (checked before plugins mutate them).
-pub(crate) fn headers_indicate_shared_cache_credentials(headers: &http::HeaderMap) -> bool {
-    headers.contains_key("authorization")
-        || headers.contains_key("proxy-authorization")
-        || headers.contains_key("cookie")
-}
 
 /// A WebSocket upgrade is trusted only when both RFC 7230/6455 handshake
 /// headers are present. In particular, an arbitrary `Upgrade` header must not
@@ -69,49 +66,6 @@ static CACHE_REQUESTS: Lazy<IntCounterVec> = Lazy::new(|| {
     )
     .expect("cache metric registration must succeed")
 });
-
-/// Whether any `Vary` field contains the wildcard token. RFC semantics make
-/// such a response unsuitable for reuse by a shared cache.
-fn response_has_vary_star(headers: &http::HeaderMap) -> bool {
-    headers
-        .get_all(VARY)
-        .iter()
-        .filter_map(|value| value.to_str().ok())
-        .flat_map(|value| value.split(','))
-        .any(|token| token.trim().eq_ignore_ascii_case("*"))
-}
-
-// Default cache metadata: No caching by default unless explicitly configured
-const CACHE_DEFAULT: CacheMetaDefaults = CacheMetaDefaults::new(|_| None, 0, 0);
-
-/// Configured eviction memory budget, populated once at startup from
-/// `pingsix.defaults.cache.max_memory_bytes`. Falls back to 512MB when unset.
-static CACHE_MAX_MEMORY_BYTES: OnceCell<usize> = OnceCell::new();
-
-/// 512MB fallback used when no memory budget has been initialized.
-const FALLBACK_MAX_MEMORY_BYTES: usize = 512 * 1024 * 1024;
-
-/// Populates global cache capacity defaults from configuration. Must be called once
-/// at startup before the proxy serves traffic. Subsequent calls are no-ops (first
-/// value wins), keeping parallel test initialization safe.
-///
-/// Migration facade: the composition root now builds a per-instance
-/// [`CacheRuntime`] from [`config::EffectiveDefaults`]; this global remains for
-/// the legacy getter until every consumer is instance-wired.
-pub fn init_cache_defaults(cache: &CacheDefaults) {
-    let _ = CACHE_MAX_MEMORY_BYTES.set(cache.max_memory_bytes);
-    cache::init_default_max_object_bytes(cache.default_max_object_bytes);
-}
-
-/// Returns the effective cache memory budget, falling back to 512MB when unset.
-///
-/// Migration facade for [`EffectiveDefaults::global`].
-pub fn configured_max_memory_bytes() -> usize {
-    CACHE_MAX_MEMORY_BYTES
-        .get()
-        .copied()
-        .unwrap_or(FALLBACK_MAX_MEMORY_BYTES)
-}
 
 /// Instance-owned response-cache infrastructure.
 ///
@@ -279,8 +233,8 @@ impl ProxyHttp for HttpService {
             route.select_upstream(session)?
         };
 
-        let mut peer = selection.peer.clone();
-        ctx.selected = Some(selection);
+        let (mut peer, selected) = selection.into_peer();
+        ctx.selected = Some(selected);
 
         // Long-lived WebSocket streams may legitimately be idle. Only relax
         // upstream timeouts for an explicitly enabled route and a complete,
@@ -322,8 +276,8 @@ impl ProxyHttp for HttpService {
                     selected.upstream.upstream_host_rewrite(upstream_request);
                 }
                 config::UpstreamPassHost::NODE => {
-                    if let Err(e) = upstream_request
-                        .insert_header(http::header::HOST, selected.peer.sni.as_str())
+                    if let Err(e) =
+                        upstream_request.insert_header(http::header::HOST, selected.sni.as_str())
                     {
                         log::error!("Failed to rewrite upstream host header: {e}");
                     }
@@ -409,32 +363,7 @@ impl ProxyHttp for HttpService {
         e: &Error,
         _ctx: &mut Self::CTX,
     ) -> FailToProxy {
-        let code = match e.etype() {
-            ErrorType::Custom(custom)
-                if *custom == crate::plugins::client_control::ERROR_PAYLOAD_TOO_LARGE =>
-            {
-                StatusCode::PAYLOAD_TOO_LARGE.as_u16()
-            }
-            _ => {
-                if let ErrorType::HTTPStatus(code) = e.etype() {
-                    *code
-                } else {
-                    match e.esource() {
-                        ErrorSource::Upstream => 502,
-                        ErrorSource::Downstream => match e.etype() {
-                            ErrorType::WriteError
-                            | ErrorType::ReadError
-                            | ErrorType::ConnectionClosed => {
-                                // connection already dead
-                                0
-                            }
-                            _ => 400,
-                        },
-                        ErrorSource::Internal | ErrorSource::Unset => 500,
-                    }
-                }
-            }
-        };
+        let code = error_status(e);
         if code > 0 {
             session.respond_error(code).await.unwrap_or_else(|err| {
                 log::error!("failed to send error response to downstream: {err}");
@@ -460,30 +389,9 @@ impl ProxyHttp for HttpService {
     }
 
     fn request_cache_filter(&self, session: &mut Session, ctx: &mut Self::CTX) -> Result<()> {
-        let headers = &session.req_header().headers;
-
-        if headers.contains_key("x-bypass-cache") {
-            log::debug!("Cache bypass requested via x-bypass-cache header");
-            return Ok(());
-        }
-
-        if let Some(cache_control) = headers.get("cache-control") {
-            if let Ok(cc_str) = cache_control.to_str() {
-                if cc_str.contains("no-cache") {
-                    log::debug!("Cache bypass requested via cache-control: no-cache");
-                    return Ok(());
-                }
-            }
-        }
-
-        // Check for cache settings from plugin configuration.
-        // Re-check credentials here: global cache may run before route auth plugins mark them.
-        if let Some(settings) = ctx.get::<Arc<CacheSettings>>(CTX_KEY_CACHE_SETTINGS) {
-            if crate::plugins::cache::should_bypass_authenticated_request(settings, ctx) {
-                log::debug!("Skipping shared cache: request has credentials");
-                return Ok(());
-            }
-
+        let settings = ctx.get::<Arc<CacheSettings>>(CTX_KEY_CACHE_SETTINGS);
+        if should_enable_request_cache(&session.req_header().headers, settings, ctx) {
+            let settings = settings.expect("cache settings checked above");
             log::debug!("Cache settings found, enabling Pingora cache.");
 
             // Enable caching with configured backend and eviction manager
@@ -510,54 +418,7 @@ impl ProxyHttp for HttpService {
     }
 
     fn cache_key_callback(&self, session: &Session, ctx: &mut Self::CTX) -> Result<CacheKey> {
-        let req = session.req_header();
-        let host = req
-            .headers
-            .get(http::header::HOST)
-            .and_then(|v| v.to_str().ok())
-            .unwrap_or("");
-        // PURGE requests must compute the same key as the cached GET/HEAD so
-        // the delete hits the entry (APISIX proxy-cache keys exclude the method).
-        let method = if req.method.as_str() == "PURGE" {
-            "GET"
-        } else {
-            req.method.as_str()
-        };
-        let primary = format!("{method} {} {}", host, req.uri);
-
-        let route_fp = ctx
-            .route
-            .as_ref()
-            .map(|r| r.cache_namespace_fingerprint())
-            .unwrap_or(0);
-        let policy_fp = ctx
-            .get::<Arc<CacheSettings>>(CTX_KEY_CACHE_SETTINGS)
-            .map(|s| s.policy_fingerprint)
-            .unwrap_or(0);
-        let upstream_key = if let Some(override_up) = ctx.upstream_override.as_ref() {
-            override_up.cache_isolation_key()
-        } else {
-            ctx.route
-                .as_ref()
-                .and_then(|r| r.resolve_upstream())
-                .map(|u| u.cache_isolation_key())
-                .unwrap_or_default()
-        };
-        let scheme = if session
-            .digest()
-            .and_then(|d| d.ssl_digest.as_ref())
-            .is_some()
-        {
-            "https"
-        } else {
-            "http"
-        };
-        // Route fingerprint covers identity + response-affecting plugins;
-        // upstream isolation covers origin selection (nodes, Host rewrite, TLS).
-        // `upstream_key` is a u64 fingerprint directly, avoiding a per-request
-        // hex `String` allocation.
-        let namespace = format!("rf={route_fp:x}|c={policy_fp:x}|u={upstream_key:x}|sch={scheme}");
-        Ok(CacheKey::new(namespace, primary, ""))
+        Ok(cache_key(session, ctx))
     }
 
     fn cache_vary_filter(
@@ -566,53 +427,7 @@ impl ProxyHttp for HttpService {
         ctx: &mut Self::CTX,
         req: &RequestHeader,
     ) -> Option<HashBinary> {
-        // Only process Vary headers when cache settings are present
-        let settings = ctx.get::<Arc<CacheSettings>>(CTX_KEY_CACHE_SETTINGS)?;
-
-        // `Vary: *` responses must never enter a shared cache. The response
-        // filter enforces that rule; this is a defensive guard against ever
-        // constructing a stable variance for the literal `*` header name.
-        if response_has_vary_star(meta.headers()) {
-            return None;
-        }
-
-        // Collect Vary header names into a small Vec instead of a HashSet:
-        // typical responses carry 0-3 names, where sort+dedup on a Vec is
-        // cheaper than a hashed container, and we avoid cloning already-
-        // lowercase configured names.
-        let mut vary_headers: Vec<String> = Vec::new();
-        // 1. Headers from the origin's `Vary` response header (arbitrary case).
-        meta.headers()
-            .get_all(VARY)
-            .iter()
-            .flat_map(|v| v.to_str().unwrap_or("").split(','))
-            .for_each(|h| {
-                let trimmed = h.trim().to_ascii_lowercase();
-                if !trimmed.is_empty() {
-                    vary_headers.push(trimmed);
-                }
-            });
-        // 2. Headers from the plugin's pre-normalized (lowercase, sorted,
-        //    deduped) `vary` configuration.
-        vary_headers.extend(settings.vary.iter().cloned());
-
-        // 3. Build the variance key.
-        if vary_headers.is_empty() {
-            return None;
-        }
-        vary_headers.sort_unstable();
-        vary_headers.dedup();
-        let mut key = VarianceBuilder::new();
-        for header_name in &vary_headers {
-            key.add_value(
-                header_name,
-                req.headers
-                    .get(header_name)
-                    .map(|v| v.as_bytes())
-                    .unwrap_or(&[]),
-            );
-        }
-        key.finalize()
+        cache_vary(meta, ctx, req)
     }
 
     fn response_cache_filter(
@@ -621,42 +436,7 @@ impl ProxyHttp for HttpService {
         resp: &ResponseHeader,
         ctx: &mut Self::CTX,
     ) -> Result<RespCacheable> {
-        let Some(settings) = ctx.get::<Arc<CacheSettings>>(CTX_KEY_CACHE_SETTINGS) else {
-            return Ok(RespCacheable::Uncacheable(NoCacheReason::NeverEnabled));
-        };
-
-        // These reasons may run after `session.cache.enable()`; NeverEnabled panics there.
-        if crate::plugins::cache::should_bypass_authenticated_request(settings, ctx) {
-            return Ok(RespCacheable::Uncacheable(NoCacheReason::OriginNotCache));
-        }
-
-        if !settings.statuses.contains(&resp.status.as_u16()) {
-            return Ok(RespCacheable::Uncacheable(NoCacheReason::OriginNotCache));
-        }
-
-        if !settings.cache_set_cookie_responses && resp.headers.contains_key(SET_COOKIE) {
-            return Ok(RespCacheable::Uncacheable(NoCacheReason::OriginNotCache));
-        }
-
-        if response_has_vary_star(&resp.headers) {
-            return Ok(RespCacheable::Uncacheable(NoCacheReason::OriginNotCache));
-        }
-
-        let cc = CacheControl::from_resp_headers(resp);
-        let final_cc = ensure_max_age(cc, settings);
-
-        // Only treat the request as authorized when credentials were actually
-        // present; the previous hard-coded `true` made every response require
-        // `public`/`s-maxage` and prevented the default TTL path from caching.
-        let authorization_present =
-            ctx.original_request_had_credentials || ctx.request_has_credentials;
-
-        Ok(resp_cacheable(
-            final_cc.as_ref(),
-            resp.clone(),
-            authorization_present,
-            &CACHE_DEFAULT,
-        ))
+        response_cacheability(resp, ctx)
     }
 
     async fn logging(&self, session: &mut Session, e: Option<&Error>, ctx: &mut Self::CTX) {
@@ -733,86 +513,6 @@ impl ProxyHttp for HttpService {
     }
 }
 
-/// Ensures CacheControl has max-age set, adding default TTL if missing.
-/// Also handles s-maxage and stale-while-revalidate directives based on settings.
-fn ensure_max_age(cc: Option<CacheControl>, settings: &CacheSettings) -> Option<CacheControl> {
-    match cc {
-        Some(existing_cc) => {
-            let has_max_age_existing = existing_cc.directives.contains_key("max-age");
-            let needs_smaxage_rewrite =
-                settings.respect_s_maxage && existing_cc.directives.contains_key("s-maxage");
-            let needs_stale_while_revalidate = settings.stale_while_revalidate.is_some_and(|_| {
-                !existing_cc
-                    .directives
-                    .contains_key("stale-while-revalidate")
-            });
-
-            if has_max_age_existing && !needs_smaxage_rewrite && !needs_stale_while_revalidate {
-                return Some(existing_cc);
-            }
-
-            let mut directives = DirectiveMap::with_capacity(existing_cc.directives.len() + 3);
-            let mut has_max_age = false;
-
-            // Copy existing directives and check for max-age
-            for (key, value) in &existing_cc.directives {
-                // If respect_s_maxage is enabled and s-maxage is present, use it as max-age for shared cache
-                if settings.respect_s_maxage && key == "s-maxage" {
-                    if let Some(s_maxage_value) = value {
-                        // Use s-maxage value as max-age for shared cache scenario
-                        let max_age_from_s_maxage = DirectiveValue(s_maxage_value.0.clone());
-                        directives.insert("max-age".to_string(), Some(max_age_from_s_maxage));
-                        has_max_age = true;
-                    }
-                    // Also keep the original s-maxage
-                    let cloned_value = value.as_ref().map(|val| DirectiveValue(val.0.clone()));
-                    directives.insert(key.clone(), cloned_value);
-                } else if key == "max-age" {
-                    has_max_age = true;
-                    let cloned_value = value.as_ref().map(|val| DirectiveValue(val.0.clone()));
-                    directives.insert(key.clone(), cloned_value);
-                } else {
-                    let cloned_value = value.as_ref().map(|val| DirectiveValue(val.0.clone()));
-                    directives.insert(key.clone(), cloned_value);
-                }
-            }
-
-            // Add max-age if not present (and not set from s-maxage)
-            if !has_max_age {
-                let max_age_value = DirectiveValue(settings.ttl.as_secs().to_string().into_bytes());
-                directives.insert("max-age".to_string(), Some(max_age_value));
-            }
-
-            // Add stale-while-revalidate if configured and not already present
-            if let Some(swr_duration) = settings.stale_while_revalidate {
-                if !directives.contains_key("stale-while-revalidate") {
-                    let swr_value = DirectiveValue(swr_duration.as_secs().to_string().into_bytes());
-                    directives.insert("stale-while-revalidate".to_string(), Some(swr_value));
-                }
-            }
-
-            Some(CacheControl { directives })
-        }
-        None => {
-            // No Cache-Control header, create new instance
-            let capacity = 1 + settings.stale_while_revalidate.is_some() as usize;
-            let mut directives = DirectiveMap::with_capacity(capacity);
-
-            // Add max-age directive
-            let max_age_value = DirectiveValue(settings.ttl.as_secs().to_string().into_bytes());
-            directives.insert("max-age".to_string(), Some(max_age_value));
-
-            // Add stale-while-revalidate if configured
-            if let Some(swr_duration) = settings.stale_while_revalidate {
-                let swr_value = DirectiveValue(swr_duration.as_secs().to_string().into_bytes());
-                directives.insert("stale-while-revalidate".to_string(), Some(swr_value));
-            }
-
-            Some(CacheControl { directives })
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -876,18 +576,5 @@ mod tests {
 
         headers.insert(http::header::UPGRADE, "h2c".parse().unwrap());
         assert!(!is_websocket_upgrade(&headers));
-    }
-
-    #[test]
-    fn eviction_manager_uses_configured_memory() {
-        // init_cache_defaults is idempotent (first call wins); in a fresh test binary this
-        // is the only setter, so the configured value is observable via the getter.
-        let cache = CacheDefaults {
-            max_memory_bytes: 777_777,
-            default_max_object_bytes: 888,
-        };
-        init_cache_defaults(&cache);
-        assert_eq!(configured_max_memory_bytes(), 777_777);
-        assert_eq!(cache::default_max_object_bytes(), 888);
     }
 }

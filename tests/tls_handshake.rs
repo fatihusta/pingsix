@@ -9,6 +9,7 @@
 use std::net::TcpStream;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 fn testdata_path(name: &str) -> PathBuf {
@@ -61,7 +62,10 @@ fn dynamic_cert_loads_testdata_certs() {
         key_path: key_path.to_string_lossy().into_owned(),
     };
 
-    let result = DynamicCert::new(&tls_config, pingsix::proxy::runtime::RuntimeStore::global());
+    let result = DynamicCert::new(
+        &tls_config,
+        Arc::new(pingsix::proxy::runtime::RuntimeStore::new()),
+    );
     assert!(
         result.is_ok(),
         "DynamicCert should load testdata certs: {:?}",

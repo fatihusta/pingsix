@@ -9,7 +9,12 @@ use serde_json::Value as JsonValue;
 use std::sync::Arc;
 use validator::{Validate, ValidationError};
 
-use crate::core::{apply_regex_uri_template, ProxyContext, ProxyError, ProxyPlugin, ProxyResult};
+use crate::{
+    core::{
+        apply_regex_uri_template, PluginPhases, ProxyContext, ProxyError, ProxyPlugin, ProxyResult,
+    },
+    plugins::config::parse_and_validate_plugin_config,
+};
 
 pub const PLUGIN_NAME: &str = "proxy-rewrite";
 const PRIORITY: i32 = 1008;
@@ -91,11 +96,8 @@ impl TryFrom<JsonValue> for PluginConfig {
     type Error = ProxyError;
 
     fn try_from(value: JsonValue) -> Result<Self, Self::Error> {
-        let config: PluginConfig = serde_json::from_value(value).map_err(|e| {
-            ProxyError::serialization_error("Invalid proxy rewrite plugin config", e)
-        })?;
-
-        config.validate()?;
+        let config: PluginConfig =
+            parse_and_validate_plugin_config(value, "Invalid proxy rewrite plugin config")?;
 
         Ok(config)
     }
@@ -114,6 +116,9 @@ impl ProxyPlugin for PluginProxyRewrite {
 
     fn priority(&self) -> i32 {
         PRIORITY
+    }
+    fn phases(&self) -> PluginPhases {
+        PluginPhases::UPSTREAM_REQUEST
     }
 
     async fn upstream_request_filter(

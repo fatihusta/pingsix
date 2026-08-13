@@ -1,4 +1,4 @@
-use std::{borrow::Cow, sync::Arc};
+use std::sync::Arc;
 
 use async_trait::async_trait;
 use dashmap::DashMap;
@@ -12,7 +12,7 @@ use prometheus::{
 use regex::Regex;
 use serde_json::Value as JsonValue;
 
-use crate::core::{ProxyContext, ProxyError, ProxyPlugin, ProxyResult};
+use crate::core::{PluginPhases, ProxyContext, ProxyError, ProxyPlugin, ProxyResult};
 
 const DEFAULT_BUCKETS: &[f64] = &[
     1.0, 2.0, 5.0, 10.0, 20.0, 50.0, 100.0, 200.0, 500.0, 1000.0, 2000.0, 5000.0, 10000.0, 30000.0,
@@ -197,6 +197,9 @@ impl ProxyPlugin for PluginPrometheus {
     fn priority(&self) -> i32 {
         PRIORITY
     }
+    fn phases(&self) -> PluginPhases {
+        PluginPhases::LOGGING
+    }
 
     async fn logging(&self, session: &mut Session, _e: Option<&Error>, ctx: &mut ProxyContext) {
         REQUESTS.inc();
@@ -236,36 +239,27 @@ impl ProxyPlugin for PluginPrometheus {
             },
         );
 
-        // Extract node from context variables (assumes HttpService::upstream_peer sets ctx.selected) as String
-        let node = ctx.selected.as_ref().map_or(Cow::Borrowed(""), |s| {
-            Cow::Owned(s.peer._address.to_string())
-        });
+        // Node label is captured when the peer is handed to Pingora.
+        let node = ctx.selected.as_ref().map_or("", |s| s.node.as_str());
 
         // Update Prometheus metrics with normalized path template
         STATUS
-            .with_label_values(&[
-                code,
-                route_label,
-                &path_template,
-                &host,
-                service,
-                node.as_ref(),
-            ])
+            .with_label_values(&[code, route_label, &path_template, &host, service, node])
             .inc();
 
         // Record request latency
         let elapsed_ms = ctx.elapsed_ms_f64();
         LATENCY
-            .with_label_values(&["request", route_label, service, node.as_ref()])
+            .with_label_values(&["request", route_label, service, node])
             .observe(elapsed_ms);
 
         // Record bandwidth metrics
         BANDWIDTH
-            .with_label_values(&["ingress", route_label, service, node.as_ref()])
+            .with_label_values(&["ingress", route_label, service, node])
             .inc_by(session.body_bytes_read() as _);
 
         BANDWIDTH
-            .with_label_values(&["egress", route_label, service, node.as_ref()])
+            .with_label_values(&["egress", route_label, service, node])
             .inc_by(session.body_bytes_sent() as _);
 
         // Record request and response sizes

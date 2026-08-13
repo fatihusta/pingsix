@@ -8,7 +8,7 @@ use pingora_proxy::Session;
 use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
 
-use crate::core::{ProxyContext, ProxyError, ProxyPlugin, ProxyResult};
+use crate::core::{PluginPhases, ProxyContext, ProxyError, ProxyPlugin, ProxyResult};
 use crate::utils::{
     request::{get_direct_client_ip, get_req_header_value},
     response::ResponseBuilder,
@@ -174,6 +174,9 @@ impl ProxyPlugin for PluginIPRestriction {
 
     fn priority(&self) -> i32 {
         PRIORITY
+    }
+    fn phases(&self) -> PluginPhases {
+        PluginPhases::REQUEST
     }
 
     async fn request_filter(&self, session: &mut Session, _ctx: &mut ProxyContext) -> Result<bool> {

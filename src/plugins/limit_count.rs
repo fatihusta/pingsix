@@ -14,7 +14,8 @@ use validator::{Validate, ValidationError};
 
 use crate::{
     config::UpstreamHashOn,
-    core::{ProxyContext, ProxyError, ProxyPlugin, ProxyResult},
+    core::{PluginPhases, ProxyContext, ProxyError, ProxyPlugin, ProxyResult},
+    plugins::config::parse_and_validate_plugin_config,
     utils::{request::request_selector_key, response::ResponseBuilder},
 };
 
@@ -132,10 +133,8 @@ impl TryFrom<JsonValue> for PluginConfig {
     type Error = ProxyError;
 
     fn try_from(value: JsonValue) -> Result<Self, Self::Error> {
-        let config: PluginConfig = serde_json::from_value(value)
-            .map_err(|e| ProxyError::serialization_error("Invalid limit count plugin config", e))?;
-
-        config.validate()?;
+        let config: PluginConfig =
+            parse_and_validate_plugin_config(value, "Invalid limit count plugin config")?;
         if config.scope == Scope::Cluster {
             return Err(ProxyError::validation_error(
                 "limit-count scope 'cluster' requires a distributed backend",
@@ -177,6 +176,9 @@ impl ProxyPlugin for PluginRateLimit {
 
     fn priority(&self) -> i32 {
         PRIORITY
+    }
+    fn phases(&self) -> PluginPhases {
+        PluginPhases::REQUEST | PluginPhases::RESPONSE
     }
 
     async fn request_filter(&self, session: &mut Session, ctx: &mut ProxyContext) -> Result<bool> {

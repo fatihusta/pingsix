@@ -4,6 +4,7 @@ pub mod brotli;
 pub mod cache;
 pub mod client_control;
 pub mod compression;
+pub(crate) mod config;
 pub mod cors;
 pub mod csrf;
 pub mod echo;
@@ -17,6 +18,7 @@ pub mod key_auth;
 pub mod limit_conn;
 pub mod limit_count;
 pub mod limit_req;
+pub(crate) mod limiter_shards;
 pub mod prometheus;
 pub mod proxy_mirror;
 pub mod proxy_rewrite;
@@ -27,7 +29,6 @@ pub mod traffic_split;
 
 use std::{collections::HashMap, sync::Arc};
 
-use once_cell::sync::Lazy;
 use serde_json::Value as JsonValue;
 
 use crate::{
@@ -35,79 +36,6 @@ use crate::{
     core::{PluginCreateFn, ProxyError, ProxyPlugin, ProxyResult},
     proxy::upstream::{PreparedUpstreams, ProxyUpstream, TrafficSplitOwner, UpstreamOccurrence},
 };
-
-/// Global registry mapping plugin names to their factory functions.
-///
-/// Plugins are listed in descending priority order (higher priority = executes first).
-/// The priority value determines execution order in the plugin chain.
-static PLUGIN_BUILDER_REGISTRY: Lazy<HashMap<&'static str, PluginCreateFn>> = Lazy::new(|| {
-    let arr: Vec<(&str, PluginCreateFn)> = vec![
-        (
-            client_control::PLUGIN_NAME,
-            client_control::create_client_control_plugin,
-        ), // 22000
-        (
-            request_id::PLUGIN_NAME,
-            request_id::create_request_id_plugin,
-        ), // 12015
-        (
-            fault_injection::PLUGIN_NAME,
-            fault_injection::create_fault_injection_plugin,
-        ), // 11000
-        (cors::PLUGIN_NAME, cors::create_cors_plugin), // 4000
-        (
-            ip_restriction::PLUGIN_NAME,
-            ip_restriction::create_ip_restriction_plugin,
-        ), // 3000
-        (csrf::PLUGIN_NAME, csrf::create_csrf_plugin), // 2980
-        (
-            basic_auth::PLUGIN_NAME,
-            basic_auth::create_basic_auth_plugin,
-        ), // 2520
-        (jwt_auth::PLUGIN_NAME, jwt_auth::create_jwt_auth_plugin), // 2510
-        (key_auth::PLUGIN_NAME, key_auth::create_key_auth_plugin), // 2500
-        (cache::PLUGIN_NAME, cache::create_cache_plugin), // 1085
-        (
-            proxy_rewrite::PLUGIN_NAME,
-            proxy_rewrite::create_proxy_rewrite_plugin,
-        ), // 1008
-        (
-            api_breaker::PLUGIN_NAME,
-            api_breaker::create_api_breaker_plugin,
-        ), // 1005
-        (
-            proxy_mirror::PLUGIN_NAME,
-            proxy_mirror::create_proxy_mirror_plugin,
-        ), // 1010
-        (
-            limit_conn::PLUGIN_NAME,
-            limit_conn::create_limit_conn_plugin,
-        ), // 1003
-        (
-            limit_count::PLUGIN_NAME,
-            limit_count::create_limit_count_plugin,
-        ), // 1002
-        (limit_req::PLUGIN_NAME, limit_req::create_limit_req_plugin), // 1001
-        (brotli::PLUGIN_NAME, brotli::create_brotli_plugin), // 996
-        (gzip::PLUGIN_NAME, gzip::create_gzip_plugin), // 995
-        (redirect::PLUGIN_NAME, redirect::create_redirect_plugin), // 900
-        (
-            response_rewrite::PLUGIN_NAME,
-            response_rewrite::create_response_rewrite_plugin,
-        ), // 899
-        (grpc_web::PLUGIN_NAME, grpc_web::create_grpc_web_plugin), // 505
-        (
-            prometheus::PLUGIN_NAME,
-            prometheus::create_prometheus_plugin,
-        ), // 500
-        (echo::PLUGIN_NAME, echo::create_echo_plugin), // 412
-        (
-            file_logger::PLUGIN_NAME,
-            file_logger::create_file_logger_plugin,
-        ), // 399
-    ];
-    arr.into_iter().collect()
-});
 
 /// Build-time dependency context for plugins that resolve other resources.
 ///
@@ -142,14 +70,21 @@ type PluginUpstreamRefsFn = fn(&JsonValue) -> ProxyResult<Vec<String>>;
 type PluginUpstreamJobsFn =
     fn(TrafficSplitOwner, &JsonValue) -> ProxyResult<Vec<(UpstreamOccurrence, Upstream)>>;
 
-/// Control-plane capabilities of a plugin that resolves other resources.
+/// Construction strategy for one builtin plugin.
+pub(crate) enum PluginFactory {
+    Plain(PluginCreateFn),
+    WithUpstreams(UpstreamPluginFactory),
+}
+
+/// Complete compile-time metadata for one builtin plugin.
 ///
-/// One registry entry replaces the former name-based special cases in graph
-/// validation and candidate preparation; a future dependency-aware plugin
-/// declares the capabilities it needs here and every consumer picks them up
-/// generically.
-pub(crate) struct PluginUpstreamCapabilities {
-    pub factory: UpstreamPluginFactory,
+/// This is deliberately an explicit closed inventory rather than a distributed
+/// registration mechanism: adding a plugin makes all of its construction,
+/// graph, and secret-handling choices visible in one entry.
+pub(crate) struct PluginMeta {
+    pub name: &'static str,
+    pub factory: PluginFactory,
+    pub secrets_transform: Option<crate::utils::encryption::PluginSecretsTransform>,
     /// Deterministic structural validation (Admin pre-check, no graph context).
     pub validate: Option<ValidatePluginFn>,
     /// Named upstream ids referenced by the config (whole-graph reference check).
@@ -158,54 +93,244 @@ pub(crate) struct PluginUpstreamCapabilities {
     pub upstream_jobs: Option<PluginUpstreamJobsFn>,
 }
 
-static PLUGIN_UPSTREAM_CAPABILITIES: Lazy<HashMap<&'static str, PluginUpstreamCapabilities>> =
-    Lazy::new(|| {
-        HashMap::from([(
-            traffic_split::PLUGIN_NAME,
-            PluginUpstreamCapabilities {
-                factory: traffic_split::create_traffic_split_plugin_with_context,
-                validate: Some(traffic_split::validate_traffic_split_config),
-                upstream_refs: Some(traffic_split::named_upstream_ids),
-                upstream_jobs: Some(traffic_split::inline_upstream_jobs),
-            },
-        )])
-    });
+/// The single inventory for every builtin plugin. Entries remain in descending
+/// priority order to preserve the previous registry's documentation order.
+static PLUGIN_META: &[PluginMeta] = &[
+    PluginMeta {
+        name: client_control::PLUGIN_NAME,
+        factory: PluginFactory::Plain(client_control::create_client_control_plugin),
+        secrets_transform: None,
+        validate: None,
+        upstream_refs: None,
+        upstream_jobs: None,
+    },
+    PluginMeta {
+        name: request_id::PLUGIN_NAME,
+        factory: PluginFactory::Plain(request_id::create_request_id_plugin),
+        secrets_transform: None,
+        validate: None,
+        upstream_refs: None,
+        upstream_jobs: None,
+    },
+    PluginMeta {
+        name: fault_injection::PLUGIN_NAME,
+        factory: PluginFactory::Plain(fault_injection::create_fault_injection_plugin),
+        secrets_transform: None,
+        validate: None,
+        upstream_refs: None,
+        upstream_jobs: None,
+    },
+    PluginMeta {
+        name: cors::PLUGIN_NAME,
+        factory: PluginFactory::Plain(cors::create_cors_plugin),
+        secrets_transform: None,
+        validate: None,
+        upstream_refs: None,
+        upstream_jobs: None,
+    },
+    PluginMeta {
+        name: ip_restriction::PLUGIN_NAME,
+        factory: PluginFactory::Plain(ip_restriction::create_ip_restriction_plugin),
+        secrets_transform: None,
+        validate: None,
+        upstream_refs: None,
+        upstream_jobs: None,
+    },
+    PluginMeta {
+        name: csrf::PLUGIN_NAME,
+        factory: PluginFactory::Plain(csrf::create_csrf_plugin),
+        secrets_transform: Some(csrf::SECRETS_TRANSFORM),
+        validate: None,
+        upstream_refs: None,
+        upstream_jobs: None,
+    },
+    PluginMeta {
+        name: basic_auth::PLUGIN_NAME,
+        factory: PluginFactory::Plain(basic_auth::create_basic_auth_plugin),
+        secrets_transform: Some(basic_auth::SECRETS_TRANSFORM),
+        validate: None,
+        upstream_refs: None,
+        upstream_jobs: None,
+    },
+    PluginMeta {
+        name: jwt_auth::PLUGIN_NAME,
+        factory: PluginFactory::Plain(jwt_auth::create_jwt_auth_plugin),
+        secrets_transform: Some(jwt_auth::SECRETS_TRANSFORM),
+        validate: None,
+        upstream_refs: None,
+        upstream_jobs: None,
+    },
+    PluginMeta {
+        name: key_auth::PLUGIN_NAME,
+        factory: PluginFactory::Plain(key_auth::create_key_auth_plugin),
+        secrets_transform: Some(key_auth::SECRETS_TRANSFORM),
+        validate: None,
+        upstream_refs: None,
+        upstream_jobs: None,
+    },
+    PluginMeta {
+        name: cache::PLUGIN_NAME,
+        factory: PluginFactory::Plain(cache::create_cache_plugin),
+        secrets_transform: None,
+        validate: None,
+        upstream_refs: None,
+        upstream_jobs: None,
+    },
+    PluginMeta {
+        name: proxy_rewrite::PLUGIN_NAME,
+        factory: PluginFactory::Plain(proxy_rewrite::create_proxy_rewrite_plugin),
+        secrets_transform: None,
+        validate: None,
+        upstream_refs: None,
+        upstream_jobs: None,
+    },
+    PluginMeta {
+        name: api_breaker::PLUGIN_NAME,
+        factory: PluginFactory::Plain(api_breaker::create_api_breaker_plugin),
+        secrets_transform: None,
+        validate: None,
+        upstream_refs: None,
+        upstream_jobs: None,
+    },
+    PluginMeta {
+        name: proxy_mirror::PLUGIN_NAME,
+        factory: PluginFactory::Plain(proxy_mirror::create_proxy_mirror_plugin),
+        secrets_transform: None,
+        validate: None,
+        upstream_refs: None,
+        upstream_jobs: None,
+    },
+    PluginMeta {
+        name: limit_conn::PLUGIN_NAME,
+        factory: PluginFactory::Plain(limit_conn::create_limit_conn_plugin),
+        secrets_transform: None,
+        validate: None,
+        upstream_refs: None,
+        upstream_jobs: None,
+    },
+    PluginMeta {
+        name: limit_count::PLUGIN_NAME,
+        factory: PluginFactory::Plain(limit_count::create_limit_count_plugin),
+        secrets_transform: None,
+        validate: None,
+        upstream_refs: None,
+        upstream_jobs: None,
+    },
+    PluginMeta {
+        name: limit_req::PLUGIN_NAME,
+        factory: PluginFactory::Plain(limit_req::create_limit_req_plugin),
+        secrets_transform: None,
+        validate: None,
+        upstream_refs: None,
+        upstream_jobs: None,
+    },
+    PluginMeta {
+        name: brotli::PLUGIN_NAME,
+        factory: PluginFactory::Plain(brotli::create_brotli_plugin),
+        secrets_transform: None,
+        validate: None,
+        upstream_refs: None,
+        upstream_jobs: None,
+    },
+    PluginMeta {
+        name: gzip::PLUGIN_NAME,
+        factory: PluginFactory::Plain(gzip::create_gzip_plugin),
+        secrets_transform: None,
+        validate: None,
+        upstream_refs: None,
+        upstream_jobs: None,
+    },
+    PluginMeta {
+        name: redirect::PLUGIN_NAME,
+        factory: PluginFactory::Plain(redirect::create_redirect_plugin),
+        secrets_transform: None,
+        validate: None,
+        upstream_refs: None,
+        upstream_jobs: None,
+    },
+    PluginMeta {
+        name: response_rewrite::PLUGIN_NAME,
+        factory: PluginFactory::Plain(response_rewrite::create_response_rewrite_plugin),
+        secrets_transform: None,
+        validate: None,
+        upstream_refs: None,
+        upstream_jobs: None,
+    },
+    PluginMeta {
+        name: grpc_web::PLUGIN_NAME,
+        factory: PluginFactory::Plain(grpc_web::create_grpc_web_plugin),
+        secrets_transform: None,
+        validate: None,
+        upstream_refs: None,
+        upstream_jobs: None,
+    },
+    PluginMeta {
+        name: prometheus::PLUGIN_NAME,
+        factory: PluginFactory::Plain(prometheus::create_prometheus_plugin),
+        secrets_transform: None,
+        validate: None,
+        upstream_refs: None,
+        upstream_jobs: None,
+    },
+    PluginMeta {
+        name: echo::PLUGIN_NAME,
+        factory: PluginFactory::Plain(echo::create_echo_plugin),
+        secrets_transform: None,
+        validate: None,
+        upstream_refs: None,
+        upstream_jobs: None,
+    },
+    PluginMeta {
+        name: file_logger::PLUGIN_NAME,
+        factory: PluginFactory::Plain(file_logger::create_file_logger_plugin),
+        secrets_transform: None,
+        validate: None,
+        upstream_refs: None,
+        upstream_jobs: None,
+    },
+    PluginMeta {
+        name: traffic_split::PLUGIN_NAME,
+        factory: PluginFactory::WithUpstreams(
+            traffic_split::create_traffic_split_plugin_with_context,
+        ),
+        secrets_transform: None,
+        validate: Some(traffic_split::validate_traffic_split_config),
+        upstream_refs: Some(traffic_split::named_upstream_ids),
+        upstream_jobs: Some(traffic_split::inline_upstream_jobs),
+    },
+];
+
+fn plugin_meta(name: &str) -> Option<&'static PluginMeta> {
+    PLUGIN_META.iter().find(|meta| meta.name == name)
+}
 
 /// Deterministic Admin pre-check for one plugin config.
 ///
-/// Dependency-aware plugins (registered in [`PLUGIN_UPSTREAM_CAPABILITIES`])
-/// validate structurally through their declared `validate` capability — they
-/// cannot be built without upstream context. Plain plugins are built, which
-/// parses their typed config and surfaces configuration errors.
+/// Plain plugins validate by construction: building parses the typed config
+/// and surfaces errors. Dependency-aware plugins (`WithUpstreams`) cannot be
+/// built without upstream context, so they validate structurally through their
+/// declared `validate` capability. Defaults only affect fallback resolution
+/// (identical validation outcome), and the Admin path always uses a neutral
+/// default so it never inherits another gateway instance's state.
 pub(crate) fn validate_plugin_config(name: &str, cfg: &JsonValue) -> ProxyResult<()> {
-    match PLUGIN_UPSTREAM_CAPABILITIES.get(name) {
-        Some(cap) => match cap.validate {
+    let meta = plugin_meta(name)
+        .ok_or_else(|| ProxyError::Plugin(format!("Unknown plugin type: {name}")))?;
+    match meta.factory {
+        PluginFactory::Plain(factory) => {
+            factory(cfg.clone(), &crate::config::EffectiveDefaults::default())?;
+            Ok(())
+        }
+        PluginFactory::WithUpstreams(_) => match meta.validate {
             Some(validate) => validate(cfg),
             None => Ok(()),
         },
-        None => {
-            // Validation builds the plugin to surface config errors; defaults
-            // only affect fallback resolution (identical validation outcome).
-            build_plugin(
-                name,
-                cfg.clone(),
-                // Admin validation only checks whether a plugin config can be
-                // parsed and built. It must not inherit another gateway
-                // instance's process-global defaults.
-                &crate::config::EffectiveDefaults::default(),
-            )?;
-            Ok(())
-        }
     }
 }
 
 /// Named upstream ids referenced by a plugin config, when the plugin declares
 /// any. Empty for plugins without graph references.
 pub(crate) fn plugin_upstream_refs(name: &str, cfg: &JsonValue) -> ProxyResult<Vec<String>> {
-    match PLUGIN_UPSTREAM_CAPABILITIES
-        .get(name)
-        .and_then(|cap| cap.upstream_refs)
-    {
+    match plugin_meta(name).and_then(|meta| meta.upstream_refs) {
         Some(extract) => extract(cfg),
         None => Ok(Vec::new()),
     }
@@ -221,10 +346,7 @@ pub(crate) fn plugin_upstream_jobs(
 ) -> ProxyResult<Vec<(UpstreamOccurrence, Upstream)>> {
     let mut jobs = Vec::new();
     for (name, cfg) in plugins {
-        if let Some(collect) = PLUGIN_UPSTREAM_CAPABILITIES
-            .get(name.as_str())
-            .and_then(|cap| cap.upstream_jobs)
-        {
+        if let Some(collect) = plugin_meta(name).and_then(|meta| meta.upstream_jobs) {
             jobs.extend(collect(owner.clone(), cfg)?);
         }
     }
@@ -254,42 +376,195 @@ pub(crate) fn build_plugin_with_upstreams(
     defaults: &crate::config::EffectiveDefaults,
     resolver: &Arc<hickory_resolver::TokioResolver>,
 ) -> ProxyResult<Arc<dyn ProxyPlugin>> {
-    // Dependency-aware plugins register here; the lookup replaces the former
-    // `name == traffic-split` special case with a declarative registry entry.
-    if let Some(capabilities) = PLUGIN_UPSTREAM_CAPABILITIES.get(name) {
-        let context = PluginBuildContext {
-            upstreams,
-            prepared,
-            owner,
-            defaults,
-            resolver,
-        };
-        return (capabilities.factory)(cfg, &context);
+    let meta = plugin_meta(name)
+        .ok_or_else(|| ProxyError::Plugin(format!("Unknown plugin type: {name}")))?;
+    match meta.factory {
+        PluginFactory::Plain(factory) => factory(cfg, defaults),
+        PluginFactory::WithUpstreams(factory) => {
+            let context = PluginBuildContext {
+                upstreams,
+                prepared,
+                owner,
+                defaults,
+                resolver,
+            };
+            factory(cfg, &context)
+        }
     }
-    build_plugin(name, cfg, defaults)
 }
 
-/// Plugin name → secret-field transform derived from `#[encrypt]` markers.
-///
-/// Used by admin (encrypt before etcd write) and control-plane (decrypt on load).
-pub(crate) static PLUGIN_ENCRYPT_FIELDS: Lazy<
-    HashMap<&'static str, crate::utils::encryption::PluginSecretsTransform>,
-> = Lazy::new(|| {
-    HashMap::from([
-        (basic_auth::PLUGIN_NAME, basic_auth::SECRETS_TRANSFORM),
-        (csrf::PLUGIN_NAME, csrf::SECRETS_TRANSFORM),
-        (key_auth::PLUGIN_NAME, key_auth::SECRETS_TRANSFORM),
-        (jwt_auth::PLUGIN_NAME, jwt_auth::SECRETS_TRANSFORM),
-    ])
-});
+/// Transform a plugin config's declared secret fields, if any.
+pub(crate) fn transform_plugin_secrets(
+    name: &str,
+    config: &mut JsonValue,
+    op: crate::utils::encryption::SecretOp,
+    keyring: &crate::utils::encryption::KeyringService,
+) -> ProxyResult<()> {
+    if let Some(transform) = plugin_meta(name).and_then(|meta| meta.secrets_transform) {
+        transform(config, op, keyring)?;
+    }
+    Ok(())
+}
 
 pub fn build_plugin(
     name: &str,
     cfg: JsonValue,
     defaults: &crate::config::EffectiveDefaults,
 ) -> ProxyResult<Arc<dyn ProxyPlugin>> {
-    let builder = PLUGIN_BUILDER_REGISTRY
-        .get(name)
+    let meta = plugin_meta(name)
         .ok_or_else(|| ProxyError::Plugin(format!("Unknown plugin type: {name}")))?;
-    builder(cfg, defaults)
+    match meta.factory {
+        PluginFactory::Plain(factory) => factory(cfg, defaults),
+        PluginFactory::WithUpstreams(_) => Err(ProxyError::Plugin(format!(
+            "Plugin type '{name}' requires upstream build context"
+        ))),
+    }
+}
+
+#[cfg(test)]
+mod builtin_phases_tests {
+    use super::*;
+    use serde_json::json;
+
+    use crate::core::PluginPhases;
+    use crate::proxy::upstream::discovery::build_resolver_for_state;
+
+    fn expected_phases() -> HashMap<&'static str, PluginPhases> {
+        let request = PluginPhases::REQUEST;
+        let early = PluginPhases::EARLY_REQUEST;
+        let logging = PluginPhases::LOGGING;
+        HashMap::from([
+            (
+                client_control::PLUGIN_NAME,
+                request | PluginPhases::REQUEST_BODY,
+            ),
+            (request_id::PLUGIN_NAME, request | PluginPhases::RESPONSE),
+            (fault_injection::PLUGIN_NAME, request),
+            (cors::PLUGIN_NAME, request | PluginPhases::RESPONSE),
+            (ip_restriction::PLUGIN_NAME, request),
+            (csrf::PLUGIN_NAME, request | PluginPhases::RESPONSE),
+            (basic_auth::PLUGIN_NAME, request),
+            (jwt_auth::PLUGIN_NAME, request | PluginPhases::RESPONSE),
+            (key_auth::PLUGIN_NAME, request),
+            (cache::PLUGIN_NAME, request),
+            (proxy_rewrite::PLUGIN_NAME, PluginPhases::UPSTREAM_REQUEST),
+            (
+                proxy_mirror::PLUGIN_NAME,
+                request | PluginPhases::UPSTREAM_REQUEST | PluginPhases::REQUEST_BODY,
+            ),
+            (api_breaker::PLUGIN_NAME, request | PluginPhases::RESPONSE),
+            (limit_conn::PLUGIN_NAME, request | logging),
+            (limit_count::PLUGIN_NAME, request | PluginPhases::RESPONSE),
+            (limit_req::PLUGIN_NAME, request),
+            (gzip::PLUGIN_NAME, early),
+            (brotli::PLUGIN_NAME, early),
+            (redirect::PLUGIN_NAME, request),
+            (echo::PLUGIN_NAME, request),
+            (response_rewrite::PLUGIN_NAME, PluginPhases::RESPONSE),
+            (grpc_web::PLUGIN_NAME, early),
+            (prometheus::PLUGIN_NAME, logging),
+            (file_logger::PLUGIN_NAME, logging),
+            (traffic_split::PLUGIN_NAME, request),
+        ])
+    }
+
+    fn minimal_config(name: &str) -> JsonValue {
+        match name {
+            "fault-injection" => json!({"abort": {"http_status": 503}}),
+            "basic-auth" => json!({"username": "user", "password": "pass"}),
+            "jwt-auth" => json!({"secret": "test-secret"}),
+            "key-auth" => json!({"key": "test-key"}),
+            "csrf" => json!({"key": "csrf-secret"}),
+            "cache" => json!({"ttl": 60}),
+            "limit-req" => json!({"rate": 1.0, "key": "remote_addr"}),
+            "limit-conn" => json!({
+                "conn": 2,
+                "default_conn_delay": 0.1,
+                "key": "remote_addr"
+            }),
+            "limit-count" => json!({"time_window": 1, "count": 10}),
+            "api-breaker" => json!({"break_response_code": 502}),
+            "proxy-mirror" => json!({"host": "http://127.0.0.1:9797"}),
+            "echo" => json!({"body": "ok"}),
+            "redirect" => json!({"uri": "/next", "regex_uri": []}),
+            _ => json!({}),
+        }
+    }
+
+    #[test]
+    fn plugin_meta_inventory_is_complete_and_unique() {
+        let expected_names: std::collections::HashSet<_> = expected_phases().into_keys().collect();
+        let inventory_names: std::collections::HashSet<_> =
+            PLUGIN_META.iter().map(|meta| meta.name).collect();
+        assert_eq!(
+            inventory_names.len(),
+            PLUGIN_META.len(),
+            "duplicate plugin metadata"
+        );
+        assert_eq!(
+            inventory_names, expected_names,
+            "plugin metadata is incomplete"
+        );
+
+        let traffic_split =
+            plugin_meta(traffic_split::PLUGIN_NAME).expect("traffic-split metadata");
+        assert!(matches!(
+            traffic_split.factory,
+            PluginFactory::WithUpstreams(_)
+        ));
+        assert!(traffic_split.validate.is_some());
+        assert!(traffic_split.upstream_refs.is_some());
+        assert!(traffic_split.upstream_jobs.is_some());
+
+        for name in [
+            basic_auth::PLUGIN_NAME,
+            csrf::PLUGIN_NAME,
+            jwt_auth::PLUGIN_NAME,
+            key_auth::PLUGIN_NAME,
+        ] {
+            assert!(plugin_meta(name).unwrap().secrets_transform.is_some());
+        }
+        assert!(plugin_meta(cache::PLUGIN_NAME)
+            .unwrap()
+            .secrets_transform
+            .is_none());
+    }
+
+    #[test]
+    fn builtin_plugin_phases_match_table() {
+        let defaults = crate::config::EffectiveDefaults::default();
+        let expected = expected_phases();
+
+        for meta in PLUGIN_META {
+            assert!(
+                expected.contains_key(meta.name),
+                "builtin phase table is missing {}",
+                meta.name
+            );
+        }
+
+        for (name, phases) in &expected {
+            if *name == traffic_split::PLUGIN_NAME {
+                continue;
+            }
+            let plugin = build_plugin(name, minimal_config(name), &defaults)
+                .unwrap_or_else(|err| panic!("build {name}: {err}"));
+            assert_eq!(plugin.phases(), *phases, "phases mismatch for {name}");
+        }
+
+        let split = traffic_split::create_traffic_split_plugin_with_upstreams(
+            json!({"rules":[{"weighted_upstreams":[{"weight": 1}]}]}),
+            &HashMap::new(),
+            &HashMap::new(),
+            TrafficSplitOwner::Route("phase-table".into()),
+            &defaults,
+            &build_resolver_for_state().expect("resolver"),
+        )
+        .expect("traffic-split");
+        assert_eq!(
+            split.phases(),
+            expected[traffic_split::PLUGIN_NAME],
+            "phases mismatch for traffic-split"
+        );
+    }
 }

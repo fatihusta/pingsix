@@ -11,8 +11,7 @@
 //! distributed counter backend.
 
 use std::{
-    collections::{BTreeMap, HashMap},
-    hash::{Hash, Hasher},
+    collections::HashMap,
     sync::{
         atomic::{AtomicUsize, Ordering},
         Arc, Mutex,
@@ -29,7 +28,10 @@ use serde_json::Value as JsonValue;
 use validator::{Validate, ValidationError};
 
 use crate::{
-    core::{ProxyContext, ProxyError, ProxyPlugin, ProxyResult},
+    core::{PluginPhases, ProxyContext, ProxyError, ProxyPlugin, ProxyResult},
+    plugins::limiter_shards::{
+        shard_idx, TouchOrder, CLEANUP_BUDGET, LIMIT_SHARDS, PER_SHARD_REGULAR_MAX,
+    },
     utils::{request::apisix_key, response::ResponseBuilder},
 };
 
@@ -40,24 +42,6 @@ const PRIORITY: i32 = 1003;
 
 /// Context key holding the concurrency guard while the request is in flight.
 const CTX_KEY_CONN_GUARD: &str = "pingsix_limit_conn_guard";
-
-/// Upper bound on tracked keys before idle entries are swept.
-const MAX_KEYS: usize = 4096;
-
-/// Number of independent shards the in-flight counter map is split across so
-/// requests with different keys do not all serialize on one mutex. The total
-/// entry bound stays `MAX_KEYS` (`PER_SHARD_MAX * LIMIT_SHARDS`).
-const LIMIT_SHARDS: usize = 16;
-const PER_SHARD_MAX: usize = MAX_KEYS / LIMIT_SHARDS;
-const PER_SHARD_REGULAR_MAX: usize = PER_SHARD_MAX - 1;
-const CLEANUP_BUDGET: usize = 8;
-
-/// Shard index for a limiter key.
-fn shard_idx(key: &str) -> usize {
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    key.hash(&mut hasher);
-    (hasher.finish() as usize) % LIMIT_SHARDS
-}
 
 /// Creates a `limit-conn` plugin instance from JSON configuration.
 pub fn create_limit_conn_plugin(
@@ -104,23 +88,18 @@ struct ConnState {
 #[derive(Default)]
 struct CounterShard {
     entries: HashMap<String, Arc<ConnState>>,
-    oldest: BTreeMap<u64, String>,
-    next_touch: u64,
+    touch_order: TouchOrder,
 }
 
 impl CounterShard {
     fn touch(&mut self, key: &str) {
-        self.next_touch = self.next_touch.wrapping_add(1);
-        if self.next_touch == 0 {
-            self.next_touch = 1;
-        }
-        self.oldest.insert(self.next_touch, key.to_string());
+        self.touch_order.touch(key);
     }
 
     /// Remove at most `CLEANUP_BUDGET` inactive states; active states remain.
     fn sweep_inactive(&mut self) {
         for _ in 0..CLEANUP_BUDGET {
-            let Some((touch, key)) = self.oldest.pop_first() else {
+            let Some((_touch, key)) = self.touch_order.pop_oldest() else {
                 break;
             };
             if self
@@ -132,7 +111,6 @@ impl CounterShard {
             } else {
                 // Move active entries to the back so one active oldest entry
                 // cannot consume every cleanup slot.
-                let _ = touch;
                 self.touch(&key);
             }
         }
@@ -279,7 +257,7 @@ impl TryFrom<JsonValue> for PluginConfig {
 pub struct PluginLimitConn {
     config: PluginConfig,
     /// Sharded in-flight counters. Entries are swept when a shard grows past
-    /// [`PER_SHARD_MAX`] to avoid unbounded memory from ephemeral keys.
+    /// the per-shard capacity to avoid unbounded memory from ephemeral keys.
     /// Sharding keeps requests with different keys off the same mutex and
     /// bounds any cleanup sweep to one shard (1/`LIMIT_SHARDS` of keys).
     counters: [Mutex<CounterShard>; LIMIT_SHARDS],
@@ -340,6 +318,9 @@ impl ProxyPlugin for PluginLimitConn {
 
     fn priority(&self) -> i32 {
         PRIORITY
+    }
+    fn phases(&self) -> PluginPhases {
+        PluginPhases::REQUEST | PluginPhases::LOGGING
     }
 
     async fn request_filter(&self, session: &mut Session, ctx: &mut ProxyContext) -> Result<bool> {
@@ -456,6 +437,46 @@ mod tests {
         guard.leave(false);
         assert_eq!(state.count.load(Ordering::Relaxed), 0);
         // A second release via Drop must not double-decrement.
+    }
+
+    #[test]
+    fn full_active_shard_uses_one_stable_overflow_state() {
+        let plugin = PluginLimitConn {
+            config: PluginConfig::try_from(serde_json::json!({
+                "conn": 2,
+                "default_conn_delay": 0.1,
+                "key": "remote_addr"
+            }))
+            .unwrap(),
+            counters: std::array::from_fn(|_| Mutex::new(CounterShard::default())),
+        };
+        let shard = shard_idx("regular-0");
+        let regular_keys: Vec<_> = (0..100_000)
+            .map(|i| format!("regular-{i}"))
+            .filter(|key| shard_idx(key) == shard)
+            .take(PER_SHARD_REGULAR_MAX)
+            .collect();
+        assert_eq!(regular_keys.len(), PER_SHARD_REGULAR_MAX);
+        for key in &regular_keys {
+            plugin
+                .get_or_insert_counter(key)
+                .count
+                .fetch_add(1, Ordering::Relaxed);
+        }
+        let overflow_keys: Vec<_> = (100_000..200_000)
+            .map(|i| format!("overflow-{i}"))
+            .filter(|key| shard_idx(key) == shard)
+            .take(2)
+            .collect();
+        let first = plugin.get_or_insert_counter(&overflow_keys[0]);
+        let second = plugin.get_or_insert_counter(&overflow_keys[1]);
+
+        assert!(Arc::ptr_eq(&first, &second));
+        let shard = plugin.counters[shard].lock().unwrap();
+        assert_eq!(shard.entries.len(), PER_SHARD_REGULAR_MAX + 1);
+        assert!(shard
+            .entries
+            .contains_key("__pingsix_limit_conn_overflow__"));
     }
 
     #[test]

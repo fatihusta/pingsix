@@ -21,7 +21,6 @@ use aes_gcm::{
 };
 use argon2::Argon2;
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
-use once_cell::sync::OnceCell;
 use serde_json::Value as JsonValue;
 
 use crate::core::{ProxyError, ProxyResult};
@@ -74,15 +73,19 @@ const ENVELOPE_V1_PREFIX: &str = "$pingsix-enc:v1$";
 /// Instance-owned field-encryption service.
 ///
 /// Wraps the optional derived keyring so the configuration graph, admin write
-/// path, and runtime ingestion can share one instance instead of reading the
-/// process-global [`KEYRING`] OnceCell. Two gateway runtimes in one process
-/// may hold different keyrings without interference.
+/// path, and runtime ingestion share one instance. Two gateway runtimes in one
+/// process may hold different keyrings without interference.
 #[derive(Clone, Debug)]
 pub struct KeyringService {
     keyring: Option<Keyring>,
 }
 
 impl KeyringService {
+    /// Pass-through service: encrypt is a no-op, ciphertext decrypt is rejected.
+    pub fn disabled() -> Self {
+        Self { keyring: None }
+    }
+
     /// Build the service from configuration. `enable=false` installs a
     /// pass-through service (encrypt no-op, ciphertext rejected on decrypt).
     pub fn new(enable: bool, keyring: &[String]) -> ProxyResult<Self> {
@@ -92,14 +95,6 @@ impl KeyringService {
             None
         };
         Ok(Self { keyring: installed })
-    }
-
-    /// The migration-period process-global service, mirroring whatever the
-    /// legacy [`init`] facade installed (pass-through when unset).
-    pub fn global() -> Self {
-        Self {
-            keyring: KEYRING.get().and_then(|opt| opt.clone()),
-        }
     }
 
     /// Whether field encryption is active for this instance.
@@ -137,8 +132,6 @@ impl KeyringService {
         }
     }
 }
-
-static KEYRING: OnceCell<Option<Keyring>> = OnceCell::new();
 
 /// Derived AES-256 keyring used for encrypt (first key) / decrypt (all keys).
 #[derive(Clone, Debug)]
@@ -247,65 +240,6 @@ fn derive_key(secret: &str) -> ProxyResult<[u8; 32]> {
 /// Returns true when `value` carries this module's ciphertext prefix.
 pub fn is_ciphertext(value: &str) -> bool {
     value.starts_with(CIPHERTEXT_PREFIX)
-}
-
-/// Install the process-wide keyring from config. First call wins (safe for tests).
-pub fn init(enable: bool, keyring: &[String]) -> ProxyResult<()> {
-    let installed = if enable {
-        Some(Keyring::from_secrets(keyring)?)
-    } else {
-        None
-    };
-    let _ = KEYRING.set(installed);
-    Ok(())
-}
-
-/// Whether field encryption is active for this process.
-///
-/// Migration facade: kept until every caller holds a [`KeyringService`].
-#[allow(dead_code)]
-pub fn is_enabled() -> bool {
-    matches!(KEYRING.get(), Some(Some(_)))
-}
-
-#[allow(dead_code)]
-fn active_keyring() -> Option<&'static Keyring> {
-    KEYRING.get().and_then(|opt| opt.as_ref())
-}
-
-/// Encrypt a sensitive string for etcd storage.
-///
-/// No-op when encryption is disabled or the value is already ciphertext.
-///
-/// Migration facade: kept until every caller holds a [`KeyringService`].
-#[allow(dead_code)]
-pub fn encrypt(plaintext: &str) -> ProxyResult<String> {
-    match active_keyring() {
-        Some(kr) => kr.encrypt(plaintext),
-        None => Ok(plaintext.to_string()),
-    }
-}
-
-/// Decrypt a sensitive string loaded from etcd into memory.
-///
-/// Plaintext (no prefix) passes through. Ciphertext is tried against every
-/// keyring key in order. When encryption is disabled, ciphertext is rejected
-/// so misconfiguration surfaces clearly instead of opaque PEM parse errors.
-///
-/// Migration facade: kept until every caller holds a [`KeyringService`].
-#[allow(dead_code)]
-pub fn decrypt(value: &str) -> ProxyResult<String> {
-    match active_keyring() {
-        Some(kr) => kr.decrypt(value),
-        None => {
-            if is_ciphertext(value) {
-                return Err(ProxyError::Configuration(
-                    "Encrypted value found but data_encryption is disabled".into(),
-                ));
-            }
-            Ok(value.to_string())
-        }
-    }
 }
 
 /// Apply `op` to a single leaf field (string or array of strings).
@@ -443,8 +377,7 @@ mod tests {
 
     #[test]
     fn encrypt_json_field_replaces_string() {
-        // Exercise Keyring directly via encrypt path used by helpers when enabled
-        // is unavailable in unit tests that share OnceCell — call Keyring APIs.
+        // Exercise Keyring directly via encrypt path used by helpers.
         let kr = Keyring::from_secrets(&["k".into()]).unwrap();
         let mut value = serde_json::json!({ "key": "plain", "cert": "c" });
         let plain = value["key"].as_str().unwrap().to_string();
@@ -513,8 +446,9 @@ mod tests {
             "inner": { "secret": format!("{CIPHERTEXT_PREFIX}deadbeef") },
             "maybe": null,
         });
-        let err = Outer::transform_secrets(&mut cfg, SecretOp::Decrypt, &KeyringService::global())
-            .unwrap_err();
+        let err =
+            Outer::transform_secrets(&mut cfg, SecretOp::Decrypt, &KeyringService::disabled())
+                .unwrap_err();
         assert!(
             err.to_string().contains("data_encryption is disabled")
                 || err.to_string().contains("Encrypted value"),
@@ -527,7 +461,7 @@ mod tests {
             "inner": { "secret": "plain-secret" },
             "maybe": null,
         });
-        Outer::transform_secrets(&mut ok, SecretOp::Decrypt, &KeyringService::global()).unwrap();
+        Outer::transform_secrets(&mut ok, SecretOp::Decrypt, &KeyringService::disabled()).unwrap();
         assert_eq!(ok["inner"]["secret"], "plain-secret");
     }
 }

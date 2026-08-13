@@ -809,13 +809,13 @@ mod tests {
 
         let upstreams = HashMap::new();
         let services = HashMap::new();
-        let resolver = crate::proxy::upstream::discovery::get_global_resolver_for_build().unwrap();
+        let resolver = crate::proxy::upstream::discovery::build_resolver_for_state().unwrap();
         let proxy_route = ProxyRoute::build(
             route_cfg,
             &upstreams,
             &services,
             &HashMap::new(),
-            &config::EffectiveDefaults::global(),
+            &config::EffectiveDefaults::default(),
             &resolver,
         )
         .unwrap();

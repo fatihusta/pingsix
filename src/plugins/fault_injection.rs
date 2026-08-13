@@ -11,7 +11,10 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
 use validator::Validate;
 
-use crate::core::{ProxyContext, ProxyError, ProxyPlugin, ProxyResult};
+use crate::{
+    core::{PluginPhases, ProxyContext, ProxyError, ProxyPlugin, ProxyResult},
+    plugins::config::parse_and_validate_plugin_config,
+};
 
 pub const PLUGIN_NAME: &str = "fault-injection";
 const PRIORITY: i32 = 11000;
@@ -78,11 +81,8 @@ impl TryFrom<JsonValue> for PluginConfig {
     type Error = ProxyError;
 
     fn try_from(value: JsonValue) -> Result<Self, Self::Error> {
-        let config: PluginConfig = serde_json::from_value(value).map_err(|e| {
-            ProxyError::serialization_error("Invalid fault injection plugin config", e)
-        })?;
-
-        config.validate()?;
+        let config: PluginConfig =
+            parse_and_validate_plugin_config(value, "Invalid fault injection plugin config")?;
 
         // Validate that at least one of delay or abort is configured
         if config.delay.is_none() && config.abort.is_none() {
@@ -185,6 +185,9 @@ impl ProxyPlugin for PluginFaultInjection {
 
     fn priority(&self) -> i32 {
         PRIORITY
+    }
+    fn phases(&self) -> PluginPhases {
+        PluginPhases::REQUEST
     }
 
     async fn request_filter(&self, session: &mut Session, _ctx: &mut ProxyContext) -> Result<bool> {

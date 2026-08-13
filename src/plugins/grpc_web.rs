@@ -6,7 +6,7 @@ use pingora_error::Result;
 use pingora_proxy::Session;
 use serde_json::Value as JsonValue;
 
-use crate::core::{ProxyContext, ProxyPlugin, ProxyResult};
+use crate::core::{PluginPhases, ProxyContext, ProxyPlugin, ProxyResult};
 
 pub const PLUGIN_NAME: &str = "grpc-web";
 const PRIORITY: i32 = 505;
@@ -36,6 +36,9 @@ impl ProxyPlugin for PluginGrpcWeb {
 
     fn priority(&self) -> i32 {
         PRIORITY
+    }
+    fn phases(&self) -> PluginPhases {
+        PluginPhases::EARLY_REQUEST
     }
 
     async fn early_request_filter(

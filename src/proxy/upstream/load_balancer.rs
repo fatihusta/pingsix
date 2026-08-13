@@ -60,8 +60,7 @@ pub struct ProxyUpstream {
     /// (APISIX `checks.passive`).
     passive: Option<PassiveHealthState>,
     /// Effective `pingsix.defaults.upstream_timeout` captured at build time, so
-    /// peer timeouts honor the owning gateway instance's defaults without
-    /// reading the process-global OnceCell on every request.
+    /// peer timeouts honor the owning gateway instance's defaults.
     default_timeout: Option<config::Timeout>,
 }
 
@@ -260,9 +259,9 @@ impl ProxyUpstream {
     /// explicitly prepared material to [`Self::build`].
     #[cfg(test)]
     pub(crate) fn build_static(upstream: config::Upstream) -> ProxyResult<Self> {
-        let resolver = super::discovery::get_global_resolver_for_build()?;
+        let resolver = super::discovery::build_resolver_for_state()?;
         let prepared = prepare_static_upstream(&upstream, &resolver)?;
-        Self::build(upstream, prepared, &EffectiveDefaults::global(), &resolver)
+        Self::build(upstream, prepared, &EffectiveDefaults::default(), &resolver)
     }
 
     /// Build an upstream from material prepared before candidate compilation.
@@ -548,7 +547,8 @@ where
 
         // Extract the Arc<LoadBalancer> via background_service().task().
         // The wrapper is intentionally dropped — health checks are driven by
-        // SHARED_HEALTH_CHECK_SERVICE, not by Pingora's background service mechanism.
+        // the instance-owned SharedHealthCheckService, not by Pingora's
+        // background service mechanism.
         let background =
             background_service(&format!("health check for {}", upstream.id), upstreams);
         let upstreams = background.task();
@@ -713,8 +713,7 @@ impl TryFrom<config::ActiveCheck> for HttpHealthCheck {
 mod tests {
     use super::*;
     use crate::config::{
-        init_default_upstream_timeout, Nodes, SelectionType, Timeout, UpstreamHashOn,
-        UpstreamPassHost, UpstreamScheme,
+        Nodes, SelectionType, Timeout, UpstreamHashOn, UpstreamPassHost, UpstreamScheme,
     };
     use std::collections::HashMap;
 
@@ -751,11 +750,6 @@ mod tests {
 
     #[test]
     fn explicit_upstream_timeout_applied_to_peer() {
-        init_default_upstream_timeout(Some(Timeout {
-            connect: 5,
-            send: 5,
-            read: 5,
-        }));
         let upstream = ProxyUpstream::build_static(sample_upstream(
             "payments",
             Some(Timeout {
@@ -781,8 +775,7 @@ mod tests {
         // must yield different peer timeouts for the same upstream config.
         let make = |defaults: &EffectiveDefaults| {
             let upstream = sample_upstream("plain", None);
-            let resolver =
-                crate::proxy::upstream::discovery::get_global_resolver_for_build().unwrap();
+            let resolver = crate::proxy::upstream::discovery::build_resolver_for_state().unwrap();
             let prepared =
                 crate::proxy::upstream::discovery::prepare_static_upstream(&upstream, &resolver)
                     .unwrap();
@@ -813,31 +806,29 @@ mod tests {
     }
 
     #[test]
-    fn missing_upstream_timeout_uses_global_default() {
-        init_default_upstream_timeout(Some(Timeout {
-            connect: 5,
-            send: 5,
-            read: 5,
-        }));
-        // First-wins OnceCell: if a prior test already set a different value,
-        // resolve via whatever is currently configured.
-        let global = crate::config::default_upstream_timeout();
-        let upstream = ProxyUpstream::build_static(sample_upstream("plain", None)).unwrap();
-        let backend = upstream.select_backend_for_test().unwrap();
+    fn missing_upstream_timeout_uses_instance_default() {
+        let defaults = EffectiveDefaults {
+            upstream_timeout: Some(Timeout {
+                connect: 5,
+                send: 5,
+                read: 5,
+            }),
+            ..EffectiveDefaults::default()
+        };
+        let upstream = sample_upstream("plain", None);
+        let resolver = crate::proxy::upstream::discovery::build_resolver_for_state().unwrap();
+        let prepared =
+            crate::proxy::upstream::discovery::prepare_static_upstream(&upstream, &resolver)
+                .unwrap();
+        let built = ProxyUpstream::build(upstream, prepared, &defaults, &resolver).unwrap();
+        let backend = built.select_backend_for_test().unwrap();
         let peer = backend.ext.get::<HttpPeer>().unwrap();
-        if let Some(g) = global {
-            assert_eq!(
-                peer.options.connection_timeout,
-                Some(Duration::from_secs(g.connect))
-            );
-            assert_eq!(peer.options.read_timeout, Some(Duration::from_secs(g.read)));
-            assert_eq!(
-                peer.options.write_timeout,
-                Some(Duration::from_secs(g.send))
-            );
-        } else {
-            assert!(peer.options.connection_timeout.is_none());
-        }
+        assert_eq!(
+            peer.options.connection_timeout,
+            Some(Duration::from_secs(5))
+        );
+        assert_eq!(peer.options.read_timeout, Some(Duration::from_secs(5)));
+        assert_eq!(peer.options.write_timeout, Some(Duration::from_secs(5)));
     }
 
     #[test]
@@ -917,7 +908,7 @@ mod tests {
     fn duplicate_addr_keeps_higher_priority() {
         // Pingora Backend identity ignores ext; same addr+weight collapses.
         // We keep the higher priority so negative cannot "stick" over 0/10.
-        let resolver = crate::proxy::upstream::discovery::get_global_resolver_for_build().unwrap();
+        let resolver = crate::proxy::upstream::discovery::build_resolver_for_state().unwrap();
         let prepared = prepare_static_upstream(
             &config::Upstream {
                 nodes: Nodes(vec![node("127.0.0.1", 443, -1), node("127.0.0.1", 443, 10)]),

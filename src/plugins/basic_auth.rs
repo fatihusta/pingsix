@@ -12,8 +12,10 @@ use validator::Validate;
 
 use crate::{
     core::{
-        constant_time_digest_eq, secret_digest, ProxyContext, ProxyError, ProxyPlugin, ProxyResult,
+        constant_time_digest_eq, secret_digest, PluginPhases, ProxyContext, ProxyError,
+        ProxyPlugin, ProxyResult,
     },
+    plugins::config::parse_and_validate_plugin_config,
     utils::{request, response::ResponseBuilder},
 };
 
@@ -51,10 +53,8 @@ impl TryFrom<JsonValue> for PluginConfig {
     type Error = ProxyError;
 
     fn try_from(value: JsonValue) -> Result<Self, Self::Error> {
-        let config: PluginConfig = serde_json::from_value(value).map_err(|e| {
-            ProxyError::serialization_error("Failed to parse basic auth plugin config", e)
-        })?;
-        config.validate()?;
+        let config: PluginConfig =
+            parse_and_validate_plugin_config(value, "Failed to parse basic auth plugin config")?;
         Ok(config)
     }
 }
@@ -109,6 +109,9 @@ impl ProxyPlugin for PluginBasicAuth {
 
     fn priority(&self) -> i32 {
         PRIORITY
+    }
+    fn phases(&self) -> PluginPhases {
+        PluginPhases::REQUEST
     }
 
     async fn request_filter(&self, session: &mut Session, ctx: &mut ProxyContext) -> Result<bool> {
@@ -172,7 +175,7 @@ mod tests {
             "password": "s3cret",
         });
         // Encryption disabled → plaintext pass-through.
-        PluginConfig::transform_secrets(&mut cfg, SecretOp::Decrypt, &KeyringService::global())
+        PluginConfig::transform_secrets(&mut cfg, SecretOp::Decrypt, &KeyringService::disabled())
             .unwrap();
         assert_eq!(cfg["username"], "demo");
         assert_eq!(cfg["password"], "s3cret");

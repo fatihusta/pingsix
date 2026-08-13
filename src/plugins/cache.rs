@@ -2,9 +2,8 @@ use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Duration;
 
+use ::http::{HeaderName, Method};
 use async_trait::async_trait;
-use http::{HeaderName, Method};
-use once_cell::sync::OnceCell;
 use pingora_error::Result;
 use pingora_proxy::Session;
 use regex::Regex;
@@ -12,53 +11,31 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
 use validator::{Validate, ValidationError};
 
-use crate::core::{ProxyContext, ProxyError, ProxyPlugin, ProxyResult};
+use crate::{
+    core::{PluginPhases, ProxyContext, ProxyError, ProxyPlugin, ProxyResult},
+    plugins::config::parse_and_validate_plugin_config,
+};
+
+pub(crate) mod http;
 
 pub const PLUGIN_NAME: &str = "cache";
 const PRIORITY: i32 = 1085;
 
-/// Global default max object size, populated once at startup from
-/// `pingsix.defaults.cache.default_max_object_bytes`. Falls back to 1MB when unset
-/// (e.g. in unit tests that do not initialize the full config).
-///
-/// Migration facade retained as test scaffolding: production cache plugins
-/// receive the instance's [`crate::config::EffectiveDefaults`] at build time;
-/// this OnceCell backs [`crate::config::EffectiveDefaults::global`] and the
-/// legacy getter used by unit/integration tests.
-static DEFAULT_MAX_OBJECT_BYTES: OnceCell<usize> = OnceCell::new();
-
-/// 1MB fallback used when no global default has been initialized.
+/// 1MB fallback used when a cache plugin inherits instance defaults.
+#[cfg(test)]
 const FALLBACK_MAX_OBJECT_BYTES: usize = 1024 * 1024;
 
-/// Populates the global default max object size from configuration. Called once at
-/// startup by `service::http::init_cache_defaults`. Subsequent calls are no-ops
-/// (the first value wins), which keeps parallel test initialization safe.
-pub fn init_default_max_object_bytes(bytes: usize) {
-    let _ = DEFAULT_MAX_OBJECT_BYTES.set(bytes);
-}
-
-/// Returns the effective global default max object size, falling back to 1MB when unset.
-pub fn default_max_object_bytes() -> usize {
-    DEFAULT_MAX_OBJECT_BYTES
-        .get()
-        .copied()
-        .unwrap_or(FALLBACK_MAX_OBJECT_BYTES)
-}
-
 /// Resolves the final `max_file_size_bytes` a cache plugin would embed for `cfg`.
-///
-/// Used by static-config integration tests to assert that YAML defaults are applied
-/// before plugin construction.
-pub fn resolved_max_file_size_bytes(cfg: JsonValue) -> ProxyResult<usize> {
+pub fn resolved_max_file_size_bytes(cfg: JsonValue, default_max: usize) -> ProxyResult<usize> {
     let config = PluginConfig::try_from(cfg)?;
     Ok(resolve_max_file_size(
         config.max_file_size_bytes,
-        default_max_object_bytes(),
+        default_max,
     ))
 }
 
 /// Resolves the final `max_file_size_bytes` for `CacheSettings`.
-/// `None` (unconfigured) -> use the global default; `Some(0)` -> 0 (unlimited);
+/// `None` (unconfigured) -> use the instance default; `Some(0)` -> 0 (unlimited);
 /// `Some(n)` -> n.
 fn resolve_max_file_size(configured: Option<usize>, global_default: usize) -> usize {
     configured.unwrap_or(global_default)
@@ -122,7 +99,7 @@ pub struct PluginConfig {
     pub scope: Scope,
 
     /// Maximum cacheable response size in bytes.
-    /// `None` (default) inherits the global `default_max_object_bytes`
+    /// `None` (default) inherits the instance's `default_max_object_bytes`
     /// (`pingsix.defaults.cache.default_max_object_bytes`, 1MB by default).
     /// `Some(0)` means no limit. `Some(n)` enforces an explicit byte limit.
     #[serde(default)]
@@ -212,11 +189,8 @@ impl TryFrom<JsonValue> for PluginConfig {
     type Error = ProxyError;
 
     fn try_from(value: JsonValue) -> Result<Self, Self::Error> {
-        let config: PluginConfig = serde_json::from_value(value).map_err(|e| {
-            ProxyError::serialization_error("Failed to parse cache plugin config", e)
-        })?;
-
-        config.validate()?;
+        let config: PluginConfig =
+            parse_and_validate_plugin_config(value, "Failed to parse cache plugin config")?;
         if config.scope == Scope::Cluster {
             return Err(ProxyError::validation_error(
                 "cache scope 'cluster' requires a distributed backend",
@@ -339,6 +313,9 @@ impl ProxyPlugin for PluginCache {
     fn priority(&self) -> i32 {
         PRIORITY
     }
+    fn phases(&self) -> PluginPhases {
+        PluginPhases::REQUEST
+    }
 
     async fn request_filter(&self, session: &mut Session, ctx: &mut ProxyContext) -> Result<bool> {
         let method = &session.req_header().method;
@@ -404,7 +381,13 @@ mod tests {
     }
 
     fn settings_from_json(value: serde_json::Value) -> CacheSettings {
-        settings_from_json_with_default(value, default_max_object_bytes())
+        settings_from_json_with_default(value, FALLBACK_MAX_OBJECT_BYTES)
+    }
+
+    #[test]
+    fn purge_uses_get_cache_key_method() {
+        assert_eq!(http::cache_key_method("PURGE"), "GET");
+        assert_eq!(http::cache_key_method("HEAD"), "HEAD");
     }
 
     #[test]

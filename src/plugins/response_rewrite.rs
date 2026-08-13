@@ -12,8 +12,9 @@ use validator::Validate;
 
 use crate::{
     config::UpstreamHashOn,
-    core::{ProxyContext, ProxyError, ProxyPlugin, ProxyResult},
-    utils::request::request_selector_key,
+    core::{PluginPhases, ProxyContext, ProxyError, ProxyPlugin, ProxyResult},
+    plugins::config::parse_and_validate_plugin_config,
+    utils::{apisix_vars::match_apisix_vars, request::request_selector_key},
 };
 
 pub const PLUGIN_NAME: &str = "response-rewrite";
@@ -55,10 +56,8 @@ impl TryFrom<JsonValue> for PluginConfig {
     type Error = ProxyError;
 
     fn try_from(value: JsonValue) -> Result<Self, Self::Error> {
-        let config: PluginConfig = serde_json::from_value(value).map_err(|e| {
-            ProxyError::serialization_error("Failed to parse response-rewrite config", e)
-        })?;
-        config.validate()?;
+        let config: PluginConfig =
+            parse_and_validate_plugin_config(value, "Failed to parse response-rewrite config")?;
         Ok(config)
     }
 }
@@ -68,66 +67,63 @@ pub struct PluginResponseRewrite {
 }
 
 impl PluginResponseRewrite {
-    /// Variable matching logic (shared with the traffic-split plugin)
-    fn match_vars(&self, session: &mut Session, vars: &Option<Vec<Vec<String>>>) -> bool {
-        let Some(vars) = vars else { return true };
-        if vars.is_empty() {
-            return true;
-        }
-
-        for v in vars {
-            if v.len() < 3 {
-                continue;
-            }
-            let var_name = &v[0];
-            let op = &v[1];
-            let val = &v[2];
-
-            let actual_val = if let Some(header_name) = var_name.strip_prefix("http_") {
-                request_selector_key(session, &UpstreamHashOn::HEAD, header_name)
-            } else {
-                request_selector_key(session, &UpstreamHashOn::VARS, var_name)
-            };
-
-            match op.as_str() {
-                "==" => {
-                    if actual_val != *val {
-                        return false;
-                    }
-                }
-                "!=" => {
-                    if actual_val == *val {
-                        return false;
-                    }
-                }
-                _ => return false,
-            }
-        }
-        true
+    /// Expand the documented response-rewrite variables. Unknown `$name`
+    /// sequences are deliberately preserved rather than silently erased.
+    fn expand_vars(&self, session: &mut Session, ctx: &ProxyContext, val: &str) -> String {
+        let remote_addr = request_selector_key(session, &UpstreamHashOn::VARS, "remote_addr");
+        Self::expand_template(
+            val,
+            &remote_addr,
+            ctx.selected.as_ref().map(|selected| selected.node.as_str()),
+            ctx.request_id(),
+        )
     }
 
-    /// Expand header templates by swapping `$var` placeholders with actual values.
-    fn expand_vars(&self, session: &mut Session, val: &str) -> String {
+    fn expand_template(
+        val: &str,
+        remote_addr: &str,
+        upstream_addr: Option<&str>,
+        request_id: Option<&str>,
+    ) -> String {
         if !val.contains('$') {
             return val.to_string();
         }
-
-        // Minimal implementation; extend with regex matching if more placeholders are introduced.
-        let mut result = val.to_string();
-        let placeholders = ["$remote_addr", "$upstream_addr", "$request_id"];
-
-        for p in placeholders {
-            if result.contains(p) {
-                let actual = match p {
-                    "$remote_addr" => {
-                        request_selector_key(session, &UpstreamHashOn::VARS, "remote_addr")
-                    }
-                    _ => std::borrow::Cow::Borrowed(""),
-                };
-                result = result.replace(p, &actual);
+        // Replace only the three supported `$name` tokens by identifier
+        // boundary, so a variable like `$request_id_suffix` or
+        // `$remote_address` is preserved verbatim instead of being silently
+        // rewritten by a prefix match.
+        let mut out = String::with_capacity(val.len());
+        let mut rest = val;
+        while let Some(dollar) = rest.find('$') {
+            out.push_str(&rest[..dollar]);
+            let after = &rest[dollar + 1..];
+            let name_len = after
+                .find(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+                .unwrap_or(after.len());
+            if name_len == 0 {
+                // Lone '$' or '$' followed by a non-identifier char: keep '$'.
+                out.push('$');
+                rest = after;
+                continue;
             }
+            let name = &after[..name_len];
+            // Known variable names expand even when the value is unavailable
+            // (empty string). Unknown names are preserved verbatim. The
+            // token boundary above ensures `$remote_address` is treated as an
+            // unknown name, not a `$remote_addr` prefix match.
+            match name {
+                "remote_addr" => out.push_str(remote_addr),
+                "upstream_addr" => out.push_str(upstream_addr.unwrap_or("")),
+                "request_id" => out.push_str(request_id.unwrap_or("")),
+                _ => {
+                    out.push('$');
+                    out.push_str(name);
+                }
+            }
+            rest = &after[name_len..];
         }
-        result
+        out.push_str(rest);
+        out
     }
 }
 
@@ -139,15 +135,19 @@ impl ProxyPlugin for PluginResponseRewrite {
     fn priority(&self) -> i32 {
         PRIORITY
     }
+    fn phases(&self) -> PluginPhases {
+        PluginPhases::RESPONSE
+    }
 
     async fn response_filter(
         &self,
         session: &mut Session,
         upstream_response: &mut ResponseHeader,
-        _ctx: &mut ProxyContext,
+        ctx: &mut ProxyContext,
     ) -> Result<()> {
         // 1. Check matching conditions
-        if !self.match_vars(session, &self.config.vars) {
+        let vars = self.config.vars.as_deref().unwrap_or(&[]);
+        if !match_apisix_vars(session, vars) {
             return Ok(());
         }
 
@@ -163,7 +163,7 @@ impl ProxyPlugin for PluginResponseRewrite {
             match h_cfg {
                 HeadersConfig::Simple(headers) => {
                     for (k, v) in headers {
-                        let val = self.expand_vars(session, v);
+                        let val = self.expand_vars(session, ctx, v);
                         upstream_response.insert_header(k.clone(), val)?;
                     }
                 }
@@ -174,13 +174,13 @@ impl ProxyPlugin for PluginResponseRewrite {
                     }
                     // Set
                     for (k, v) in set {
-                        let val = self.expand_vars(session, v);
+                        let val = self.expand_vars(session, ctx, v);
                         upstream_response.insert_header(k.clone(), val)?;
                     }
                     // Add
                     for entry in add {
                         if let Some((k, v)) = entry.split_once(':') {
-                            let val = self.expand_vars(session, v.trim());
+                            let val = self.expand_vars(session, ctx, v.trim());
                             upstream_response.append_header(k.trim().to_string(), val)?;
                         }
                     }
@@ -189,5 +189,77 @@ impl ProxyPlugin for PluginResponseRewrite {
         }
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::PluginResponseRewrite;
+
+    #[test]
+    fn expands_context_variables_and_preserves_unknown_variables() {
+        assert_eq!(
+            PluginResponseRewrite::expand_template(
+                "client=$remote_addr upstream=$upstream_addr id=$request_id unknown=$unknown",
+                "192.0.2.1",
+                Some("10.0.0.1:8080"),
+                Some("request-123"),
+            ),
+            "client=192.0.2.1 upstream=10.0.0.1:8080 id=request-123 unknown=$unknown"
+        );
+    }
+
+    #[test]
+    fn missing_context_variables_expand_to_empty_strings() {
+        assert_eq!(
+            PluginResponseRewrite::expand_template(
+                "$upstream_addr/$request_id/$unknown",
+                "192.0.2.1",
+                None,
+                None,
+            ),
+            "//$unknown"
+        );
+    }
+
+    #[test]
+    fn prefix_overlapping_variables_are_not_partially_rewritten() {
+        // `$remote_address` must not be rewritten by the `$remote_addr` prefix,
+        // and `$request_id_suffix` must not be rewritten by `$request_id`.
+        assert_eq!(
+            PluginResponseRewrite::expand_template(
+                "$remote_address-$request_id_suffix",
+                "192.0.2.1",
+                Some("10.0.0.1:8080"),
+                Some("req-1"),
+            ),
+            "$remote_address-$request_id_suffix"
+        );
+    }
+
+    #[test]
+    fn adjacent_known_variables_are_all_replaced() {
+        assert_eq!(
+            PluginResponseRewrite::expand_template(
+                "$remote_addr$upstream_addr$request_id",
+                "192.0.2.1",
+                Some("10.0.0.1:8080"),
+                Some("req-1"),
+            ),
+            "192.0.2.110.0.0.1:8080req-1"
+        );
+    }
+
+    #[test]
+    fn lone_dollar_sign_and_non_identifier_dollar_are_preserved() {
+        assert_eq!(
+            PluginResponseRewrite::expand_template(
+                "price=$5 and trailing=$",
+                "192.0.2.1",
+                None,
+                None,
+            ),
+            "price=$5 and trailing=$"
+        );
     }
 }

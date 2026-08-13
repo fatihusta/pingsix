@@ -9,13 +9,15 @@
 
 pub mod error;
 pub mod plugin;
+pub mod secret;
 pub mod status;
 
 // Re-export all public items so external modules can use `crate::core::*`
 pub use error::{ErrorContext, ProxyError, ProxyResult};
 pub use plugin::{
-    apply_regex_uri_template, constant_time_digest_eq, constant_time_eq, secret_digest,
-    sort_plugins_by_priority_desc, CompiledPluginPipeline, HealthCheckFingerprint, HealthCheckSpec,
-    PassiveOutcome, PluginCreateFn, ProxyContext, ProxyPlugin, ProxyPluginExecutor, RouteContext,
+    apply_regex_uri_template, sort_plugins_by_priority_desc, CompiledPluginPipeline,
+    HealthCheckFingerprint, HealthCheckSpec, PassiveOutcome, PluginCreateFn, PluginPhases,
+    ProxyContext, ProxyPlugin, ProxyPluginExecutor, RouteContext, SelectedUpstream,
     UpstreamSelection, UpstreamSelector,
 };
+pub use secret::{constant_time_digest_eq, constant_time_eq, secret_digest};

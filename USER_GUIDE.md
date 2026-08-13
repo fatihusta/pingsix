@@ -29,7 +29,7 @@ PingSIX is a high-performance API gateway built with Rust, designed for modern c
 - **High Performance**: Built with Rust and Tokio for exceptional throughput and low latency
 - **Dynamic Configuration**: Real-time configuration updates via etcd integration
 - **Flexible Routing**: Advanced request matching based on host, path, methods, and priorities
-- **Rich Plugin Ecosystem**: 20 built-in plugins for authentication, rate limiting, compression, and more
+- **Rich Plugin Ecosystem**: 25 built-in plugins for authentication, rate limiting, compression, and more
 - **Health Checking**: Active health checks for upstream services
 - **Observability**: Built-in Prometheus metrics and Sentry integration
 - **Admin API**: RESTful API for dynamic configuration management
@@ -253,9 +253,9 @@ the same fields (redaction is just `SecretOp::Redact` over that walk). So:
 
 1. Mark the field with `#[encrypt]` (or `#[encrypt(nested)]` / `#[encrypt(plugins)]`)
    on the config struct. This alone wires up encrypt, decrypt and redaction.
-2. For a plugin, register the plugin's `SECRETS_TRANSFORM` in
-   `PLUGIN_ENCRYPT_FIELDS` (`src/plugins/mod.rs`) so the resource's `plugins`
-   walk can reach it.
+2. For a plugin, add its `SECRETS_TRANSFORM` to that plugin's `PluginMeta`
+   entry in the `PLUGIN_META` inventory (`src/plugins/mod.rs`) so the resource's
+   `plugins` walk can reach it.
 
 There is no separate redaction list to maintain — masking follows the schema.
 
@@ -1344,7 +1344,7 @@ global_rules:
 
 ## Plugins
 
-PingSIX includes 20 built-in plugins for various functionalities:
+PingSIX includes 25 built-in plugins for various functionalities:
 
 ### Plugin Execution Order
 
@@ -1653,8 +1653,12 @@ plugins:
 
 **Variable Placeholders:**
 - `$remote_addr` - Client IP address
-- `$upstream_addr` - Upstream server address
-- `$request_id` - Request tracking ID (if request-id plugin is enabled)
+- `$upstream_addr` - Selected upstream server address (empty when no upstream was selected)
+- `$request_id` - Request tracking ID (empty unless the request-id plugin set it)
+
+Only these documented placeholders are expanded. Unknown `$name` placeholders
+are preserved literally, making configuration mistakes visible rather than
+silently changing header values.
 
 **Common Use Cases:**
 - Adding security headers (X-Content-Type-Options, X-Frame-Options)
@@ -1892,6 +1896,10 @@ plugins:
 - **Path Tracking Limit**: After tracking `max_unique_paths` unique normalized paths, new paths are collapsed to `/...` to prevent unbounded metric growth
 - **Efficient Tracking**: Uses DashMap for thread-safe path deduplication with minimal overhead
 
+**Process lifetime:** Prometheus collectors are process-global registrations.
+They are intentionally shared by repeated in-process gateway builds; metrics
+accumulate for the lifetime of the process rather than being reset per runtime.
+
 **Collected Metrics:**
 - `http_requests_total` (Counter) - Total number of client requests since PingSIX started
 - `http_status` (Counter) - HTTP status codes with labels: `code`, `route`, `path_template`, `matched_host`, `service`, `node`
@@ -1962,8 +1970,50 @@ plugins:
 
 ## Plugin Development
 
-New plugins live under `src/plugins/`. Register the factory in
-`src/plugins/mod.rs` (`PLUGIN_BUILDER_REGISTRY`) and implement `ProxyPlugin`.
+New plugins live under `src/plugins/`. Add a `PluginMeta` entry to the
+`PLUGIN_META` inventory in `src/plugins/mod.rs` and implement `ProxyPlugin`.
+
+### Required Phase Declaration (Breaking Change)
+
+`ProxyPlugin` execution is fail-closed: the executor invokes a hook **only** if
+`phases()` includes its corresponding `PluginPhases` bit. The default is an
+empty set, so a hook implementation without an explicit declaration is never
+called. Existing source plugins must add declarations for every hook they
+implement before upgrading.
+
+```rust
+use async_trait::async_trait;
+use pingsix::core::{PluginPhases, ProxyContext, ProxyPlugin};
+
+struct MyPlugin;
+
+#[async_trait]
+impl ProxyPlugin for MyPlugin {
+    fn name(&self) -> &str { "my-plugin" }
+    fn priority(&self) -> i32 { 1000 }
+
+    fn phases(&self) -> PluginPhases {
+        PluginPhases::REQUEST | PluginPhases::RESPONSE
+    }
+
+    async fn request_filter(
+        &self,
+        _session: &mut Session,
+        _ctx: &mut ProxyContext,
+    ) -> pingora_error::Result<bool> {
+        Ok(false)
+    }
+}
+```
+
+The valid bits are `EARLY_REQUEST`, `REQUEST`, `UPSTREAM_REQUEST`,
+`REQUEST_BODY`, `RESPONSE`, `RESPONSE_BODY`, and `LOGGING`. The builtin phase
+registry test enforces this contract for every bundled plugin.
+
+`ProxyContext::selected` is now `Option<SelectedUpstream>`. Pingora owns the
+`HttpPeer` after upstream selection, so custom plugins must use the remaining
+`upstream`, `backend`, `sni`, and `node` fields rather than `selected.peer`.
+This is an intentional source-breaking migration.
 
 ### Encrypting Sensitive Plugin Fields
 
@@ -2003,11 +2053,18 @@ struct PluginConfig {
 }
 ```
 
-**2. Register** the exported transform in `PLUGIN_ENCRYPT_FIELDS`
-(`src/plugins/mod.rs`):
+**2. Register** the exported transform in the plugin's `PluginMeta` entry in
+`PLUGIN_META` (`src/plugins/mod.rs`):
 
 ```rust
-(my_plugin::PLUGIN_NAME, my_plugin::SECRETS_TRANSFORM),
+PluginMeta {
+    name: my_plugin::PLUGIN_NAME,
+    factory: PluginFactory::Plain(my_plugin::create_my_plugin),
+    secrets_transform: Some(my_plugin::SECRETS_TRANSFORM),
+    validate: None,
+    upstream_refs: None,
+    upstream_jobs: None,
+},
 ```
 
 `SECRETS_TRANSFORM` is a module-level `const` from `#[encrypt_fields(export)]`. Do not add a hand-written wrapper.

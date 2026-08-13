@@ -6,9 +6,10 @@ use std::{
 };
 
 use async_trait::async_trait;
-use futures::{future::join_all, FutureExt};
+use futures::future::join_all;
+#[cfg(test)]
+use futures::FutureExt;
 use hickory_resolver::TokioResolver;
-use once_cell::sync::OnceCell;
 use pingora::{protocols::ALPN, upstreams::peer::HttpPeer};
 use pingora_core::utils::tls::CertKey;
 use pingora_error::{BError, Error, ErrorType::InternalError, OrErr, Result};
@@ -23,14 +24,8 @@ use crate::{
     core::{ProxyError, ProxyResult},
 };
 
-static GLOBAL_RESOLVER: OnceCell<Arc<TokioResolver>> = OnceCell::new();
-
 /// Construct a DNS resolver for one gateway instance.
 pub(crate) fn build_resolver_for_state() -> ProxyResult<Arc<TokioResolver>> {
-    build_resolver()
-}
-
-fn build_resolver() -> ProxyResult<Arc<TokioResolver>> {
     let builder = TokioResolver::builder_tokio().map_err(|e| {
         ProxyError::Configuration(format!("Failed to create DNS resolver builder: {e}"))
     })?;
@@ -38,17 +33,6 @@ fn build_resolver() -> ProxyResult<Arc<TokioResolver>> {
         .build()
         .map_err(|e| ProxyError::Configuration(format!("Failed to build DNS resolver: {e}")))?;
     Ok(Arc::new(resolver))
-}
-
-/// The migration-period process-global resolver (first construction wins).
-fn get_global_resolver() -> ProxyResult<Arc<TokioResolver>> {
-    GLOBAL_RESOLVER.get_or_try_init(build_resolver).cloned()
-}
-
-/// [`get_global_resolver`] exposed to the upstream builder for the migration
-/// facade; the composition root constructs per-instance resolvers directly.
-pub(crate) fn get_global_resolver_for_build() -> ProxyResult<Arc<TokioResolver>> {
-    get_global_resolver()
 }
 
 /// Loads a client certificate and key from PEM format strings.
@@ -279,6 +263,7 @@ pub(crate) struct PreparedUpstream {
 
 /// Resolve an upstream before candidate compilation. The timeout bounds all DNS
 /// lookups in this upstream; a DNS-only upstream with no result is not publishable.
+#[cfg(test)]
 pub(crate) fn prepare_static_upstream(
     upstream: &Upstream,
     resolver: &Arc<TokioResolver>,
@@ -423,15 +408,6 @@ impl ServiceDiscovery for HybridDiscovery {
         }
 
         Ok((backends, health_checks))
-    }
-}
-
-impl TryFrom<Upstream> for HybridDiscovery {
-    type Error = ProxyError;
-
-    /// Migration facade: resolve through the process-global resolver.
-    fn try_from(upstream: Upstream) -> ProxyResult<Self> {
-        Self::build(upstream, get_global_resolver()?)
     }
 }
 
@@ -621,7 +597,7 @@ mod tests {
     #[test]
     fn dns_discovery_serves_lkg_backends_within_stale_ttl() {
         // A transient resolver failure must not evict a recently-good node.
-        let resolver = get_global_resolver().unwrap();
+        let resolver = build_resolver_for_state().unwrap();
         let discovery = DnsDiscovery::new(
             DnsNode {
                 domain: "does-not-resolve.example.test".into(),
@@ -772,7 +748,8 @@ mod tests {
             upstream_host: None,
             tls: Some(sample_tls("CERTDATA", "PRIVATE-KEY-MATERIAL")),
         };
-        let result: ProxyResult<HybridDiscovery> = upstream.try_into();
+        let resolver = build_resolver_for_state().unwrap();
+        let result = HybridDiscovery::build(upstream, resolver);
         assert!(
             result.is_err(),
             "garbage TLS material must reject the upstream"

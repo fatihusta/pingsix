@@ -12,7 +12,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
 
 use crate::{
-    core::{ProxyContext, ProxyError, ProxyPlugin, ProxyResult},
+    core::{PluginPhases, ProxyContext, ProxyError, ProxyPlugin, ProxyResult},
     utils::{request, response::ResponseBuilder},
 };
 
@@ -220,6 +220,9 @@ impl ProxyPlugin for PluginJWTAuth {
 
     fn priority(&self) -> i32 {
         PRIORITY
+    }
+    fn phases(&self) -> PluginPhases {
+        PluginPhases::REQUEST | PluginPhases::RESPONSE
     }
 
     async fn request_filter(&self, session: &mut Session, ctx: &mut ProxyContext) -> Result<bool> {
@@ -439,7 +442,7 @@ mod tests {
             "header": "authorization",
         });
         // Encryption disabled → plaintext pass-through.
-        PluginConfig::transform_secrets(&mut cfg, SecretOp::Decrypt, &KeyringService::global())
+        PluginConfig::transform_secrets(&mut cfg, SecretOp::Decrypt, &KeyringService::disabled())
             .unwrap();
         assert_eq!(cfg["secret"], "hmac-secret");
         assert_eq!(
@@ -455,9 +458,12 @@ mod tests {
             "secret": format!("{CIPHERTEXT_PREFIX}deadbeef"),
             "public_key": "-----BEGIN PUBLIC KEY-----\nABC\n-----END PUBLIC KEY-----",
         });
-        let err =
-            PluginConfig::transform_secrets(&mut cfg, SecretOp::Decrypt, &KeyringService::global())
-                .unwrap_err();
+        let err = PluginConfig::transform_secrets(
+            &mut cfg,
+            SecretOp::Decrypt,
+            &KeyringService::disabled(),
+        )
+        .unwrap_err();
         assert!(
             err.to_string().contains("data_encryption is disabled")
                 || err.to_string().contains("Encrypted value"),
@@ -474,11 +480,16 @@ mod tests {
     fn secrets_transform_const_matches_trait_method() {
         let mut via_const = serde_json::json!({ "secret": "s" });
         let mut via_trait = via_const.clone();
-        (SECRETS_TRANSFORM)(&mut via_const, SecretOp::Decrypt, &KeyringService::global()).unwrap();
+        (SECRETS_TRANSFORM)(
+            &mut via_const,
+            SecretOp::Decrypt,
+            &KeyringService::disabled(),
+        )
+        .unwrap();
         PluginConfig::transform_secrets(
             &mut via_trait,
             SecretOp::Decrypt,
-            &KeyringService::global(),
+            &KeyringService::disabled(),
         )
         .unwrap();
         assert_eq!(via_const, via_trait);

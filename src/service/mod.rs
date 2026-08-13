@@ -47,6 +47,15 @@ const PINGSIX_SERVICE: &str = "pingsix";
 /// builds in one process never share readiness, published snapshots, defaults,
 /// encryption keyrings, cache namespaces, health-check registries, or DNS
 /// resolvers.
+///
+/// Process-level statics that remain (not gateway state):
+/// - Pingora cache objects leaked by [`CacheRuntime`] (`'static` API). This is
+///   intentional: Pingora eviction and stale-revalidation tasks may retain the
+///   references, so reclaiming them before process exit would be unsound.
+/// - Prometheus `register_*` collectors (cache, logging, limit-count,
+///   proxy-mirror, prometheus plugin, graph mutation)
+/// - plugin metadata inventory (compile-time closed builtin declarations)
+/// - the process logger (`init_logger` is first-wins)
 pub struct GatewayState {
     /// Readiness / etcd-sync status (status HTTP app, graph, etcd sync).
     pub status: Arc<StatusStore>,
@@ -68,7 +77,7 @@ pub struct GatewayState {
 
 impl GatewayState {
     /// Assemble a fresh state from configuration. Every component is
-    /// instance-owned: nothing here reads the process-global facades.
+    /// instance-owned: nothing here reads process-global gateway facades.
     pub fn build(config: &Config) -> Result<Self, String> {
         let defaults = EffectiveDefaults::from_pingsix(&config.pingsix);
         let status = Arc::new(StatusStore::new());
@@ -120,8 +129,8 @@ pub struct GatewayRuntime {
 impl GatewayRuntime {
     /// Build the full process from a loaded configuration.
     ///
-    /// Order is significant: process-global logging, then `pingsix.defaults` and data
-    /// encryption (plugins and upstream peers bake these in at construction),
+    /// Order is significant: process-global logging, then instance-owned
+    /// [`GatewayState`] (defaults, encryption, cache, health checks, DNS),
     /// then the configuration source (etcd graph or static YAML), then the
     /// server, services, and listeners. A failure here aborts startup before
     /// any listener accepts traffic.

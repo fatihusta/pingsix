@@ -40,5 +40,4 @@ pub(crate) enum TrafficSplitOwner {
 pub(crate) type PreparedUpstreams = HashMap<UpstreamOccurrence, discovery::PreparedUpstream>;
 
 // Re-export commonly used items
-pub use health_check::SHARED_HEALTH_CHECK_SERVICE;
 pub use load_balancer::ProxyUpstream;

@@ -661,6 +661,76 @@ impl EtcdGraphStore {
 
 #[async_trait]
 impl GraphStore for EtcdGraphStore {
+    async fn get_exact(&self, key: &ResourceKey) -> Result<Option<StoredResource>, StoreError> {
+        let mut client = self
+            .ensure_connected()
+            .await
+            .map_err(|e| StoreError::Unavailable { source: e })?;
+        let physical_key = self.with_prefix(&key.logical_path());
+        let response = client
+            .get(physical_key.as_bytes(), None)
+            .await
+            .map_err(|e| StoreError::Unavailable {
+                source: ProxyError::etcd_error_with_cause(
+                    format!("Failed to read resource '{physical_key}'"),
+                    e,
+                ),
+            })?;
+        Ok(response.kvs().first().map(|kv| StoredResource {
+            value: kv.value().to_vec(),
+            create_revision: kv.create_revision(),
+            mod_revision: kv.mod_revision(),
+        }))
+    }
+
+    async fn list_kind(
+        &self,
+        kind: ResourceKind,
+    ) -> Result<Vec<(ResourceKey, StoredResource)>, StoreError> {
+        let mut client = self
+            .ensure_connected()
+            .await
+            .map_err(|e| StoreError::Unavailable { source: e })?;
+        let physical_prefix = self.with_prefix(&format!("{}/", kind.as_str()));
+        let response = client
+            .get(
+                physical_prefix.as_bytes(),
+                Some(GetOptions::new().with_prefix()),
+            )
+            .await
+            .map_err(|e| StoreError::Unavailable {
+                source: ProxyError::etcd_error_with_cause(
+                    format!("Failed to list resources under '{physical_prefix}'"),
+                    e,
+                ),
+            })?;
+        response
+            .kvs()
+            .iter()
+            .map(|kv| {
+                let key = physical_key_to_resource_key(kv.key(), &self.canonical_prefix)
+                    .map_err(|message| StoreError::InvalidResponse { message })?;
+                if key.kind != kind {
+                    return Err(StoreError::InvalidResponse {
+                        message: format!(
+                            "resource '{}' is outside requested kind '{}'",
+                            key.logical_path(),
+                            kind.as_str()
+                        ),
+                    });
+                }
+                Ok((
+                    key,
+                    StoredResource {
+                        value: kv.value().to_vec(),
+                        create_revision: kv.create_revision(),
+                        mod_revision: kv.mod_revision(),
+                    },
+                ))
+            })
+            .collect()
+    }
+
     async fn snapshot(&self) -> Result<StoredGraph, StoreError> {
         let mut client = self
             .ensure_connected()
@@ -790,6 +860,26 @@ impl Default for InMemoryGraphStore {
 
 #[async_trait]
 impl GraphStore for InMemoryGraphStore {
+    async fn get_exact(&self, key: &ResourceKey) -> Result<Option<StoredResource>, StoreError> {
+        Ok(self.state.lock().await.graph.resources.get(key).cloned())
+    }
+
+    async fn list_kind(
+        &self,
+        kind: ResourceKind,
+    ) -> Result<Vec<(ResourceKey, StoredResource)>, StoreError> {
+        Ok(self
+            .state
+            .lock()
+            .await
+            .graph
+            .resources
+            .iter()
+            .filter(|(key, _)| key.kind == kind)
+            .map(|(key, resource)| (key.clone(), resource.clone()))
+            .collect())
+    }
+
     async fn snapshot(&self) -> Result<StoredGraph, StoreError> {
         Ok(self.state.lock().await.graph.clone())
     }

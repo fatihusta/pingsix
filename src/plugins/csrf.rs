@@ -15,8 +15,11 @@ use serde_json::Value as JsonValue;
 use sha2::Sha256;
 use validator::Validate;
 
-use crate::core::{constant_time_eq, ProxyContext, ProxyError, ProxyPlugin, ProxyResult};
 use crate::utils::{request, response::ResponseBuilder};
+use crate::{
+    core::{constant_time_eq, PluginPhases, ProxyContext, ProxyError, ProxyPlugin, ProxyResult},
+    plugins::config::parse_and_validate_plugin_config,
+};
 
 pub const PLUGIN_NAME: &str = "csrf";
 const PRIORITY: i32 = 2980;
@@ -56,9 +59,8 @@ impl PluginConfig {
 impl TryFrom<JsonValue> for PluginConfig {
     type Error = ProxyError;
     fn try_from(value: JsonValue) -> Result<Self, Self::Error> {
-        let config: PluginConfig = serde_json::from_value(value)
-            .map_err(|e| ProxyError::serialization_error("Invalid csrf plugin config", e))?;
-        config.validate()?;
+        let config: PluginConfig =
+            parse_and_validate_plugin_config(value, "Invalid csrf plugin config")?;
         Ok(config)
     }
 }
@@ -205,6 +207,9 @@ impl ProxyPlugin for PluginCsrf {
     fn priority(&self) -> i32 {
         PRIORITY
     }
+    fn phases(&self) -> PluginPhases {
+        PluginPhases::REQUEST | PluginPhases::RESPONSE
+    }
 
     async fn request_filter(&self, session: &mut Session, _ctx: &mut ProxyContext) -> Result<bool> {
         let method = &session.req_header().method;
@@ -300,7 +305,7 @@ mod tests {
             "name": "csrf-token",
             "expires": 7200,
         });
-        PluginConfig::transform_secrets(&mut cfg, SecretOp::Decrypt, &KeyringService::global())
+        PluginConfig::transform_secrets(&mut cfg, SecretOp::Decrypt, &KeyringService::disabled())
             .unwrap();
         assert_eq!(cfg["key"], "unit-test-key");
         assert_eq!(cfg["name"], "csrf-token");
