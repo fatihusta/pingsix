@@ -37,9 +37,9 @@ Dockerfile*
 docker-compose*.yml
 .dockerignore
 
-# Tests/benchmarks
+# Tests (benches/ must stay in context: Cargo.toml declares [[bench]] targets
+# that cargo needs to resolve when parsing the manifest)
 tests/
-benches/
 
 # CI/CD configuration (not needed inside image)
 .github/
