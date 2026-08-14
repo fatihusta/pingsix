@@ -833,11 +833,8 @@ impl ProxyPlugin for BodyRewriteProbe {
     async fn request_filter(&self, session: &mut Session, ctx: &mut ProxyContext) -> PResult<bool> {
         // 提前把整个请求体从下游读空(APISIX ngx.req.read_body 等价物)
         let mut buf = bytes::BytesMut::new();
-        loop {
-            match session.downstream_session.read_request_body().await? {
-                Some(chunk) => buf.extend_from_slice(&chunk),
-                None => break,
-            }
+        while let Some(chunk) = session.downstream_session.read_request_body().await? {
+            buf.extend_from_slice(&chunk);
         }
         *self.seen_original.lock().unwrap() = Some(buf.freeze());
         ctx.set("probe::replacement", self.replaced.clone());
