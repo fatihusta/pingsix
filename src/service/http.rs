@@ -187,9 +187,15 @@ impl ProxyHttp for HttpService {
     /// Filters incoming requests
     async fn request_filter(&self, session: &mut Session, ctx: &mut Self::CTX) -> Result<bool> {
         if ctx.route.is_none() {
-            session
-                .respond_error(StatusCode::NOT_FOUND.as_u16())
-                .await?;
+            crate::utils::response::send_exit_response(
+                session,
+                StatusCode::NOT_FOUND.as_u16(),
+                None,
+                None,
+                &[],
+                ctx,
+            )
+            .await?;
             return Ok(true);
         }
 
@@ -355,19 +361,23 @@ impl ProxyHttp for HttpService {
             .await
     }
 
-    /// Map plugin-raised body errors to client-facing status codes; otherwise
-    /// mirror Pingora's default error-code derivation.
+    /// Map plugin-raised errors to client-facing status codes; otherwise
+    /// mirror Pingora's default error-code derivation. Every status-bearing
+    /// error flows through the shared exit helper so a configured
+    /// `exit-transformer` can rewrite the response.
     async fn fail_to_proxy(
         &self,
         session: &mut Session,
         e: &Error,
-        _ctx: &mut Self::CTX,
+        ctx: &mut Self::CTX,
     ) -> FailToProxy {
         let code = error_status(e);
         if code > 0 {
-            session.respond_error(code).await.unwrap_or_else(|err| {
-                log::error!("failed to send error response to downstream: {err}");
-            });
+            crate::utils::response::send_exit_response(session, code, None, None, &[], ctx)
+                .await
+                .unwrap_or_else(|err| {
+                    log::error!("failed to send error response to downstream: {err}");
+                });
         }
 
         FailToProxy {

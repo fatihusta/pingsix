@@ -24,6 +24,40 @@ pub use upstream::{
     UpstreamSelector,
 };
 
+/// One declarative rewrite rule for gateway-generated error responses
+/// (APISIX `exit-transformer` semantics, expressed declaratively instead of
+/// Lua callbacks).
+///
+/// A rule matches when the gateway is about to send `codes` as an error
+/// status; it may then remap the status, replace the body, and add headers.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ExitTransformRule {
+    /// Gateway exit statuses this rule matches (e.g. 401, 502).
+    pub codes: Vec<u16>,
+    /// Replacement status code; the matched status is kept when `None`.
+    pub status_code: Option<u16>,
+    /// Replacement body with `$status`/`$message`/`$request_id` variables.
+    pub body: Option<String>,
+    /// Headers to add or override on the transformed response. A
+    /// `Content-Type` entry (case-insensitive) sets the transformed body's
+    /// content type instead of being inserted twice.
+    pub headers: Vec<(String, String)>,
+}
+
+/// Compiled configuration of the `exit-transformer` plugin: an ordered rule
+/// list evaluated first-match-wins against gateway exit statuses.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ExitTransform {
+    pub rules: Vec<ExitTransformRule>,
+}
+
+impl ExitTransform {
+    /// First rule matching `status`, if any.
+    pub fn matching(&self, status: u16) -> Option<&ExitTransformRule> {
+        self.rules.iter().find(|rule| rule.codes.contains(&status))
+    }
+}
+
 /// Bitmask of plugin lifecycle phases a plugin actually implements.
 ///
 /// Executors partition their plugin lists with this so hot-path phases skip
@@ -106,6 +140,16 @@ pub trait ProxyPlugin: Send + Sync {
     /// the default is no specs.
     fn health_check_specs(&self) -> Vec<HealthCheckSpec> {
         Vec::new()
+    }
+
+    /// Gateway-exit transformation rules contributed by this plugin.
+    ///
+    /// Only the `exit-transformer` plugin overrides this; the shared exit
+    /// response helper (`utils::response::send_exit_response`) consults it so
+    /// every gateway-generated rejection flows through one configurable path.
+    /// The default is no transformation.
+    fn exit_transform(&self) -> Option<&ExitTransform> {
+        None
     }
 
     /// Handle the incoming request in the access phase.

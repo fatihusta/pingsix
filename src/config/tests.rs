@@ -1437,3 +1437,72 @@ fn upstream_rejects_explicit_zero_port_in_list_form() {
         "parse error must explain the port rule: {err}"
     );
 }
+
+#[test]
+fn keepalive_pool_defaults_match_apisix() {
+    let pool: KeepalivePool = serde_json::from_value(serde_json::json!({})).unwrap();
+    assert_eq!(pool.size, 320);
+    assert_eq!(pool.idle_timeout_ms, 60_000);
+    assert_eq!(pool.requests, 1000);
+    assert!(!pool.has_unsupported_overrides());
+    assert!(pool.validate().is_ok());
+}
+
+#[test]
+fn keepalive_pool_accepts_fractional_idle_timeout_seconds() {
+    let pool: KeepalivePool = serde_json::from_value(serde_json::json!({
+        "size": 128, "idle_timeout": 90.5, "requests": 200
+    }))
+    .unwrap();
+    assert_eq!(pool.idle_timeout_ms, 90_500);
+    assert!(pool.has_unsupported_overrides());
+    assert!(pool.validate().is_ok());
+}
+
+#[test]
+fn keepalive_pool_rejects_invalid_values() {
+    assert!(serde_json::from_value::<KeepalivePool>(serde_json::json!({
+        "idle_timeout": -1
+    }))
+    .is_err());
+    let zero_size: KeepalivePool = serde_json::from_value(serde_json::json!({"size": 0})).unwrap();
+    assert!(zero_size.validate().is_err());
+    let zero_requests: KeepalivePool =
+        serde_json::from_value(serde_json::json!({"requests": 0})).unwrap();
+    assert!(zero_requests.validate().is_err());
+}
+
+#[test]
+fn keepalive_pool_round_trips_through_upstream_json() {
+    let upstream: Upstream = serde_json::from_value(serde_json::json!({
+        "nodes": {"127.0.0.1:8080": 1},
+        "keepalive_pool": {"idle_timeout": 30}
+    }))
+    .unwrap();
+    assert_eq!(
+        upstream.keepalive_pool.as_ref().map(|p| p.idle_timeout_ms),
+        Some(30_000)
+    );
+
+    // Round-trip back to JSON preserves the APISIX field name and unit.
+    let json = serde_json::to_value(&upstream).unwrap();
+    assert_eq!(json["keepalive_pool"]["idle_timeout"].as_f64(), Some(30.0));
+}
+
+#[test]
+fn keepalive_pool_typo_is_flagged_by_schema_warnings() {
+    let warnings = unrecognized_fields(
+        "upstreams",
+        &serde_json::json!({
+            "nodes": {"127.0.0.1:8080": 1},
+            "keepalive_pool": {"size": 10, "idle_timout": 30}
+        }),
+    );
+    assert_eq!(
+        warnings,
+        vec![FieldWarning {
+            path: "upstreams.keepalive_pool.idle_timout".into(),
+            suggestion: Some("idle_timeout"),
+        }]
+    );
+}

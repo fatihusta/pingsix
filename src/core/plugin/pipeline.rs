@@ -300,6 +300,13 @@ impl ProxyPluginExecutor {
         self.plugins.iter().any(|plugin| plugin.name() == name)
     }
 
+    /// Gateway-exit transformation rules contributed by a plugin in this layer.
+    pub fn exit_transform(&self) -> Option<&crate::core::ExitTransform> {
+        self.plugins
+            .iter()
+            .find_map(|plugin| plugin.exit_transform())
+    }
+
     /// Read-only access to the ordered plugin list.
     pub fn plugins(&self) -> &[Arc<dyn ProxyPlugin>] {
         &self.plugins
@@ -457,6 +464,17 @@ impl CompiledPluginPipeline {
     /// Whether either layer contains a plugin named `name` (e.g. CORS preflight).
     pub fn has_plugin(&self, name: &str) -> bool {
         self.global.has_plugin(name) || self.route.has_plugin(name)
+    }
+
+    /// Gateway-exit transformation rules for this request, if any.
+    ///
+    /// Route/service configuration wins over global rules (more specific
+    /// scope overrides the broader one), mirroring the layer-precedence policy
+    /// of the phase methods below.
+    pub fn exit_transform(&self) -> Option<&crate::core::ExitTransform> {
+        self.route
+            .exit_transform()
+            .or_else(|| self.global.exit_transform())
     }
 
     /// Run global-rule plugins then route/service plugins for `early_request_filter`.

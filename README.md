@@ -13,7 +13,7 @@ PingSIX is a modern API gateway designed for cloud-native environments, offering
 - 🚀 **High Performance**: Built with Rust and Tokio for exceptional throughput and low latency
 - 🔄 **Dynamic Configuration**: Real-time configuration updates via etcd integration
 - 🛣️ **Advanced Routing**: Flexible request matching based on host, path, methods, and priorities
-- 🔌 **Rich Plugin Ecosystem**: 25 built-in plugins with easy extensibility
+- 🔌 **Rich Plugin Ecosystem**: 28 built-in plugins with easy extensibility
 - 📊 **Observability**: Built-in Prometheus metrics and Sentry integration
 - 🔒 **Security**: JWT/API key authentication, IP restrictions, CORS support, circuit breaking
 - ⚡ **Load Balancing**: Multiple algorithms with active and passive health checking
@@ -85,7 +85,7 @@ curl http://localhost:8080/get
 
 ## 🔌 Plugin Ecosystem
 
-PingSIX includes 25 built-in plugins organized by category:
+PingSIX includes 28 built-in plugins organized by category:
 
 ### 🔐 Authentication & Security
 - **`jwt-auth`** - JWT token validation with multiple algorithms
@@ -93,7 +93,10 @@ PingSIX includes 25 built-in plugins organized by category:
 - **`basic-auth`** - HTTP Basic Authentication with constant-time comparison
 - **`csrf`** - CSRF protection using double-submit cookie pattern
 - **`ip-restriction`** - IP allowlist/blocklist with CIDR support
+- **`uri-blocker`** - URI regex blocklist (APISIX compatible)
+- **`request-validation`** - JSON Schema validation of request headers and bodies (APISIX compatible)
 - **`cors`** - Cross-Origin Resource Sharing with regex patterns
+- **`exit-transformer`** - Declarative rewriting of gateway-generated error responses
 
 ### 🚦 Traffic Management
 - **`limit-count`** - Request rate limiting with flexible keys
@@ -128,7 +131,7 @@ PingSIX includes 25 built-in plugins organized by category:
 PingSIX is built on a modular architecture with the following key components:
 
 - **Core Engine**: Built on Cloudflare's Pingora framework for high-performance HTTP handling
-- **Plugin System**: Extensible plugin architecture with 25 built-in plugins
+- **Plugin System**: Extensible plugin architecture with 28 built-in plugins
 - **Configuration Management**: Support for both static YAML and dynamic etcd-based configuration
 - **Admin API**: RESTful API for runtime configuration management
 - **Observability**: Built-in metrics, logging, and error tracking

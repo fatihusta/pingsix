@@ -149,6 +149,10 @@ pub struct Upstream {
     #[encrypt(nested)]
     #[validate(nested)]
     pub tls: Option<UpstreamTls>,
+    /// Per-upstream connection-pool tuning (APISIX `keepalive_pool`).
+    #[serde(default)]
+    #[validate(nested)]
+    pub keepalive_pool: Option<KeepalivePool>,
 }
 
 impl Upstream {
@@ -477,6 +481,82 @@ pub enum UpstreamPassHost {
     PASS,
     REWRITE,
     NODE,
+}
+
+/// Serde bridge mapping APISIX's fractional `idle_timeout` seconds onto an
+/// integer millisecond field so [`Upstream`] can keep deriving `Eq`.
+mod secs_f64_as_ms {
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    pub(crate) fn deserialize<'de, D>(deserializer: D) -> Result<u64, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let secs = f64::deserialize(deserializer)?;
+        if !secs.is_finite() || secs < 0.0 {
+            return Err(serde::de::Error::custom(
+                "keepalive_pool.idle_timeout must be a non-negative number",
+            ));
+        }
+        Ok((secs * 1000.0).round() as u64)
+    }
+
+    pub(crate) fn serialize<S>(millis: &u64, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_f64(*millis as f64 / 1000.0)
+    }
+}
+
+/// Per-upstream keepalive connection-pool settings, APISIX
+/// `keepalive_pool` schema compatible.
+///
+/// * `idle_timeout` (seconds, fractional allowed, default 60) maps onto
+///   Pingora's per-peer idle timeout: how long an idle upstream connection
+///   stays in the pool before it is closed.
+/// * `size` (default 320) and `requests` (default 1000) are accepted for
+///   APISIX schema compatibility. Pingora 0.8 does not expose per-upstream
+///   pool size or per-connection request caps, so non-default values log a
+///   warning at build time and the process-global
+///   `pingora.upstream_keepalive_pool_size` applies instead.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, Validate)]
+pub struct KeepalivePool {
+    /// Idle connections to keep per upstream (accepted, not enforced).
+    #[serde(default = "KeepalivePool::default_size")]
+    #[validate(range(min = 1))]
+    pub size: u32,
+    /// Seconds an idle connection is kept before closing.
+    #[serde(
+        default = "KeepalivePool::default_idle_timeout_ms",
+        rename = "idle_timeout",
+        with = "secs_f64_as_ms"
+    )]
+    #[validate(range(min = 0))]
+    pub idle_timeout_ms: u64,
+    /// Requests per connection before recycling (accepted, not enforced).
+    #[serde(default = "KeepalivePool::default_requests")]
+    #[validate(range(min = 1))]
+    pub requests: u32,
+}
+
+impl KeepalivePool {
+    pub(crate) fn default_size() -> u32 {
+        320
+    }
+
+    pub(crate) fn default_idle_timeout_ms() -> u64 {
+        60_000
+    }
+
+    pub(crate) fn default_requests() -> u32 {
+        1000
+    }
+
+    /// Whether any accepted-but-unenforced knob deviates from its default.
+    pub(crate) fn has_unsupported_overrides(&self) -> bool {
+        self.size != Self::default_size() || self.requests != Self::default_requests()
+    }
 }
 
 #[derive(Clone, Default, Debug, PartialEq, Eq, Serialize, Deserialize, Validate, EncryptFields)]

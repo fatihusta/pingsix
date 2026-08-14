@@ -327,6 +327,7 @@ mod tests {
             pass_host: UpstreamPassHost::PASS,
             upstream_host: None,
             tls: None,
+            keepalive_pool: None,
         }
     }
 

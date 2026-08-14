@@ -29,7 +29,7 @@ PingSIX is a high-performance API gateway built with Rust, designed for modern c
 - **High Performance**: Built with Rust and Tokio for exceptional throughput and low latency
 - **Dynamic Configuration**: Real-time configuration updates via etcd integration
 - **Flexible Routing**: Advanced request matching based on host, path, methods, and priorities
-- **Rich Plugin Ecosystem**: 25 built-in plugins for authentication, rate limiting, compression, and more
+- **Rich Plugin Ecosystem**: 28 built-in plugins for authentication, rate limiting, compression, and more
 - **Health Checking**: Active health checks for upstream services
 - **Observability**: Built-in Prometheus metrics and Sentry integration
 - **Admin API**: RESTful API for dynamic configuration management
@@ -1298,6 +1298,35 @@ upstreams:
 - **`rewrite`**: Replace the Host header with the value specified in `upstream_host`
 - **`node`**: Use the upstream node's hostname as the Host header
 
+### Keepalive Connection Pool (keepalive_pool)
+
+APISIX `keepalive_pool` schema compatible, per upstream:
+
+```yaml
+upstreams:
+  - id: "pooled-upstream"
+    nodes:
+      "backend.local:8080": 1
+    keepalive_pool:
+      size: 320                    # Idle connections to keep (APISIX compat, see note)
+      idle_timeout: 60             # Seconds before an idle connection is closed
+      requests: 1000               # Requests per connection (APISIX compat, see note)
+```
+
+- **`idle_timeout`** (seconds, fractional values allowed, default `60`, minimum `0`)
+  maps onto Pingora's per-peer idle timeout: how long an idle upstream
+  connection stays reusable before it is closed. Lower it for fast-churning
+  backends, raise it to maximize connection reuse behind slow handshakes.
+- **`size`** (default `320`) and **`requests`** (default `1000`) are accepted
+  for APISIX configuration compatibility. Pingora 0.8 does not expose
+  per-upstream pool size or per-connection request caps, so non-default
+  values log a build-time warning and the process-global
+  `pingora.upstream_keepalive_pool_size` applies instead.
+
+Route-level `timeout` overrides still apply to `connect`/`read`/`write` on
+the same connections; `idle_timeout` is independent and survives route
+override.
+
 ## Services
 
 Services provide reusable configurations:
@@ -1344,7 +1373,7 @@ global_rules:
 
 ## Plugins
 
-PingSIX includes 25 built-in plugins for various functionalities:
+PingSIX includes 28 built-in plugins for various functionalities:
 
 ### Plugin Execution Order
 
@@ -1455,6 +1484,29 @@ plugins:
 ```
 
 When every hop in XFF is trusted, PingSIX returns the leftmost address (farthest trusted source).
+
+#### URI Blocker (uri-blocker)
+
+APISIX `uri-blocker` compatible. Intercepts requests whose URI (path plus
+query string, like nginx `$request_uri`) matches any configured regex and
+rejects them. Matches are unanchored: a rule matches when the pattern occurs
+anywhere in the URI.
+
+```yaml
+plugins:
+  uri-blocker:
+    block_rules:                   # Regex list, matched against path + query
+      - "^/admin"
+      - "token=[0-9]+"
+      - "\\.sql$"
+    rejected_code: 403             # Status for blocked requests (200-599)
+    rejected_msg: "blocked"        # JSON body: {"error_msg":"blocked"} when set
+    case_insensitive: false        # Compile all rules case-insensitively
+```
+
+With `rejected_msg` set the rejection body is `{"error_msg": "..."}` with
+`Content-Type: application/json`; otherwise the body is empty. Duplicate
+rules are rejected at configuration time, as are invalid regexes.
 
 #### CORS (Cross-Origin Resource Sharing)
 ```yaml
@@ -1755,6 +1807,80 @@ plugins:
 Rejects requests whose body exceeds `max_body_size` with `413 Payload Too
 Large`. A declared `Content-Length` is rejected immediately; chunked or lying
 bodies are caught by counting streamed bytes.
+
+#### Request Validation (request-validation)
+
+APISIX `request-validation` compatible. Validates requests against JSON
+Schemas before they reach the upstream. At least one of `header_schema` or
+`body_schema` is required; schemas are compiled at configuration time, so an
+invalid schema fails the update instead of failing requests.
+
+```yaml
+plugins:
+  request-validation:
+    header_schema:                # JSON Schema for the request headers
+      type: object
+      required: ["X-Api-Version"]
+      properties:
+        X-Api-Version:
+          type: string
+          pattern: "^v[0-9]+$"
+    body_schema:                  # JSON Schema for the decoded request body
+      type: object
+      required: ["quantity"]
+      properties:
+        quantity:
+          type: integer
+          minimum: 1
+    max_req_body_size: 67108864   # Body buffer cap in bytes (default 64 MiB)
+    rejected_code: 400             # Status for rejected requests (200-599)
+    rejected_msg: "invalid request" # Rejection body (default: first schema error)
+```
+
+Semantics (APISIX parity):
+
+- Headers are validated as a JSON object: single-valued headers become
+  strings and repeated headers become arrays. Names are canonicalized to
+  title case (`User-Agent`), matching what browsers send and APISIX sees.
+- The body is **buffered and never forwarded** until it validates.
+  `application/x-www-form-urlencoded` bodies are decoded as form objects
+  (duplicate keys become arrays); anything else is parsed as JSON, the APISIX
+  default.
+- With `body_schema` set, a request without a body is rejected (fail-closed),
+  as is a duplicated `Content-Type` header.
+- Body-phase rejections carry `rejected_code` over Pingora's error path with
+  an empty body; configure an `exit-transformer` rule when you need a body
+  there. A `$ref` to a remote schema document is rejected at configuration
+  time — validation is strictly offline.
+
+#### Gateway Exit Transformer (exit-transformer)
+
+Declarative counterpart of APISIX's `exit-transformer`: rewrites responses
+**generated by the gateway itself** — authentication failures, rate-limit
+rejections, blocked URIs, upstream 502/504s, no-route 404s — before they
+reach the client. Upstream responses are not affected; use
+  `response-rewrite` for those.
+
+```yaml
+plugins:
+  exit-transformer:
+    rules:                        # First match wins on the exit status
+      - codes: [401, 403]
+        status_code: 403          # Optional remap of the status
+        body: '{"error":true,"status":$status,"message":"$message"}'
+        headers:
+          Content-Type: application/json   # Sets the rewritten body's type
+          X-Error-Code: "$status"
+      - codes: [502, 504]
+        body: "upstream unavailable (request $request_id)"
+```
+
+- `codes` lists the gateway exit statuses a rule matches (first-match-wins).
+- `body`/header values support `$status` (final status), `$message`
+  (original exit body when one exists), and `$request_id`.
+- Route-level rules override global-rule rules when both configure the
+  plugin. Because the rewrite runs in the shared exit path, the plugin needs
+  no phase of its own and never delays the hot path.
 
 #### WebSocket Support (enable_websocket)
 ```yaml

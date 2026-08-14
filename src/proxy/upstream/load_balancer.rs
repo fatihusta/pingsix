@@ -280,6 +280,16 @@ impl ProxyUpstream {
         }
 
         let cache_origin_fingerprint = cache_origin_fingerprint(&upstream);
+        if let Some(keepalive) = &upstream.keepalive_pool {
+            if keepalive.has_unsupported_overrides() {
+                log::warn!(
+                    "upstream '{}': keepalive_pool.size/requests are accepted for APISIX \
+                     compatibility but not enforced; the process-global \
+                     pingora.upstream_keepalive_pool_size applies",
+                    upstream.id
+                );
+            }
+        }
         let lb = SelectionLB::from_prepared(upstream.clone(), prepared, defaults, resolver)
             .map_err(|e| {
                 ProxyError::Configuration(format!("Failed to create load balancer: {e}"))
@@ -379,7 +389,8 @@ impl ProxyUpstream {
         backend
     }
 
-    /// Sets the finite upstream/global/built-in timeout for an `HttpPeer`.
+    /// Sets the finite upstream/global/built-in timeout for an `HttpPeer`,
+    /// plus the per-upstream keepalive idle timeout when configured.
     fn set_timeout(&self, p: &mut HttpPeer) {
         let config::Timeout {
             connect,
@@ -392,6 +403,9 @@ impl ProxyUpstream {
         p.options.connection_timeout = Some(Duration::from_secs(connect));
         p.options.read_timeout = Some(Duration::from_secs(read));
         p.options.write_timeout = Some(Duration::from_secs(send));
+        if let Some(keepalive) = &self.inner.keepalive_pool {
+            p.options.idle_timeout = Some(Duration::from_millis(keepalive.idle_timeout_ms));
+        }
     }
 
     /// Hash key for the session-aware selection algorithms.
@@ -745,6 +759,7 @@ mod tests {
             pass_host: UpstreamPassHost::PASS,
             upstream_host: None,
             tls: None,
+            keepalive_pool: None,
         }
     }
 
@@ -767,6 +782,31 @@ mod tests {
         );
         assert_eq!(peer.options.read_timeout, Some(Duration::from_secs(30)));
         assert_eq!(peer.options.write_timeout, Some(Duration::from_secs(30)));
+    }
+
+    #[test]
+    fn keepalive_idle_timeout_applied_to_peer() {
+        let mut upstream = sample_upstream("pooled", None);
+        upstream.keepalive_pool = Some(crate::config::KeepalivePool {
+            size: 320,
+            idle_timeout_ms: 15_000,
+            requests: 1000,
+        });
+        let built = ProxyUpstream::build_static(upstream).unwrap();
+        let backend = built.select_backend_for_test().unwrap();
+        let peer = backend.ext.get::<HttpPeer>().unwrap();
+        assert_eq!(
+            peer.options.idle_timeout,
+            Some(Duration::from_millis(15_000))
+        );
+    }
+
+    #[test]
+    fn keepalive_absent_leaves_peer_idle_timeout_unset() {
+        let upstream = ProxyUpstream::build_static(sample_upstream("plain", None)).unwrap();
+        let backend = upstream.select_backend_for_test().unwrap();
+        let peer = backend.ext.get::<HttpPeer>().unwrap();
+        assert_eq!(peer.options.idle_timeout, None);
     }
 
     #[test]

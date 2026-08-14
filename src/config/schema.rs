@@ -49,12 +49,14 @@ pub(crate) fn schema_for(id: &str) -> Option<&'static ResourceSchema> {
             "pass_host",
             "upstream_host",
             "tls",
+            "keepalive_pool",
             "metadata",
         ],
         nested: &[
             ("timeout", "timeout"),
             ("checks", "health_check"),
             ("tls", "upstream_tls"),
+            ("keepalive_pool", "keepalive_pool"),
         ],
     };
     const SERVICE: ResourceSchema = ResourceSchema {
@@ -83,6 +85,10 @@ pub(crate) fn schema_for(id: &str) -> Option<&'static ResourceSchema> {
     };
     const UPSTREAM_TLS: ResourceSchema = ResourceSchema {
         fields: &["client_cert", "client_key"],
+        nested: &[],
+    };
+    const KEEPALIVE_POOL: ResourceSchema = ResourceSchema {
+        fields: &["size", "idle_timeout", "requests"],
         nested: &[],
     };
     const HEALTH_CHECK: ResourceSchema = ResourceSchema {
@@ -134,6 +140,7 @@ pub(crate) fn schema_for(id: &str) -> Option<&'static ResourceSchema> {
         "ssl" => Some(&SSL),
         "timeout" => Some(&TIMEOUT),
         "upstream_tls" => Some(&UPSTREAM_TLS),
+        "keepalive_pool" => Some(&KEEPALIVE_POOL),
         "health_check" => Some(&HEALTH_CHECK),
         "active_check" => Some(&ACTIVE_CHECK),
         "health" => Some(&HEALTH),

@@ -266,6 +266,7 @@ mod dependency_invalidation {
             pass_host: UpstreamPassHost::PASS,
             upstream_host: None,
             tls: None,
+            keepalive_pool: None,
         }
     }
 

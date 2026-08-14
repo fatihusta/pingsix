@@ -747,6 +747,7 @@ mod tests {
             pass_host: UpstreamPassHost::PASS,
             upstream_host: None,
             tls: Some(sample_tls("CERTDATA", "PRIVATE-KEY-MATERIAL")),
+            keepalive_pool: None,
         };
         let resolver = build_resolver_for_state().unwrap();
         let result = HybridDiscovery::build(upstream, resolver);

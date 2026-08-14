@@ -8,6 +8,7 @@ pub(crate) mod config;
 pub mod cors;
 pub mod csrf;
 pub mod echo;
+pub mod exit_transformer;
 pub mod fault_injection;
 pub mod file_logger;
 pub mod grpc_web;
@@ -24,8 +25,10 @@ pub mod proxy_mirror;
 pub mod proxy_rewrite;
 pub mod redirect;
 pub mod request_id;
+pub mod request_validation;
 pub mod response_rewrite;
 pub mod traffic_split;
+pub mod uri_blocker;
 
 use std::{collections::HashMap, sync::Arc};
 
@@ -105,6 +108,14 @@ static PLUGIN_META: &[PluginMeta] = &[
         upstream_jobs: None,
     },
     PluginMeta {
+        name: exit_transformer::PLUGIN_NAME,
+        factory: PluginFactory::Plain(exit_transformer::create_exit_transformer_plugin),
+        secrets_transform: None,
+        validate: None,
+        upstream_refs: None,
+        upstream_jobs: None,
+    },
+    PluginMeta {
         name: request_id::PLUGIN_NAME,
         factory: PluginFactory::Plain(request_id::create_request_id_plugin),
         secrets_transform: None,
@@ -131,6 +142,22 @@ static PLUGIN_META: &[PluginMeta] = &[
     PluginMeta {
         name: ip_restriction::PLUGIN_NAME,
         factory: PluginFactory::Plain(ip_restriction::create_ip_restriction_plugin),
+        secrets_transform: None,
+        validate: None,
+        upstream_refs: None,
+        upstream_jobs: None,
+    },
+    PluginMeta {
+        name: uri_blocker::PLUGIN_NAME,
+        factory: PluginFactory::Plain(uri_blocker::create_uri_blocker_plugin),
+        secrets_transform: None,
+        validate: None,
+        upstream_refs: None,
+        upstream_jobs: None,
+    },
+    PluginMeta {
+        name: request_validation::PLUGIN_NAME,
+        factory: PluginFactory::Plain(request_validation::create_request_validation_plugin),
         secrets_transform: None,
         validate: None,
         upstream_refs: None,
@@ -421,6 +448,14 @@ pub fn build_plugin(
     }
 }
 
+/// Public plugin construction by name for embedders and integration tests.
+///
+/// Mirrors the internal registry lookup: unknown plugins and invalid
+/// configurations fail loudly.
+pub fn build_plugin_by_name(name: &str, cfg: JsonValue) -> ProxyResult<Arc<dyn ProxyPlugin>> {
+    build_plugin(name, cfg, &crate::config::EffectiveDefaults::default())
+}
+
 #[cfg(test)]
 mod builtin_phases_tests {
     use super::*;
@@ -438,10 +473,16 @@ mod builtin_phases_tests {
                 client_control::PLUGIN_NAME,
                 request | PluginPhases::REQUEST_BODY,
             ),
+            (exit_transformer::PLUGIN_NAME, PluginPhases::empty()),
             (request_id::PLUGIN_NAME, request | PluginPhases::RESPONSE),
             (fault_injection::PLUGIN_NAME, request),
             (cors::PLUGIN_NAME, request | PluginPhases::RESPONSE),
             (ip_restriction::PLUGIN_NAME, request),
+            (uri_blocker::PLUGIN_NAME, request),
+            (
+                request_validation::PLUGIN_NAME,
+                request | PluginPhases::REQUEST_BODY,
+            ),
             (csrf::PLUGIN_NAME, request | PluginPhases::RESPONSE),
             (basic_auth::PLUGIN_NAME, request),
             (jwt_auth::PLUGIN_NAME, request | PluginPhases::RESPONSE),
@@ -487,6 +528,9 @@ mod builtin_phases_tests {
             "proxy-mirror" => json!({"host": "http://127.0.0.1:9797"}),
             "echo" => json!({"body": "ok"}),
             "redirect" => json!({"uri": "/next", "regex_uri": []}),
+            "uri-blocker" => json!({"block_rules": ["/blocked"]}),
+            "request-validation" => json!({"header_schema": {"type": "object"}}),
+            "exit-transformer" => json!({"rules": [{"codes": [404]}]}),
             _ => json!({}),
         }
     }
