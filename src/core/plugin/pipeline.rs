@@ -18,6 +18,10 @@ use crate::core::error::ProxyResult;
 use super::upstream::{SelectedUpstream, UpstreamSelection, UpstreamSelector};
 use super::{sort_plugins_by_priority_desc, PluginPhases, ProxyPlugin};
 
+/// Context key for the generic "request body was replaced by a plugin" marker
+/// (see [`ProxyContext::mark_request_body_replaced`]).
+const REQUEST_BODY_REPLACED_KEY: &str = "core::request_body_replaced";
+
 /// Trait for route behavior that can be used in proxy context.
 ///
 /// Lives next to [`ProxyPluginExecutor`] because `build_plugin_executor`
@@ -151,6 +155,34 @@ impl ProxyContext {
             .as_ref()
             .and_then(|vars| vars.get(key))
             .and_then(|v| v.downcast_ref::<T>())
+    }
+
+    /// Get a typed mutable reference from the context with type safety.
+    ///
+    /// Mirrors [`Self::get`] for plugins that accumulate state across phase
+    /// invocations (e.g. buffered request bodies).
+    pub fn get_mut<T: Any>(&mut self, key: &str) -> Option<&mut T> {
+        self.vars
+            .as_mut()
+            .and_then(|vars| vars.get_mut(key))
+            .and_then(|v| v.downcast_mut::<T>())
+    }
+
+    /// Mark that a plugin has replaced the request body the client sent with
+    /// a gateway-generated one (e.g. provider-format transformation).
+    ///
+    /// Body-buffering/-validating plugins consult this so client-format
+    /// schemas are not applied to the replacement; the marker is generic so
+    /// no plugin needs to know which transformer produced the body.
+    pub fn mark_request_body_replaced(&mut self) {
+        self.set(REQUEST_BODY_REPLACED_KEY, true);
+    }
+
+    /// Whether a plugin replaced the client request body on this context.
+    pub fn request_body_replaced(&self) -> bool {
+        self.get::<bool>(REQUEST_BODY_REPLACED_KEY)
+            .copied()
+            .unwrap_or(false)
     }
 
     /// Convenience method for string values to avoid repeated type annotation.

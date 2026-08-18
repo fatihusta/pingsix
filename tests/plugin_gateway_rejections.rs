@@ -232,7 +232,13 @@ async fn request_validation_passes_valid_json_body_through_whole() {
         .request_body_filter(&mut session, &mut first, false, &mut ctx)
         .await
         .expect("chunk accepted");
-    assert!(first.is_none(), "chunk is withheld until validation");
+    // The chunk content is withheld, but an empty-but-present placeholder
+    // must remain: a None body would tell pingora the upstream body is
+    // finished (terminating chunk / END_STREAM) mid-stream.
+    assert!(
+        first.is_some_and(|chunk| chunk.is_empty()),
+        "chunk is withheld until validation, stream kept open"
+    );
 
     let mut second = Some(Bytes::from_static(b"\"sku\": \"a\"}"));
     plugin

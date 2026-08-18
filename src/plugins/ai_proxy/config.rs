@@ -12,6 +12,7 @@
 
 use std::collections::BTreeMap;
 
+use http::{HeaderName, HeaderValue};
 use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
 use validator::Validate;
@@ -121,6 +122,26 @@ pub(crate) struct LlmOptions {
     pub(crate) max_tokens: u64,
 }
 
+/// Header names that must not appear in `auth.header`: they would fight the
+/// gateway's own request framing/rewriting (chunked transfer, provider
+/// Content-Type, Host/SNI) or, for hop-by-hop headers (RFC 9110 §7.6.1 plus
+/// the legacy `Keep-Alive`/`Proxy-Connection`), are not end-to-end and can
+/// disagree with the gateway's actual connection/framing state.
+const FORBIDDEN_AUTH_HEADERS: [&str; 12] = [
+    "host",
+    "content-length",
+    "transfer-encoding",
+    "content-type",
+    "connection",
+    "keep-alive",
+    "proxy-connection",
+    "te",
+    "trailer",
+    "upgrade",
+    "proxy-authenticate",
+    "proxy-authorization",
+];
+
 impl AiProxyConfig {
     /// Deserialize, run declarative validation, then the cross-field checks
     /// that validator cannot express.
@@ -151,6 +172,40 @@ impl AiProxyConfig {
                         "ai-proxy: {section}[{name:?}] must be a non-empty string"
                     )));
                 }
+            }
+        }
+        // Headers are injected verbatim on every request, so their legality
+        // is a config-time property, not a per-request failure: parse each
+        // name/value exactly like the runtime injection will, and reject the
+        // framing/hop-by-hop headers the gateway itself manages.
+        for (name, value) in &self.auth.header {
+            if FORBIDDEN_AUTH_HEADERS
+                .iter()
+                .any(|forbidden| name.eq_ignore_ascii_case(forbidden))
+            {
+                return Err(ProxyError::validation_error(format!(
+                    "ai-proxy: auth.header[{name:?}] is managed by the gateway and cannot be \
+                     overridden (managed: {FORBIDDEN_AUTH_HEADERS:?})"
+                )));
+            }
+            HeaderName::from_bytes(name.as_bytes()).map_err(|error| {
+                ProxyError::validation_error(format!(
+                    "ai-proxy: auth.header name {name:?} is not a valid HTTP header name: {error}"
+                ))
+            })?;
+            HeaderValue::from_str(value).map_err(|error| {
+                ProxyError::validation_error(format!(
+                    "ai-proxy: auth.header[{name:?}] is not a valid HTTP header value: {error}"
+                ))
+            })?;
+        }
+        // Query parameters are form-urlencoded, so any non-empty string is
+        // legal; still reject values that would encode to nothing usable.
+        for (name, value) in &self.auth.query {
+            if name.trim().is_empty() || value.trim().is_empty() {
+                return Err(ProxyError::validation_error(format!(
+                    "ai-proxy: auth.query[{name:?}] must be a non-empty string"
+                )));
             }
         }
 
@@ -313,6 +368,64 @@ mod tests {
             "auth": { "header": { "": "v" } }
         }));
         assert!(err.contains("auth.header"), "{err}");
+    }
+
+    fn header_config(entries: &[(&str, &str)]) -> JsonValue {
+        let header: serde_json::Map<String, JsonValue> = entries
+            .iter()
+            .map(|(name, value)| (name.to_string(), json!(value)))
+            .collect();
+        json!({ "provider": "openai", "auth": { "header": header } })
+    }
+
+    #[test]
+    fn invalid_auth_headers_are_rejected_at_config_time() {
+        // Illegal header names (whitespace, control characters).
+        for name in ["Bad Name", "a\nb", "x y"] {
+            let err = parse_err(header_config(&[(name, "v")]));
+            assert!(err.contains("auth.header"), "{name:?}: {err}");
+        }
+
+        // Illegal values (control characters are never header-safe).
+        let err = parse_err(header_config(&[("X-Key", "v\r\nHost: evil")]));
+        assert!(err.contains("auth.header"), "{err}");
+
+        // Gateway-managed framing headers and the full RFC 9110 hop-by-hop
+        // set (plus legacy keep-alive variants) cannot be overridden; the
+        // rejection is case-insensitive.
+        for name in [
+            "Host",
+            "Content-Length",
+            "Transfer-Encoding",
+            "Content-Type",
+            "Connection",
+            "Keep-Alive",
+            "Proxy-Connection",
+            "TE",
+            "Trailer",
+            "Upgrade",
+            "Proxy-Authenticate",
+            "proxy-authorization",
+        ] {
+            let err = parse_err(header_config(&[(name, "x")]));
+            assert!(err.contains("managed"), "{name}: {err}");
+        }
+
+        // Well-formed custom headers (incl. anthropic-version) pass.
+        parse_ok(header_config(&[
+            ("Authorization", "Bearer sk"),
+            ("x-api-key", "k"),
+            ("anthropic-version", "2023-06-01"),
+        ]));
+    }
+
+    #[test]
+    fn blank_auth_query_entries_are_rejected() {
+        let err = parse_err(json!({
+            "provider": "openai",
+            "auth": { "query": { "key": "   " } }
+        }));
+        assert!(err.contains("auth.query"), "{err}");
     }
 
     #[test]

@@ -10,16 +10,35 @@
 //!
 //! ```text
 //! request_filter          header-only checks (content-type, body declared),
-//!                         ctx flags, switch to the provider upstream
+//!                         claim the request (single-instance ownership,
+//!                         see below), switch to the provider upstream
 //! upstream_request_filter provider path/query, auth headers, and replace
 //!                         Content-Length with `Transfer-Encoding: chunked`
 //!                         (the upstream writer becomes length-agnostic)
 //! request_body_filter     buffer client chunks (bounded), transform at end
 //!                         of stream, inject the transformed body as one
-//!                         chunk
+//!                         chunk, mark the body as gateway-replaced
 //! ```
 //!
 //! The response side is pure passthrough (APISIX ai-proxy semantics).
+//!
+//! # Single-instance ownership
+//!
+//! The pipeline may compose a global-rule and a route/service plugin layer,
+//! and several scopes can configure `ai-proxy` at once. At most ONE instance
+//! may own a request; everything else (peer options, auth injection, body
+//! transform) is derived from the owning instance alone, so provider
+//! credentials, TLS flags, and transformations can never mix:
+//!
+//! * APISIX merge semantics: a route/service-scoped `ai-proxy` overrides a
+//!   global-rule one — the global instance yields before claiming whenever
+//!   the matched route carries its own instance (the check is an `Arc`
+//!   clone, not a rebuild).
+//! * The first remaining instance to run `request_filter` claims the request
+//!   by recording its identity token in [`AiProxyRequestState`]; any later
+//!   instance (e.g. a second global rule) becomes a no-op.
+//! * Every other hook re-checks the token, so a yielded instance never
+//!   touches the upstream request or the body stream.
 //!
 //! # Why chunked framing (and not rewrite Content-Length)
 //!
@@ -48,6 +67,7 @@ use http::HeaderMap;
 use pingora_error::{Error, ErrorType, Result};
 use pingora_http::RequestHeader;
 use pingora_proxy::Session;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use crate::core::{PluginPhases, ProxyContext, ProxyError, ProxyPlugin, UpstreamSelector};
@@ -57,8 +77,6 @@ use crate::proxy::upstream::ProxyUpstream;
 
 use config::AiProxyConfig;
 use provider::{provider_spec, Provider};
-
-pub(crate) use transform::TransformedRequest;
 
 use upstream::ResolvedEndpoint;
 
@@ -74,43 +92,63 @@ pub(crate) const PLUGIN_NAME: &str = "ai-proxy";
 /// request state. Ties break by name, putting ai-proxy first.
 const PRIORITY: i32 = 2900;
 
-/// ctx flag marking this request as ai-proxy-owned; set in `request_filter`
-/// and consumed by `upstream_request_filter` (skip guard) and
-/// [`HttpService::upstream_peer`](crate::service::http::HttpService).
-pub const CTX_KEY_ACTIVE: &str = "ai_proxy::active";
+/// ctx key holding the per-request [`AiProxyRequestState`]; written exactly
+/// once by the owning instance in `request_filter` and read by every later
+/// hook (including [`HttpService::upstream_peer`](crate::service::http::HttpService)).
+pub(crate) const CTX_KEY_STATE: &str = "ai_proxy::state";
 
-/// ctx key holding the [`TransformedRequest`] once the body has been
-/// transformed (set in the body filter at end of stream).
+/// Floor for the upstream read timeout on ai-proxy requests (seconds).
 ///
-/// Also consulted by request-validation (lower priority, same phase): when
-/// present, the body the client sent has been replaced, so client-format
-/// body schemas are skipped. The entry stays for the whole request because
-/// body-phase plugins run after injection.
-pub const CTX_KEY_TRANSFORMED: &str = "ai_proxy::transformed";
-
-/// ctx flag marking a streaming (`"stream": true`) request. Set at end of
-/// the body transform; observational in v1 (the read timeout is relaxed for
-/// every ai-proxy request — see [`CTX_KEY_RELAX_READ_TIMEOUT`]).
-pub const CTX_KEY_STREAMING: &str = "ai_proxy::streaming";
-
-/// ctx flag relaxing the upstream read timeout for this request.
-///
-/// Set for EVERY ai-proxy request: LLM upstreams legitimately go silent for
-/// long stretches — non-streaming completions before their first byte
-/// ("thinking"), streaming responses between SSE chunks — and pingora's
-/// `read_timeout` bounds the gap *between* reads, not the total duration.
-/// Connect/write timeouts still apply per `timeout`. A total-duration bound
+/// LLM upstreams legitimately go silent between reads — non-streaming
+/// completions before their first byte ("thinking"), SSE streams between
+/// chunks — and pingora's `read_timeout` bounds the gap *between* reads, not
+/// the total duration, so the configured value (often 30s) would kill live
+/// requests. The relaxation is therefore bounded by this generous floor: a
+/// stalled provider connection is dropped after at most this long, while
+/// `timeout` keeps bounding connect and write. A total-duration bound
 /// (`max_stream_duration_ms`) is v2.
-pub const CTX_KEY_RELAX_READ_TIMEOUT: &str = "ai_proxy::relax_read_timeout";
+pub(crate) const PROVIDER_READ_TIMEOUT_FLOOR_SECS: u64 = 600;
 
-/// ctx key holding the buffered (pre-transform) request body.
-const CTX_KEY_BODY_BUFFER: &str = "ai_proxy::body_buffer";
+/// Identity tokens for plugin instances (see [`AiProxyRequestState::token`]).
+fn next_instance_token() -> u64 {
+    static TOKENS: AtomicU64 = AtomicU64::new(1);
+    TOKENS.fetch_add(1, Ordering::Relaxed)
+}
 
-/// ctx flag marking `ssl_verify: false`; consumed by
-/// [`HttpService::upstream_peer`](crate::service::http::HttpService) to
-/// disable peer certificate verification (not expressible on the upstream
-/// resource, whose TLS block carries only client certificates).
-pub const CTX_KEY_INSECURE_TLS: &str = "ai_proxy::insecure_tls";
+/// Which configuration layer an instance was built from.
+///
+/// Route and service plugins share the route layer (services are merged into
+/// routes before execution), so only the global-rule layer needs separate
+/// treatment: it runs first and yields to a route-scoped instance.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum PluginScope {
+    /// Built from a global rule (runs before the route layer).
+    Global,
+    /// Built from a route or service (the route plugin layer).
+    Route,
+}
+
+/// Per-request ai-proxy state, owned by exactly one plugin instance.
+///
+/// Consolidating what used to be independent boolean/string ctx entries keeps
+/// ownership, TLS, streaming, and the body buffer consistent: a non-owning
+/// instance can never observe or mutate another instance's flags, and the
+/// claiming instance overwrites the whole state atomically.
+#[derive(Debug, Default)]
+pub(crate) struct AiProxyRequestState {
+    /// Identity token of the owning [`PluginAiProxy`] instance; every hook
+    /// compares it against its own token before acting.
+    pub(crate) token: u64,
+    /// `ssl_verify: false` of the owning instance — disables provider
+    /// certificate verification (not expressible on the upstream resource,
+    /// whose TLS block carries only client certificates).
+    pub(crate) insecure_tls: bool,
+    /// The final body carried `"stream": true`. Set at end of the body
+    /// transform; observational in v1.
+    pub(crate) streaming: bool,
+    /// Buffered (pre-transform) client body; taken out at end of stream.
+    pub(crate) body: BytesMut,
+}
 
 /// Anthropic Messages API version header value (APISIX docs' canonical).
 const ANTHROPIC_VERSION: &str = "2023-06-01";
@@ -121,6 +159,10 @@ pub struct PluginAiProxy {
     provider: Provider,
     endpoint: ResolvedEndpoint,
     upstream: Arc<ProxyUpstream>,
+    scope: PluginScope,
+    /// Unique identity of this instance; recorded in
+    /// [`AiProxyRequestState`] by the claiming instance.
+    token: u64,
 }
 
 impl PluginAiProxy {
@@ -128,6 +170,7 @@ impl PluginAiProxy {
         config: AiProxyConfig,
         endpoint: ResolvedEndpoint,
         upstream: Arc<ProxyUpstream>,
+        scope: PluginScope,
     ) -> Self {
         let provider = config.provider;
         Self {
@@ -135,7 +178,17 @@ impl PluginAiProxy {
             provider,
             endpoint,
             upstream,
+            scope,
+            token: next_instance_token(),
         }
+    }
+
+    /// Whether this instance owns the request: the state recorded at claim
+    /// time carries this instance's token. Non-owning instances (a global
+    /// instance that yielded, or a later duplicate) never touch the request.
+    fn owns_request(&self, ctx: &ProxyContext) -> bool {
+        ctx.get::<AiProxyRequestState>(CTX_KEY_STATE)
+            .is_some_and(|state| state.token == self.token)
     }
 
     /// Reject through the shared exit helper (exit-transformer applies).
@@ -173,6 +226,38 @@ fn request_declares_body(headers: &HeaderMap) -> bool {
         .and_then(|value| value.parse::<u64>().ok())
         .unwrap_or(0);
     chunked || content_length > 0
+}
+
+/// Validate the request Content-Type: `None` accepts, `Some(message)`
+/// rejects with a 400.
+///
+/// APISIX parity: an absent Content-Type defaults to JSON. A present one
+/// must be exactly `application/json` (case-insensitive; parameters such as
+/// `charset=utf-8` are allowed) — prefix look-alikes like `application/jsonp`
+/// are rejected, and a duplicated Content-Type is ambiguous, so the gateway
+/// and the provider could otherwise disagree about the body format.
+fn content_type_error(headers: &HeaderMap) -> Option<&'static str> {
+    let mut values = headers.get_all(http::header::CONTENT_TYPE).iter();
+    let first = values.next()?;
+    if values.next().is_some() {
+        return Some("ambiguous content-type: exactly one application/json value is required");
+    }
+    let is_json = first
+        .to_str()
+        .map(|value| {
+            value
+                .split(';')
+                .next()
+                .unwrap_or("")
+                .trim()
+                .eq_ignore_ascii_case("application/json")
+        })
+        .unwrap_or(false);
+    if is_json {
+        None
+    } else {
+        Some("unsupported content-type: only application/json is supported")
+    }
 }
 
 /// Merge query-parameter sources: client query (already on the upstream
@@ -235,28 +320,28 @@ impl ProxyPlugin for PluginAiProxy {
     }
 
     async fn request_filter(&self, session: &mut Session, ctx: &mut ProxyContext) -> Result<bool> {
-        // APISIX parity: absent Content-Type defaults to JSON; a present one
-        // must be application/json.
-        let content_type_json = session
-            .req_header()
-            .headers
-            .get(http::header::CONTENT_TYPE)
-            .and_then(|value| value.to_str().ok())
-            .map(|value| {
-                value
-                    .trim_start()
-                    .to_ascii_lowercase()
-                    .starts_with("application/json")
-            })
-            .unwrap_or(true);
-        if !content_type_json {
-            return Self::reject(
-                session,
-                ctx,
-                400,
-                "unsupported content-type: only application/json is supported",
-            )
-            .await;
+        // Single-instance ownership: at most one ai-proxy instance handles a
+        // request. An instance that already claimed makes this one a no-op,
+        // so credentials, TLS flags, and the body transform never mix.
+        if ctx.get::<AiProxyRequestState>(CTX_KEY_STATE).is_some() {
+            return Ok(false);
+        }
+        // APISIX merge semantics: a route-scoped ai-proxy overrides a
+        // global-rule one. When the matched route carries its own instance,
+        // the global instance yields before claiming (the check is an `Arc`
+        // clone, not a rebuild).
+        if self.scope == PluginScope::Global
+            && ctx
+                .route
+                .as_ref()
+                .is_some_and(|route| route.build_plugin_executor().has_plugin(PLUGIN_NAME))
+        {
+            log::debug!("ai-proxy: global instance yields to the route-scoped instance");
+            return Ok(false);
+        }
+
+        if let Some(message) = content_type_error(&session.req_header().headers) {
+            return Self::reject(session, ctx, 400, message).await;
         }
 
         if !request_declares_body(&session.req_header().headers) {
@@ -267,11 +352,15 @@ impl ProxyPlugin for PluginAiProxy {
         // fully draining it would deadlock pingora 0.8's h1 proxy loop (see
         // the module docs); the body is buffered and transformed in
         // `request_body_filter` instead.
-        ctx.set(CTX_KEY_ACTIVE, true);
-        ctx.set(CTX_KEY_RELAX_READ_TIMEOUT, true);
-        if !self.config.ssl_verify {
-            ctx.set(CTX_KEY_INSECURE_TLS, true);
-        }
+        ctx.set(
+            CTX_KEY_STATE,
+            AiProxyRequestState {
+                token: self.token,
+                insecure_tls: !self.config.ssl_verify,
+                streaming: false,
+                body: BytesMut::new(),
+            },
+        );
 
         // Switch this request onto the provider upstream.
         ctx.upstream_override = Some(self.upstream.clone() as Arc<dyn UpstreamSelector>);
@@ -285,8 +374,8 @@ impl ProxyPlugin for PluginAiProxy {
         ctx: &mut ProxyContext,
     ) -> Result<()> {
         // Only rewrite when this plugin owns the request (request_filter
-        // short-circuited otherwise).
-        if ctx.get::<bool>(CTX_KEY_ACTIVE).copied() != Some(true) {
+        // yields/no-ops otherwise).
+        if !self.owns_request(ctx) {
             return Ok(());
         }
 
@@ -351,23 +440,18 @@ impl ProxyPlugin for PluginAiProxy {
         end_of_stream: bool,
         ctx: &mut ProxyContext,
     ) -> Result<()> {
-        if ctx.get::<bool>(CTX_KEY_ACTIVE).copied() != Some(true) {
+        if !self.owns_request(ctx) {
             return Ok(());
         }
 
         // Swallow client chunks into the per-request buffer; nothing reaches
         // the provider before the transform (request-validation pattern).
         if let Some(chunk) = body.take() {
-            let buffer = ctx
-                .vars
-                .get_or_insert_with(Default::default)
-                .entry(CTX_KEY_BODY_BUFFER.to_string())
-                .or_insert_with(|| Box::new(BytesMut::new()));
-            let buffer = buffer
-                .downcast_mut::<BytesMut>()
-                .expect("ai-proxy body buffer");
-            buffer.extend_from_slice(&chunk);
-            if buffer.len() as u64 > self.config.max_req_body_size {
+            let state = ctx
+                .get_mut::<AiProxyRequestState>(CTX_KEY_STATE)
+                .expect("ai-proxy state present (ownership checked above)");
+            state.body.extend_from_slice(&chunk);
+            if state.body.len() as u64 > self.config.max_req_body_size {
                 log::debug!(
                     "ai-proxy: body exceeded max_req_body_size {}",
                     self.config.max_req_body_size
@@ -380,17 +464,24 @@ impl ProxyPlugin for PluginAiProxy {
         }
 
         if !end_of_stream {
+            // Keep the upstream stream open. Returning `None` here would be
+            // read as "body finished" by pingora's request-body pipeline
+            // (h1 sends the terminating chunk, h2 sets END_STREAM), so the
+            // swallowed chunk must leave an empty-but-present placeholder;
+            // pingora skips writing 0-byte chunks mid-stream. Without this,
+            // chunked client requests would reach the provider as an empty
+            // body after the very first chunk.
+            *body = Some(Bytes::new());
             return Ok(());
         }
 
-        // End of body: take the buffer back out and transform.
-        let buffer = ctx
-            .vars
-            .as_mut()
-            .and_then(|vars| vars.remove(CTX_KEY_BODY_BUFFER))
-            .and_then(|boxed| boxed.downcast::<BytesMut>().ok())
-            .map(|boxed| *boxed)
-            .unwrap_or_default();
+        // End of body: take the buffered bytes back out and transform.
+        let buffer = std::mem::take(
+            &mut ctx
+                .get_mut::<AiProxyRequestState>(CTX_KEY_STATE)
+                .expect("ai-proxy state present (ownership checked above)")
+                .body,
+        );
 
         let transformed = match transform::transform_request(
             &buffer,
@@ -412,19 +503,467 @@ impl ProxyPlugin for PluginAiProxy {
             }
         };
 
-        if transformed.streaming {
-            ctx.set(CTX_KEY_STREAMING, true);
-        }
-        // Marker for request-validation (same phase, lower priority): the
-        // client-format body schema no longer applies.
-        ctx.set(CTX_KEY_TRANSFORMED, transformed.clone());
+        let state = ctx
+            .get_mut::<AiProxyRequestState>(CTX_KEY_STATE)
+            .expect("ai-proxy state present (ownership checked above)");
+        state.streaming = transformed.streaming;
+        // Generic marker: the client-format body has been replaced with the
+        // provider-format one; client-format body schemas no longer apply
+        // (read by request-validation, which stays decoupled from ai-proxy).
+        ctx.mark_request_body_replaced();
 
         *body = Some(transformed.body);
         Ok(())
     }
 }
 
-/// Whether an ai-proxy-transformed request is on this context.
-pub(crate) fn transformed_request_present(ctx: &ProxyContext) -> bool {
-    ctx.get::<TransformedRequest>(CTX_KEY_TRANSFORMED).is_some()
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::core::{ProxyPluginExecutor, ProxyResult, RouteContext, UpstreamSelection};
+    use async_trait::async_trait;
+    use pingora_core::protocols::raw_connect::ProxyDigest;
+    use pingora_core::protocols::{
+        GetProxyDigest, GetSocketDigest, GetTimingDigest, Peek, Shutdown, SocketDigest, Ssl,
+        TimingDigest, UniqueID, UniqueIDType, IO,
+    };
+    use serde_json::{json, Value as JsonValue};
+    use std::pin::Pin;
+    use std::task::{Context, Poll};
+    use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
+
+    // ------------------------------------------------------------------
+    // Minimal downstream mock (same pattern as utils/apisix_vars.rs tests)
+    // ------------------------------------------------------------------
+
+    #[derive(Debug)]
+    struct MockStream {
+        data: Vec<u8>,
+        pos: usize,
+    }
+
+    impl MockStream {
+        fn with_request(wire: &str) -> Self {
+            Self {
+                data: wire.as_bytes().to_vec(),
+                pos: 0,
+            }
+        }
+    }
+
+    impl AsyncRead for MockStream {
+        fn poll_read(
+            mut self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            buf: &mut ReadBuf<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            if self.pos >= self.data.len() {
+                return Poll::Ready(Ok(()));
+            }
+            let remaining = &self.data[self.pos..];
+            let to_copy = remaining.len().min(buf.remaining());
+            buf.put_slice(&remaining[..to_copy]);
+            self.pos += to_copy;
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    impl AsyncWrite for MockStream {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<std::io::Result<usize>> {
+            Poll::Ready(Ok(buf.len()))
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    #[async_trait]
+    impl Shutdown for MockStream {
+        async fn shutdown(&mut self) {}
+    }
+
+    impl UniqueID for MockStream {
+        fn id(&self) -> UniqueIDType {
+            0
+        }
+    }
+
+    impl Ssl for MockStream {}
+
+    impl GetTimingDigest for MockStream {
+        fn get_timing_digest(&self) -> Vec<Option<TimingDigest>> {
+            Vec::new()
+        }
+    }
+
+    impl GetProxyDigest for MockStream {
+        fn get_proxy_digest(&self) -> Option<Arc<ProxyDigest>> {
+            None
+        }
+    }
+
+    impl GetSocketDigest for MockStream {
+        fn get_socket_digest(&self) -> Option<Arc<SocketDigest>> {
+            None
+        }
+    }
+
+    #[async_trait]
+    impl Peek for MockStream {}
+
+    async fn session_for(request: &str) -> Session {
+        let stream: Box<dyn IO> = Box::new(MockStream::with_request(request));
+        let mut session = Session::new_h1(stream);
+        session
+            .downstream_session
+            .read_request()
+            .await
+            .expect("canned request parses");
+        session
+    }
+
+    fn json_request(content_type: Option<&str>, extra: &str) -> String {
+        let body = r#"{"model":"m","messages":[{"role":"user","content":"hi"}]}"#;
+        let mut wire = String::from("POST /llm HTTP/1.1\r\nHost: t\r\n");
+        if let Some(content_type) = content_type {
+            wire.push_str(&format!("Content-Type: {content_type}\r\n"));
+        }
+        wire.push_str(&format!("Content-Length: {}\r\n\r\n{body}", body.len()));
+        wire.push_str(extra);
+        wire
+    }
+
+    // ------------------------------------------------------------------
+    // Plugin construction helpers (direct, so tests can pick the scope)
+    // ------------------------------------------------------------------
+
+    fn instance_config(port: u16, key: &str, ssl_verify: bool) -> JsonValue {
+        json!({
+            "provider": "openai-compatible",
+            "auth": { "header": { "Authorization": format!("Bearer {key}") } },
+            "override": { "endpoint": format!("http://127.0.0.1:{port}") },
+            "ssl_verify": ssl_verify
+        })
+    }
+
+    fn build_with_scope(cfg: JsonValue, scope: PluginScope) -> Arc<PluginAiProxy> {
+        use crate::config::EffectiveDefaults;
+        use crate::proxy::upstream::discovery;
+        use upstream::{build_provider_upstream_config, resolve_endpoint};
+        let config = config::AiProxyConfig::parse(cfg).expect("config parses");
+        let endpoint = resolve_endpoint(&config).expect("endpoint resolves");
+        let upstream_config = build_provider_upstream_config(&config, &endpoint).unwrap();
+        let resolver = discovery::build_resolver_for_state().unwrap();
+        let prepared = discovery::prepare_static_upstream(&upstream_config, &resolver).unwrap();
+        Arc::new(PluginAiProxy::new(
+            config,
+            endpoint,
+            Arc::new(
+                ProxyUpstream::build(
+                    upstream_config,
+                    prepared,
+                    &EffectiveDefaults::default(),
+                    &resolver,
+                )
+                .unwrap(),
+            ),
+            scope,
+        ))
+    }
+
+    struct MockRoute {
+        executor: Arc<ProxyPluginExecutor>,
+    }
+
+    impl RouteContext for MockRoute {
+        fn id(&self) -> &str {
+            "mock-route"
+        }
+
+        fn service_id(&self) -> Option<&str> {
+            None
+        }
+
+        fn uri_template(&self) -> Option<&str> {
+            None
+        }
+
+        fn select_upstream(&self, _session: &mut Session) -> ProxyResult<UpstreamSelection> {
+            unimplemented!("not needed for ownership tests")
+        }
+
+        fn build_plugin_executor(&self) -> Arc<ProxyPluginExecutor> {
+            self.executor.clone()
+        }
+
+        fn resolve_upstream(&self) -> Option<Arc<dyn UpstreamSelector>> {
+            None
+        }
+
+        fn timeout(&self) -> Option<&crate::config::Timeout> {
+            None
+        }
+    }
+
+    fn owner_token(ctx: &ProxyContext) -> Option<u64> {
+        ctx.get::<AiProxyRequestState>(CTX_KEY_STATE)
+            .map(|state| state.token)
+    }
+
+    // ------------------------------------------------------------------
+    // Content-Type gate
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn content_type_check_accepts_exact_json_only() {
+        let headers = |values: &[&str]| {
+            let mut map = HeaderMap::new();
+            for value in values {
+                map.append(http::header::CONTENT_TYPE, value.parse().unwrap());
+            }
+            map
+        };
+
+        // Exact match (any case) and parameters are fine.
+        assert!(content_type_error(&headers(&[])).is_none());
+        assert!(content_type_error(&headers(&["application/json"])).is_none());
+        assert!(content_type_error(&headers(&["APPLICATION/JSON"])).is_none());
+        assert!(content_type_error(&headers(&["application/json; charset=utf-8"])).is_none());
+
+        // Prefix look-alikes are not application/json.
+        let error = content_type_error(&headers(&["application/jsonp"])).unwrap();
+        assert!(error.contains("unsupported"));
+        assert!(content_type_error(&headers(&["application/json-foo"])).is_some());
+
+        // Duplicated Content-Type is ambiguous.
+        let error = content_type_error(&headers(&["application/json", "text/plain"])).unwrap();
+        assert!(error.contains("ambiguous"));
+    }
+
+    #[tokio::test]
+    async fn request_filter_rejects_bad_content_type() {
+        for content_type in [Some("application/jsonp"), Some("text/plain")] {
+            let mut session = session_for(&json_request(content_type, "")).await;
+            let mut ctx = ProxyContext::default();
+            let plugin = build_with_scope(instance_config(19099, "k", true), PluginScope::Route);
+            let exited = plugin
+                .request_filter(&mut session, &mut ctx)
+                .await
+                .expect("no error");
+            assert!(exited, "{content_type:?} must short-circuit");
+            assert!(owner_token(&ctx).is_none(), "no claim on rejection");
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // Single-instance ownership
+    // ------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn first_instance_claims_and_later_instances_noop() {
+        let first = build_with_scope(
+            instance_config(19099, "first-key", true),
+            PluginScope::Route,
+        );
+        let second = build_with_scope(
+            instance_config(19098, "second-key", false),
+            PluginScope::Route,
+        );
+
+        let mut session = session_for(&json_request(Some("application/json"), "")).await;
+        let mut ctx = ProxyContext::default();
+
+        // First instance claims.
+        assert!(!first.request_filter(&mut session, &mut ctx).await.unwrap());
+        let first_token = owner_token(&ctx).expect("first instance claimed");
+        assert_eq!(first_token, first.token);
+        let first_upstream = ctx
+            .upstream_override
+            .as_ref()
+            .map(|o| Arc::as_ptr(o) as *const ());
+        assert!(first_upstream.is_some());
+
+        // A second instance never re-claims: the state, upstream override,
+        // and TLS flag all stay derived from the first instance.
+        assert!(!second.request_filter(&mut session, &mut ctx).await.unwrap());
+        assert_eq!(owner_token(&ctx), Some(first_token));
+        assert_eq!(
+            ctx.upstream_override
+                .as_ref()
+                .map(|o| Arc::as_ptr(o) as *const ()),
+            first_upstream
+        );
+
+        // The non-owner also leaves the upstream request untouched, while
+        // the owner rewrites path, framing, and auth.
+        let mut upstream_request = session.req_header().clone();
+        second
+            .upstream_request_filter(&mut session, &mut upstream_request, &mut ctx)
+            .await
+            .unwrap();
+        assert_eq!(upstream_request.uri.path(), "/llm");
+        assert!(upstream_request.headers.get("Authorization").is_none());
+
+        first
+            .upstream_request_filter(&mut session, &mut upstream_request, &mut ctx)
+            .await
+            .unwrap();
+        assert_eq!(upstream_request.uri.path(), "/v1/chat/completions");
+        assert_eq!(
+            upstream_request.headers.get("Authorization").unwrap(),
+            "Bearer first-key"
+        );
+
+        // ...and does not touch the body stream.
+        let mut chunk = Some(Bytes::from_static(b"{\"partial\""));
+        second
+            .request_body_filter(&mut session, &mut chunk, false, &mut ctx)
+            .await
+            .unwrap();
+        assert!(chunk.is_some(), "non-owner must pass chunks through");
+        assert!(ctx
+            .get::<AiProxyRequestState>(CTX_KEY_STATE)
+            .unwrap()
+            .body
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn global_instance_yields_to_route_scoped_instance() {
+        let global = build_with_scope(
+            instance_config(19099, "global-key", false),
+            PluginScope::Global,
+        );
+        let route = build_with_scope(
+            instance_config(19098, "route-key", true),
+            PluginScope::Route,
+        );
+
+        let mut session = session_for(&json_request(Some("application/json"), "")).await;
+        let mut ctx = ProxyContext {
+            route: Some(Arc::new(MockRoute {
+                executor: Arc::new(ProxyPluginExecutor::new(vec![
+                    route.clone() as Arc<dyn ProxyPlugin>
+                ])),
+            })),
+            ..ProxyContext::default()
+        };
+
+        // The global instance (even running first) does not claim...
+        assert!(!global.request_filter(&mut session, &mut ctx).await.unwrap());
+        assert!(owner_token(&ctx).is_none(), "global must yield");
+        assert!(ctx.upstream_override.is_none());
+
+        // ...so its credentials and ssl_verify:false never reach the request;
+        // the route-scoped instance owns it alone.
+        assert!(!route.request_filter(&mut session, &mut ctx).await.unwrap());
+        assert_eq!(owner_token(&ctx), Some(route.token));
+
+        let mut upstream_request = session.req_header().clone();
+        global
+            .upstream_request_filter(&mut session, &mut upstream_request, &mut ctx)
+            .await
+            .unwrap();
+        assert_eq!(upstream_request.uri.path(), "/llm");
+
+        route
+            .upstream_request_filter(&mut session, &mut upstream_request, &mut ctx)
+            .await
+            .unwrap();
+        assert_eq!(upstream_request.uri.path(), "/v1/chat/completions");
+        assert_eq!(
+            upstream_request.headers.get("Authorization").unwrap(),
+            "Bearer route-key"
+        );
+        assert!(
+            !ctx.get::<AiProxyRequestState>(CTX_KEY_STATE)
+                .unwrap()
+                .insecure_tls,
+            "route's ssl_verify=true must not be poisoned by the global instance"
+        );
+    }
+
+    #[tokio::test]
+    async fn global_instance_claims_when_route_has_no_ai_proxy() {
+        let global = build_with_scope(
+            instance_config(19099, "global-key", false),
+            PluginScope::Global,
+        );
+
+        let mut session = session_for(&json_request(Some("application/json"), "")).await;
+        let mut ctx = ProxyContext {
+            route: Some(Arc::new(MockRoute {
+                executor: ProxyPluginExecutor::default_shared(),
+            })),
+            ..ProxyContext::default()
+        };
+
+        assert!(!global.request_filter(&mut session, &mut ctx).await.unwrap());
+        assert_eq!(owner_token(&ctx), Some(global.token));
+        assert!(
+            ctx.get::<AiProxyRequestState>(CTX_KEY_STATE)
+                .unwrap()
+                .insecure_tls
+        );
+    }
+
+    #[tokio::test]
+    async fn body_transform_marks_replaced_body_and_streaming() {
+        let plugin = build_with_scope(instance_config(19099, "k", true), PluginScope::Route);
+        let mut session = session_for(
+            "POST /llm HTTP/1.1\r\nHost: t\r\nContent-Type: application/json\r\nTransfer-Encoding: chunked\r\n\r\n",
+        )
+        .await;
+        let mut ctx = ProxyContext::default();
+        assert!(!plugin.request_filter(&mut session, &mut ctx).await.unwrap());
+
+        let body = br#"{"model":"m","messages":[{"role":"user","content":"hi"}],"stream":true}"#;
+        let mut chunk = Some(Bytes::from_static(body));
+        plugin
+            .request_body_filter(&mut session, &mut chunk, false, &mut ctx)
+            .await
+            .unwrap();
+        // The client chunk is swallowed, but an empty-but-present placeholder
+        // must remain: a None body would tell pingora the upstream body is
+        // finished (terminating chunk / END_STREAM) mid-stream.
+        let swallowed = chunk.expect("stream kept open with a placeholder chunk");
+        assert!(
+            swallowed.is_empty(),
+            "chunk content must be swallowed, got {swallowed:?}"
+        );
+        assert!(
+            !ctx.get::<AiProxyRequestState>(CTX_KEY_STATE)
+                .unwrap()
+                .body
+                .is_empty(),
+            "swallowed bytes are buffered in the request state"
+        );
+
+        let mut chunk = None;
+        plugin
+            .request_body_filter(&mut session, &mut chunk, true, &mut ctx)
+            .await
+            .unwrap();
+        let transformed = chunk.expect("transformed body injected at end of stream");
+        let parsed: JsonValue = serde_json::from_slice(&transformed).unwrap();
+        assert_eq!(parsed["stream"], json!(true));
+        assert!(
+            ctx.request_body_replaced(),
+            "generic body-replaced marker must be set for request-validation"
+        );
+        assert!(
+            ctx.get::<AiProxyRequestState>(CTX_KEY_STATE)
+                .unwrap()
+                .streaming
+        );
+    }
 }

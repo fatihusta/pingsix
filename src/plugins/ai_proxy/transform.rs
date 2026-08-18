@@ -12,8 +12,14 @@
 //!    wholesale — options values win, mirroring APISIX model options).
 //! 3. Apply `override.llm_options.max_tokens` to the provider's target
 //!    field (forced: always overwrites the client value).
-//! 4. For anthropic, convert the structure to Anthropic Messages format.
-//! 5. Serialize once (`serde_json::to_vec`): the byte length is the exact
+//! 4. Re-validate: the merge is operator-controlled but must not be able to
+//!    break the structure the first validation accepted, and well-known
+//!    scalar fields must keep their wire types. A bad final body fails with
+//!    a local 400 instead of a round-tripped provider error.
+//! 5. For anthropic, convert the structure to Anthropic Messages format and
+//!    enforce the provider's required fields (`model`, `max_tokens`, at
+//!    least one non-system message) locally.
+//! 6. Serialize once (`serde_json::to_vec`): the byte length is the exact
 //!    upstream Content-Length.
 
 use bytes::Bytes;
@@ -40,6 +46,8 @@ pub(crate) enum TransformError {
     MissingField(String),
     /// `messages` has an unusable shape (non-array, bad element, bad role).
     BadMessagesShape(String),
+    /// A well-known field has the wrong type or an out-of-range value.
+    InvalidField(String),
 }
 
 impl TransformError {
@@ -51,6 +59,7 @@ impl TransformError {
                 format!("request body is missing required field '{field}'")
             }
             TransformError::BadMessagesShape(message) => message.clone(),
+            TransformError::InvalidField(message) => message.clone(),
         }
     }
 }
@@ -87,8 +96,16 @@ pub(crate) fn transform_request(
         apply_max_tokens(&mut body, max_tokens, provider);
     }
 
+    // Re-validate after the merge: options are operator-controlled, but the
+    // final body must still be a structurally valid chat request, and
+    // well-known scalar fields must keep their wire types. Failing here
+    // returns a local 400 instead of a round-tripped provider rejection.
+    validate_messages_shape(&body)?;
+    validate_field_types(&body)?;
+
     if provider == Provider::Anthropic {
         let converted = convert_to_anthropic(&body)?;
+        validate_anthropic_requirements(&converted)?;
         body = JsonValue::Object(converted);
     }
 
@@ -139,6 +156,64 @@ fn validate_messages_shape(body: &JsonValue) -> Result<(), TransformError> {
                 "messages[{index}].content must be a string"
             )));
         }
+    }
+    Ok(())
+}
+
+/// Well-known scalar fields must keep their wire types in the final body
+/// (after the options merge): a typed mistake is caught locally with a 400
+/// rather than by the provider after a full round trip.
+fn validate_field_types(body: &JsonValue) -> Result<(), TransformError> {
+    if let Some(stream) = body.get("stream") {
+        if !stream.is_boolean() {
+            return Err(TransformError::InvalidField(
+                "'stream' must be a boolean".to_string(),
+            ));
+        }
+    }
+    for field in ["max_tokens", "max_completion_tokens"] {
+        if let Some(value) = body.get(field) {
+            let valid = value.as_u64().is_some_and(|tokens| tokens >= 1);
+            if !valid {
+                return Err(TransformError::InvalidField(format!(
+                    "'{field}' must be an integer >= 1"
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Fail fast on Anthropic Messages API requirements the gateway can check
+/// locally: `model` and `max_tokens` are required, and at least one
+/// non-system message must remain after system extraction.
+fn validate_anthropic_requirements(body: &Map<String, JsonValue>) -> Result<(), TransformError> {
+    match body.get("model") {
+        Some(model) if model.is_string() => {}
+        Some(_) => {
+            return Err(TransformError::InvalidField(
+                "'model' must be a string".to_string(),
+            ))
+        }
+        None => return Err(TransformError::MissingField("model".to_string())),
+    }
+    match body.get("max_tokens") {
+        Some(max_tokens) if max_tokens.as_u64().is_some_and(|tokens| tokens >= 1) => {}
+        Some(_) => {
+            return Err(TransformError::InvalidField(
+                "'max_tokens' must be an integer >= 1".to_string(),
+            ))
+        }
+        None => return Err(TransformError::MissingField("max_tokens".to_string())),
+    }
+    let has_non_system_message = body
+        .get("messages")
+        .and_then(JsonValue::as_array)
+        .is_some_and(|messages| !messages.is_empty());
+    if !has_non_system_message {
+        return Err(TransformError::BadMessagesShape(
+            "messages must contain at least one non-system message".to_string(),
+        ));
     }
     Ok(())
 }
@@ -194,7 +269,8 @@ fn apply_max_tokens(body: &mut JsonValue, max_tokens: u64, provider: Provider) {
 ///
 /// * `system` role messages are extracted into the top-level `system` string.
 /// * `user`/`assistant` messages are kept as-is (string content).
-/// * `max_tokens` is required by Anthropic; when only the OpenAI-style
+/// * `max_tokens` is required by Anthropic (enforced afterwards by
+///   [`validate_anthropic_requirements`]); when only the OpenAI-style
 ///   `max_completion_tokens` is present it is renamed.
 /// * A small whitelist of compatible fields passes through
 ///   (`stream`, `temperature`, `top_p`, `top_k`); `stop` becomes
@@ -401,6 +477,94 @@ mod tests {
     }
 
     #[test]
+    fn options_cannot_break_the_validated_structure() {
+        // The merge happens after the first validation, so a broken result
+        // must be caught by the re-validation, not by the provider.
+        let options = json!({"messages": null});
+        let error = transform(
+            CLIENT_BODY.as_bytes(),
+            Some(&options),
+            None,
+            Provider::Openai,
+        )
+        .unwrap_err();
+        assert!(error.detail().contains("messages"), "{}", error.detail());
+
+        let options = json!({"messages": [{"role": "user"}]});
+        let error = transform(
+            CLIENT_BODY.as_bytes(),
+            Some(&options),
+            None,
+            Provider::Openai,
+        )
+        .unwrap_err();
+        assert!(error.detail().contains("content"), "{}", error.detail());
+    }
+
+    #[test]
+    fn well_known_field_types_are_validated_in_the_final_body() {
+        let client = br#"{"messages":[{"role":"user","content":"hi"}],"stream":"yes"}"#;
+        let error = transform(client, None, None, Provider::Openai).unwrap_err();
+        assert!(error.detail().contains("'stream'"), "{}", error.detail());
+
+        let client = br#"{"messages":[{"role":"user","content":"hi"}],"max_tokens":"512"}"#;
+        let error = transform(client, None, None, Provider::Deepseek).unwrap_err();
+        assert!(
+            error.detail().contains("'max_tokens'"),
+            "{}",
+            error.detail()
+        );
+
+        // Type errors injected through options are caught too.
+        let options = json!({"max_completion_tokens": 0});
+        let error = transform(
+            br#"{"messages":[{"role":"user","content":"hi"}]}"#,
+            Some(&options),
+            None,
+            Provider::Openai,
+        )
+        .unwrap_err();
+        assert!(
+            error.detail().contains("'max_completion_tokens'"),
+            "{}",
+            error.detail()
+        );
+    }
+
+    #[test]
+    fn anthropic_required_fields_fail_fast_locally() {
+        // model missing.
+        let error = transform(
+            br#"{"messages":[{"role":"user","content":"hi"}],"max_tokens":8}"#,
+            None,
+            None,
+            Provider::Anthropic,
+        )
+        .unwrap_err();
+        assert!(error.detail().contains("model"), "{}", error.detail());
+
+        // max_tokens missing.
+        let error = transform(
+            br#"{"model":"claude-3","messages":[{"role":"user","content":"hi"}]}"#,
+            None,
+            None,
+            Provider::Anthropic,
+        )
+        .unwrap_err();
+        assert!(error.detail().contains("max_tokens"), "{}", error.detail());
+
+        // All-system conversation: no non-system message remains.
+        let error = transform(
+            br#"{"model":"claude-3","max_tokens":8,"messages":[{"role":"system","content":"s"}]}"#,
+            None,
+            None,
+            Provider::Anthropic,
+        )
+        .unwrap_err();
+        assert!(error.detail().contains("non-system"), "{}", error.detail());
+    }
+
+    #[test]
     fn openai_body_structure_is_untouched_without_options() {
         let body = ok_body(CLIENT_BODY.as_bytes(), None, None, Provider::Openai);
         assert_eq!(
@@ -422,12 +586,15 @@ mod tests {
         assert_eq!(body["max_completion_tokens"], json!(1024));
         assert!(body.get("max_tokens").is_none());
 
-        // deepseek / openai-compatible / anthropic: classic field.
+        // deepseek / openai-compatible: classic field.
         for provider in [Provider::Deepseek, Provider::OpenaiCompatible] {
             let body = ok_body(with_client_tokens, None, Some(2048), provider);
             assert_eq!(body["max_tokens"], json!(2048), "{provider:?}");
         }
-        let body = ok_body(with_client_tokens, None, Some(2048), Provider::Anthropic);
+        // anthropic: classic field (model present to satisfy its requirements).
+        let with_model =
+            br#"{"model":"claude-3","messages":[{"role":"user","content":"hi"}],"max_tokens":8}"#;
+        let body = ok_body(with_model, None, Some(2048), Provider::Anthropic);
         assert_eq!(body["max_tokens"], json!(2048));
 
         // Without an override the client's fields pass through untouched.
@@ -471,7 +638,7 @@ mod tests {
 
     #[test]
     fn anthropic_renames_max_completion_tokens_fallback() {
-        let client = br#"{"messages":[{"role":"user","content":"hi"}],"max_completion_tokens":77}"#;
+        let client = br#"{"model":"claude-3","messages":[{"role":"user","content":"hi"}],"max_completion_tokens":77}"#;
         let body = ok_body(client, None, None, Provider::Anthropic);
         assert_eq!(body["max_tokens"], json!(77));
         assert!(body.get("max_completion_tokens").is_none());
@@ -486,8 +653,9 @@ mod tests {
 
     #[test]
     fn anthropic_merge_happens_before_conversion() {
-        // options injected model/temperature survive conversion.
-        let options = json!({"model": "claude-3-5", "temperature": 0.7});
+        // options injected model/max_tokens/temperature survive conversion
+        // and satisfy the anthropic requirements.
+        let options = json!({"model": "claude-3-5", "max_tokens": 64, "temperature": 0.7});
         let body = ok_body(
             br#"{"messages":[{"role":"user","content":"hi"}]}"#,
             Some(&options),
@@ -495,6 +663,7 @@ mod tests {
             Provider::Anthropic,
         );
         assert_eq!(body["model"], json!("claude-3-5"));
+        assert_eq!(body["max_tokens"], json!(64));
         assert_eq!(body["temperature"], json!(0.7));
     }
 
@@ -526,10 +695,13 @@ mod tests {
                 .streaming
         );
 
-        // Detected through options too, and for anthropic.
+        // Detected through options too, and for anthropic (whose required
+        // model/max_tokens are carried by the base body).
+        let anthropic_base =
+            br#"{"model":"claude-3","max_tokens":64,"messages":[{"role":"user","content":"hi"}]}"#;
         let options = json!({"stream": true});
         assert!(
-            transform(base, Some(&options), None, Provider::Anthropic)
+            transform(anthropic_base, Some(&options), None, Provider::Anthropic)
                 .unwrap()
                 .streaming
         );

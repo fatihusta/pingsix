@@ -60,33 +60,41 @@ fn is_websocket_upgrade(headers: &http::HeaderMap) -> bool {
 
 /// Apply ai-proxy request-scoped peer adjustments after upstream selection.
 ///
-/// Two flags travel on the request context because peer options cannot be
-/// expressed on the upstream resource (its TLS block carries only client
-/// certificates) or must be set for every ai-proxy request:
+/// Both settings travel on the ai-proxy request state (written once by the
+/// owning plugin instance) because peer options cannot be expressed on the
+/// upstream resource (its TLS block carries only client certificates) and
+/// must reflect the owning instance's configuration:
 ///
-/// * read-timeout relaxation (`ai_proxy::relax_read_timeout`, set for every
-///   ai-proxy request): LLM upstreams legitimately go silent between reads —
-///   non-streaming completions before their first byte ("thinking"), SSE
-///   streams between chunks — and pingora's `read_timeout` bounds the gap
-///   *between* reads, so it is lifted. The write timeout stays as client-side
-///   abuse protection (same reasoning as the WebSocket branch above). A
-///   total-duration bound (`max_stream_duration_ms`) is planned for v2.
+/// * read-timeout floor (every ai-proxy request): LLM upstreams legitimately
+///   go silent between reads — non-streaming completions before their first
+///   byte ("thinking"), SSE streams between chunks — and pingora's
+///   `read_timeout` bounds the gap *between* reads, so the configured value
+///   is lifted to a generous finite floor instead of being removed: a
+///   stalled provider can no longer hold a connection forever. The write
+///   timeout stays untouched as client-side abuse protection (same reasoning
+///   as the WebSocket branch above). A total-duration bound
+///   (`max_stream_duration_ms`) is planned for v2.
 /// * `ssl_verify: false`: disable certificate verification for the selected
 ///   provider peer.
 fn apply_ai_proxy_peer_options(ctx: &ProxyContext, peer: &mut HttpPeer) {
-    if ctx
-        .get::<bool>(crate::plugins::ai_proxy::CTX_KEY_RELAX_READ_TIMEOUT)
-        .copied()
-        .unwrap_or(false)
+    let Some(state) = ctx.get::<crate::plugins::ai_proxy::AiProxyRequestState>(
+        crate::plugins::ai_proxy::CTX_KEY_STATE,
+    ) else {
+        return;
+    };
+    let floor = Duration::from_secs(crate::plugins::ai_proxy::PROVIDER_READ_TIMEOUT_FLOOR_SECS);
+    if peer
+        .options
+        .read_timeout
+        .is_none_or(|current| current < floor)
     {
-        peer.options.read_timeout = None;
-        log::debug!("ai-proxy request: relaxed upstream read_timeout");
+        peer.options.read_timeout = Some(floor);
+        log::debug!(
+            "ai-proxy request: upstream read_timeout floored at {}s",
+            floor.as_secs()
+        );
     }
-    if ctx
-        .get::<bool>(crate::plugins::ai_proxy::CTX_KEY_INSECURE_TLS)
-        .copied()
-        .unwrap_or(false)
-    {
+    if state.insecure_tls {
         peer.options.verify_cert = false;
         peer.options.verify_hostname = false;
         log::debug!(
@@ -627,30 +635,45 @@ mod tests {
         assert!(!is_websocket_upgrade(&headers));
     }
 
-    fn configured_peer() -> HttpPeer {
+    fn configured_peer(read_secs: u64) -> HttpPeer {
         let mut peer = HttpPeer::new("127.0.0.1:9443", true, "provider.internal".to_string());
-        peer.options.read_timeout = Some(Duration::from_secs(60));
+        peer.options.read_timeout = Some(Duration::from_secs(read_secs));
         peer.options.write_timeout = Some(Duration::from_secs(60));
         peer.options.verify_cert = true;
         peer.options.verify_hostname = true;
         peer
     }
 
+    fn ai_proxy_state(insecure_tls: bool) -> crate::plugins::ai_proxy::AiProxyRequestState {
+        crate::plugins::ai_proxy::AiProxyRequestState {
+            token: 1,
+            insecure_tls,
+            streaming: false,
+            body: bytes::BytesMut::new(),
+        }
+    }
+
     #[test]
-    fn ai_proxy_flag_relaxes_read_timeout_only() {
+    fn ai_proxy_state_floors_read_timeout_without_touching_write_or_tls() {
+        let floor = Duration::from_secs(crate::plugins::ai_proxy::PROVIDER_READ_TIMEOUT_FLOOR_SECS);
+
+        // Without ai-proxy state the peer is untouched.
         let mut ctx = ProxyContext::default();
-        let mut peer = configured_peer();
+        let mut peer = configured_peer(60);
         apply_ai_proxy_peer_options(&ctx, &mut peer);
         assert_eq!(peer.options.read_timeout, Some(Duration::from_secs(60)));
         assert_eq!(peer.options.write_timeout, Some(Duration::from_secs(60)));
         assert!(peer.options.verify_cert);
 
-        ctx.set(crate::plugins::ai_proxy::CTX_KEY_RELAX_READ_TIMEOUT, true);
-        apply_ai_proxy_peer_options(&ctx, &mut peer);
-        assert_eq!(
-            peer.options.read_timeout, None,
-            "ai-proxy requests must not be killed between upstream reads"
+        // With state, a short read timeout is lifted to the generous floor:
+        // ai-proxy requests must not be killed between upstream reads, but a
+        // stalled provider is still dropped after the floor.
+        ctx.set(
+            crate::plugins::ai_proxy::CTX_KEY_STATE,
+            ai_proxy_state(false),
         );
+        apply_ai_proxy_peer_options(&ctx, &mut peer);
+        assert_eq!(peer.options.read_timeout, Some(floor));
         assert_eq!(
             peer.options.write_timeout,
             Some(Duration::from_secs(60)),
@@ -658,22 +681,35 @@ mod tests {
         );
         assert!(
             peer.options.verify_cert,
-            "relaxation alone must not touch TLS"
+            "the read floor alone must not touch TLS"
         );
+
+        // A configured read timeout above the floor is preserved.
+        let mut peer = configured_peer(3600);
+        apply_ai_proxy_peer_options(&ctx, &mut peer);
+        assert_eq!(peer.options.read_timeout, Some(Duration::from_secs(3600)));
     }
 
     #[test]
-    fn ai_proxy_insecure_flag_disables_cert_verification_only() {
+    fn ai_proxy_insecure_state_disables_cert_verification_only() {
         let mut ctx = ProxyContext::default();
-        ctx.set(crate::plugins::ai_proxy::CTX_KEY_INSECURE_TLS, true);
-        let mut peer = configured_peer();
+        ctx.set(
+            crate::plugins::ai_proxy::CTX_KEY_STATE,
+            ai_proxy_state(true),
+        );
+        let mut peer = configured_peer(3600);
         apply_ai_proxy_peer_options(&ctx, &mut peer);
         assert!(!peer.options.verify_cert);
         assert!(!peer.options.verify_hostname);
         assert_eq!(
             peer.options.read_timeout,
-            Some(Duration::from_secs(60)),
+            Some(Duration::from_secs(3600)),
             "insecure TLS alone must not touch timeouts"
+        );
+        assert_eq!(
+            peer.options.write_timeout,
+            Some(Duration::from_secs(60)),
+            "insecure TLS alone must not touch the write timeout"
         );
     }
 }

@@ -19,7 +19,7 @@ use crate::proxy::upstream::{
 
 use super::config::AiProxyConfig;
 use super::provider::provider_spec;
-use super::PluginAiProxy;
+use super::{PluginAiProxy, PluginScope};
 
 /// The effective provider endpoint after config resolution.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -230,7 +230,15 @@ pub(crate) fn create_ai_proxy_plugin_with_upstreams(
         defaults,
         resolver,
     )?);
-    Ok(Arc::new(PluginAiProxy::new(config, endpoint, upstream)))
+    // Global-rule plugins run in the layer before route/service ones; the
+    // scope feeds the route-over-global yield in `request_filter`.
+    let scope = match owner {
+        TrafficSplitOwner::GlobalRule(_) => PluginScope::Global,
+        TrafficSplitOwner::Route(_) | TrafficSplitOwner::Service(_) => PluginScope::Route,
+    };
+    Ok(Arc::new(PluginAiProxy::new(
+        config, endpoint, upstream, scope,
+    )))
 }
 
 fn owner_id(owner: &TrafficSplitOwner) -> String {
@@ -263,7 +271,13 @@ pub fn build_ai_proxy_plugin(cfg: JsonValue) -> ProxyResult<Arc<dyn ProxyPlugin>
         &EffectiveDefaults::default(),
         &resolver,
     )?);
-    Ok(Arc::new(PluginAiProxy::new(config, endpoint, upstream)))
+    // Embedder path: no global-rule layer exists, so route scope is correct.
+    Ok(Arc::new(PluginAiProxy::new(
+        config,
+        endpoint,
+        upstream,
+        PluginScope::Route,
+    )))
 }
 
 #[cfg(test)]

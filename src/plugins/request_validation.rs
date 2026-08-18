@@ -323,16 +323,14 @@ impl ProxyPlugin for PluginRequestValidation {
 
         // 2. Body pre-checks (only when a body schema is configured).
         //
-        // ai-proxy (priority 2900) already consumed and replaced the request
-        // body before this plugin runs; validating the provider-format
-        // replacement against a client-format body_schema would misreject,
-        // so body handling is skipped when an ai-proxy transform is present.
-        // Header validation above still applies. (This covers same-scope
-        // mixes; a global-scope request-validation still buffers before a
-        // route-scope ai-proxy injects — see the ai-proxy docs.)
-        if self.compiled.body_validator.is_some()
-            && !crate::plugins::ai_proxy::transformed_request_present(ctx)
-        {
+        // A body-transforming plugin (ai-proxy, priority 2900) may already
+        // have replaced the request body before this plugin runs; validating
+        // a replacement against a client-format body_schema would misreject,
+        // so body handling is skipped whenever the body was replaced. Header
+        // validation above still applies. (This covers same-scope mixes; a
+        // global-scope request-validation still buffers before a route-scope
+        // ai-proxy injects — see the ai-proxy docs.)
+        if self.compiled.body_validator.is_some() && !ctx.request_body_replaced() {
             // Duplicated Content-Type is ambiguous: the gateway and the
             // upstream may parse the body differently, bypassing validation.
             if headers.get_all(http::header::CONTENT_TYPE).iter().count() > 1 {
@@ -364,9 +362,9 @@ impl ProxyPlugin for PluginRequestValidation {
             return Ok(());
         };
 
-        // ai-proxy replaced the request body with the provider-format
-        // transform; the client-format body schema does not apply.
-        if crate::plugins::ai_proxy::transformed_request_present(ctx) {
+        // A plugin replaced the request body with a gateway-generated one;
+        // the client-format body schema does not apply to the replacement.
+        if ctx.request_body_replaced() {
             return Ok(());
         }
 
@@ -393,6 +391,14 @@ impl ProxyPlugin for PluginRequestValidation {
         }
 
         if !end_of_stream {
+            // Keep the upstream stream open. Returning `None` here would be
+            // read as "body finished" by pingora's request-body pipeline
+            // (h1 sends the terminating chunk, h2 sets END_STREAM), so the
+            // swallowed chunk must leave an empty-but-present placeholder;
+            // pingora skips writing 0-byte chunks mid-stream. Without this,
+            // chunked client requests would reach the upstream as an empty
+            // body after the very first chunk.
+            *body = Some(Bytes::new());
             return Ok(());
         }
 

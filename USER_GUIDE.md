@@ -1965,13 +1965,13 @@ routes:
 | Field | Type | Default | Notes |
 |---|---|---|---|
 | `provider` | string | — (required) | `openai`, `openai-compatible`, `deepseek`, `anthropic` |
-| `auth.header` | map | — | header name → value, injected verbatim (`Authorization`, `x-api-key`, …) |
+| `auth.header` | map | — | header name → value, injected verbatim (`Authorization`, `x-api-key`, …); names/values validated at config time; gateway-managed framing headers (`Host`, `Content-Length`, `Transfer-Encoding`, `Content-Type`) and hop-by-hop headers (`Connection`, `Keep-Alive`, `Proxy-Connection`, `TE`, `Trailer`, `Upgrade`, `Proxy-Authenticate`, `Proxy-Authorization`) are rejected |
 | `auth.query` | map | — | query parameter → value; values are non-overridable |
 | `auth` | — | — | at least one of `header`/`query` must be non-empty (v1 has no gcp/aws auth) |
 | `options` | object | — | deep-merged into the client body; objects recurse, arrays/scalars replace |
 | `override.endpoint` | string | — | replaces the provider endpoint; an endpoint path wins over the provider default chat path |
 | `override.llm_options.max_tokens` | int ≥ 1 | — | forced token limit; openai → `max_completion_tokens` (legacy `max_tokens` removed), others → `max_tokens` |
-| `timeout` | ms | 30000 | upstream connect/send/read (seconds granularity, min 1s) |
+| `timeout` | ms | 30000 | upstream connect/send (seconds granularity, min 1s); the upstream read timeout is floored at 600s for provider responses — see Streaming |
 | `max_req_body_size` | bytes | 67108864 | request body cap; larger bodies → 413 |
 | `keepalive` | bool | true | `false` disables connection reuse |
 | `keepalive_timeout` | ms | 60000 | idle timeout, ≥ 1000 |
@@ -1996,13 +1996,21 @@ becomes `stop_sequences`; a whitelist of compatible fields (`stream`,
 are dropped. The plugin injects `anthropic-version: 2023-06-01` (your
 `auth.header` entry, if any, wins).
 
-**Streaming.** The upstream read timeout is relaxed for every ai-proxy
-request — LLM upstreams legitimately go silent between reads, whether a
-non-streaming completion thinking before its first byte or an SSE stream
-between chunks, and pingora's `read_timeout` bounds the gap *between* reads.
-`timeout` still bounds connect and write. A total-duration bound
+**Streaming.** The upstream read timeout is floored at a generous 600 seconds
+for every ai-proxy request — LLM upstreams legitimately go silent between
+reads, whether a non-streaming completion thinking before its first byte or
+an SSE stream between chunks, and pingora's `read_timeout` bounds the gap
+*between* reads. The floor keeps that relaxation bounded: a stalled provider
+connection is dropped after at most 10 minutes instead of being held
+forever. `timeout` still bounds connect and write. A total-duration bound
 (`max_stream_duration_ms`) is planned for v2. Responses are passed through
 unmodified (no re-buffering, no SSE normalization).
+
+**Scope precedence.** At most ONE ai-proxy instance handles a request. A
+route/service-scoped `ai-proxy` overrides a global-rule one (APISIX merge
+semantics), and any further instance is a no-op — provider credentials, TLS
+settings, and the body transform always come from a single instance and can
+never mix across scopes.
 
 **Security notes**
 
@@ -2015,12 +2023,18 @@ unmodified (no re-buffering, no SSE normalization).
   and redacted in Admin API reads.
 - `Accept-Encoding` is stripped so responses reach clients uncompressed.
 
-**Request handling.** A non-JSON `Content-Type` or a bodyless request is
-rejected early with **400** (`{"error": "..."}`). Invalid JSON, a
-non-object body, a missing/malformed `messages` array, or a body larger
-than `max_req_body_size` are detected while streaming the body and surface
-as **400**/**413** with an empty body (`exit-transformer` can supply one).
-All gateway exits flow through `exit-transformer`.
+**Request handling.** A `Content-Type` that is not exactly `application/json`
+(parameters like `charset=utf-8` are fine; look-alikes such as
+`application/jsonp` and duplicated `Content-Type` headers are rejected), or a
+bodyless request, is rejected early with **400** (`{"error": "..."}`). Invalid
+JSON, a non-object body, a missing/malformed `messages` array, well-known
+fields with wrong types (`stream`, `max_tokens`), a body that the `options`
+merge would break, or a body larger than `max_req_body_size` are detected
+while streaming the body and surface as **400**/**413** with an empty body
+(`exit-transformer` can supply one). For `provider: anthropic`, missing
+required fields (`model`, `max_tokens`, an all-`system` conversation) also
+fail fast locally with **400** instead of a provider round trip. All gateway
+exits flow through `exit-transformer`.
 
 The upstream request is sent with `Transfer-Encoding: chunked` framing
 (the transformed body length is unknown until the client body completes),
@@ -2035,7 +2049,11 @@ which every HTTP/1.1 provider accepts.
   schema would misreject the provider-format body); header schemas still
   apply. A *global*-scope request-validation still buffers before a
   *route*-scope ai-proxy injects — avoid that combination.
-- `timeout` is applied at seconds granularity (500ms → 1s).
+- `timeout` is applied at seconds granularity (500ms → 1s); the upstream read
+  timeout is floored at 600s (see Streaming).
+- When `ai-proxy` is configured both in a global rule and on the matched
+  route/service, the route/service instance wins and the global instance is
+  skipped for those requests (see Scope precedence).
 
 **APISIX compatibility matrix (v1):**
 
@@ -2043,7 +2061,8 @@ which every HTTP/1.1 provider accepts.
 |---|---|
 | `provider`/`auth`/`options`/`override.llm_options`/`timeout`/`max_req_body_size`/`keepalive*`/`ssl_verify` | ✅ identical semantics and bounds |
 | openai / openai-compatible / deepseek / anthropic providers | ✅ |
-| SSE streaming passthrough | ✅ (with read-timeout relaxation) |
+| SSE streaming passthrough | ✅ (read timeout floored at 600s instead of removed) |
+| global-rule + route configuration of ai-proxy | ✅ route/service overrides global (single instance owns a request) |
 | client `Authorization` header | ⚠️ deleted (APISIX forwards it; `auth.header` overlays) |
 | `anthropic-version` header | ⚠️ auto-injected `2023-06-01` (APISIX ≥ 3.17 expects the client or `auth.header`) |
 | `options` merge | ⚠️ deep merge; APISIX overwrites top-level keys wholesale (identical for scalar options) |
