@@ -7,7 +7,6 @@ use std::{
 
 use async_trait::async_trait;
 use futures::future::join_all;
-#[cfg(test)]
 use futures::FutureExt;
 use hickory_resolver::TokioResolver;
 use pingora::{protocols::ALPN, upstreams::peer::HttpPeer};
@@ -261,9 +260,12 @@ pub(crate) struct PreparedUpstream {
     pub health_checks: HashMap<u64, bool>,
 }
 
-/// Resolve an upstream before candidate compilation. The timeout bounds all DNS
-/// lookups in this upstream; a DNS-only upstream with no result is not publishable.
-#[cfg(test)]
+/// Resolve an upstream before candidate compilation, synchronously.
+///
+/// Works only for upstreams whose nodes are IP literals (static discovery
+/// path — no DNS I/O); hostname nodes return an error directing callers to
+/// the asynchronous preparation path. Used by the test/static startup paths
+/// and by the ai-proxy embedder constructor.
 pub(crate) fn prepare_static_upstream(
     upstream: &Upstream,
     resolver: &Arc<TokioResolver>,

@@ -322,7 +322,17 @@ impl ProxyPlugin for PluginRequestValidation {
         }
 
         // 2. Body pre-checks (only when a body schema is configured).
-        if self.compiled.body_validator.is_some() {
+        //
+        // ai-proxy (priority 2900) already consumed and replaced the request
+        // body before this plugin runs; validating the provider-format
+        // replacement against a client-format body_schema would misreject,
+        // so body handling is skipped when an ai-proxy transform is present.
+        // Header validation above still applies. (This covers same-scope
+        // mixes; a global-scope request-validation still buffers before a
+        // route-scope ai-proxy injects — see the ai-proxy docs.)
+        if self.compiled.body_validator.is_some()
+            && !crate::plugins::ai_proxy::transformed_request_present(ctx)
+        {
             // Duplicated Content-Type is ambiguous: the gateway and the
             // upstream may parse the body differently, bypassing validation.
             if headers.get_all(http::header::CONTENT_TYPE).iter().count() > 1 {
@@ -353,6 +363,12 @@ impl ProxyPlugin for PluginRequestValidation {
         let Some(validator) = &self.compiled.body_validator else {
             return Ok(());
         };
+
+        // ai-proxy replaced the request body with the provider-format
+        // transform; the client-format body schema does not apply.
+        if crate::plugins::ai_proxy::transformed_request_present(ctx) {
+            return Ok(());
+        }
 
         // Swallow the chunk into the per-request buffer; nothing reaches the
         // upstream until validation passes.

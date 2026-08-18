@@ -27,9 +27,12 @@ pub(crate) enum UpstreamOccurrence {
     ServiceInline(String),
     /// An inline upstream embedded in a `traffic-split` plugin.
     TrafficSplit(TrafficSplitOwner, usize, usize),
+    /// The provider upstream embedded in an `ai-proxy` plugin config.
+    AiProxy(TrafficSplitOwner),
 }
 
-/// The configuration scope that owns a traffic-split inline upstream.
+/// The configuration scope that owns a plugin-declared inline upstream
+/// (traffic-split rules, ai-proxy provider endpoints).
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub(crate) enum TrafficSplitOwner {
     Route(String),

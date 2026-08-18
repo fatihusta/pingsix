@@ -13,7 +13,7 @@ PingSIX is a modern API gateway designed for cloud-native environments, offering
 - 🚀 **High Performance**: Built with Rust and Tokio for exceptional throughput and low latency
 - 🔄 **Dynamic Configuration**: Real-time configuration updates via etcd integration
 - 🛣️ **Advanced Routing**: Flexible request matching based on host, path, methods, and priorities
-- 🔌 **Rich Plugin Ecosystem**: 28 built-in plugins with easy extensibility
+- 🔌 **Rich Plugin Ecosystem**: 29 built-in plugins with easy extensibility
 - 📊 **Observability**: Built-in Prometheus metrics and Sentry integration
 - 🔒 **Security**: JWT/API key authentication, IP restrictions, CORS support, circuit breaking
 - ⚡ **Load Balancing**: Multiple algorithms with active and passive health checking
@@ -85,7 +85,7 @@ curl http://localhost:8080/get
 
 ## 🔌 Plugin Ecosystem
 
-PingSIX includes 28 built-in plugins organized by category:
+PingSIX includes 29 built-in plugins organized by category:
 
 ### 🔐 Authentication & Security
 - **`jwt-auth`** - JWT token validation with multiple algorithms
@@ -111,6 +111,11 @@ PingSIX includes 28 built-in plugins organized by category:
 - **`cache`** - Response caching with TTL, PURGE, and conditions
 - **`client-control`** - Request body size limiting (413 enforcement)
 
+### 🤖 AI / LLM
+- **`ai-proxy`** - OpenAI-format LLM proxy to openai / deepseek / anthropic /
+  any OpenAI-compatible endpoint: auth injection, request-body transforms,
+  per-provider upstreams, SSE passthrough (APISIX compatible)
+
 ### 📊 Observability
 - **`prometheus`** - Metrics collection and exposition
 - **`file-logger`** - Structured access logging
@@ -131,7 +136,7 @@ PingSIX includes 28 built-in plugins organized by category:
 PingSIX is built on a modular architecture with the following key components:
 
 - **Core Engine**: Built on Cloudflare's Pingora framework for high-performance HTTP handling
-- **Plugin System**: Extensible plugin architecture with 28 built-in plugins
+- **Plugin System**: Extensible plugin architecture with 29 built-in plugins
 - **Configuration Management**: Support for both static YAML and dynamic etcd-based configuration
 - **Admin API**: RESTful API for runtime configuration management
 - **Observability**: Built-in metrics, logging, and error tracking

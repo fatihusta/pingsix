@@ -1,3 +1,4 @@
+pub mod ai_proxy;
 pub mod api_breaker;
 pub mod basic_auth;
 pub mod brotli;
@@ -154,6 +155,14 @@ static PLUGIN_META: &[PluginMeta] = &[
         validate: None,
         upstream_refs: None,
         upstream_jobs: None,
+    },
+    PluginMeta {
+        name: ai_proxy::PLUGIN_NAME,
+        factory: PluginFactory::WithUpstreams(ai_proxy::create_ai_proxy_plugin_with_context),
+        secrets_transform: Some(ai_proxy::SECRETS_TRANSFORM),
+        validate: Some(ai_proxy::validate_ai_proxy_config),
+        upstream_refs: None,
+        upstream_jobs: Some(ai_proxy::inline_upstream_jobs),
     },
     PluginMeta {
         name: request_validation::PLUGIN_NAME,
@@ -480,6 +489,10 @@ mod builtin_phases_tests {
             (ip_restriction::PLUGIN_NAME, request),
             (uri_blocker::PLUGIN_NAME, request),
             (
+                ai_proxy::PLUGIN_NAME,
+                request | PluginPhases::UPSTREAM_REQUEST | PluginPhases::REQUEST_BODY,
+            ),
+            (
                 request_validation::PLUGIN_NAME,
                 request | PluginPhases::REQUEST_BODY,
             ),
@@ -530,6 +543,11 @@ mod builtin_phases_tests {
             "redirect" => json!({"uri": "/next", "regex_uri": []}),
             "uri-blocker" => json!({"block_rules": ["/blocked"]}),
             "request-validation" => json!({"header_schema": {"type": "object"}}),
+            "ai-proxy" => json!({
+                "provider": "openai-compatible",
+                "auth": {"header": {"Authorization": "Bearer test"}},
+                "override": {"endpoint": "http://127.0.0.1:9"}
+            }),
             "exit-transformer" => json!({"rules": [{"codes": [404]}]}),
             _ => json!({}),
         }
@@ -560,6 +578,15 @@ mod builtin_phases_tests {
         assert!(traffic_split.upstream_refs.is_some());
         assert!(traffic_split.upstream_jobs.is_some());
 
+        let ai_proxy_meta = plugin_meta(ai_proxy::PLUGIN_NAME).expect("ai-proxy metadata");
+        assert!(matches!(
+            ai_proxy_meta.factory,
+            PluginFactory::WithUpstreams(_)
+        ));
+        assert!(ai_proxy_meta.validate.is_some());
+        assert!(ai_proxy_meta.upstream_jobs.is_some());
+        assert!(ai_proxy_meta.secrets_transform.is_some());
+
         for name in [
             basic_auth::PLUGIN_NAME,
             csrf::PLUGIN_NAME,
@@ -588,7 +615,7 @@ mod builtin_phases_tests {
         }
 
         for (name, phases) in &expected {
-            if *name == traffic_split::PLUGIN_NAME {
+            if *name == traffic_split::PLUGIN_NAME || *name == ai_proxy::PLUGIN_NAME {
                 continue;
             }
             let plugin = build_plugin(name, minimal_config(name), &defaults)
@@ -609,6 +636,15 @@ mod builtin_phases_tests {
             split.phases(),
             expected[traffic_split::PLUGIN_NAME],
             "phases mismatch for traffic-split"
+        );
+
+        // ai-proxy is also WithUpstreams: build through its sync embedder
+        // constructor (IP-literal endpoint, no DNS needed).
+        let ai = ai_proxy::build_ai_proxy_plugin(minimal_config("ai-proxy")).expect("ai-proxy");
+        assert_eq!(
+            ai.phases(),
+            expected[ai_proxy::PLUGIN_NAME],
+            "phases mismatch for ai-proxy"
         );
     }
 }

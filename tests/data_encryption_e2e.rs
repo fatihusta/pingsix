@@ -190,3 +190,78 @@ fn plaintext_in_etcd_becomes_ciphertext_on_resave() {
     transform_resource_secrets(&keyring, "ssls", &mut reloaded, SecretOp::Decrypt).unwrap();
     assert_eq!(reloaded["key"], stored_plaintext["key"]);
 }
+
+/// ai-proxy provider credentials (`auth.header.*` / `auth.query.*`) ride the
+/// same encrypt → etcd → decrypt lifecycle as other plugin secrets, while
+/// non-secret config (`options.model`, endpoint, provider) stays plaintext.
+#[test]
+fn ai_proxy_auth_lifecycle_encrypt_redact_reload() {
+    let keyring = test_keyring();
+
+    let plaintext = serde_json::json!({
+        "id": "r-llm",
+        "uri": "/llm",
+        "plugins": {
+            "ai-proxy": {
+                "provider": "openai",
+                "auth": {
+                    "header": { "Authorization": "Bearer sk-live-plaintext" },
+                    "query": { "api-key": "query-secret" }
+                },
+                "options": { "model": "gpt-4o", "temperature": 0.3 },
+                "override": { "llm_options": { "max_tokens": 1024 } },
+                "timeout": 60000
+            }
+        },
+        "upstream": {
+            "nodes": { "127.0.0.1:1980": 1 },
+            "type": "roundrobin"
+        }
+    });
+
+    // 1) Admin PUT encrypts the credential values before storage.
+    let mut stored = plaintext.clone();
+    transform_resource_secrets(&keyring, "routes", &mut stored, SecretOp::Encrypt).unwrap();
+    assert!(is_ciphertext(
+        &stored["plugins"]["ai-proxy"]["auth"]["header"]["Authorization"]
+    ));
+    assert!(is_ciphertext(
+        &stored["plugins"]["ai-proxy"]["auth"]["query"]["api-key"]
+    ));
+    assert!(
+        !serde_json::to_string(&stored["plugins"]["ai-proxy"]["auth"])
+            .unwrap()
+            .contains("sk-live-plaintext")
+    );
+    // Non-secret fields stay readable.
+    assert_eq!(stored["plugins"]["ai-proxy"]["provider"], "openai");
+    assert_eq!(stored["plugins"]["ai-proxy"]["options"]["model"], "gpt-4o");
+    assert_eq!(
+        stored["plugins"]["ai-proxy"]["override"]["llm_options"]["max_tokens"],
+        1024
+    );
+
+    // 2) GET/LIST view: decrypt then redact — secrets masked, config intact.
+    let mut view = stored.clone();
+    transform_resource_secrets(&keyring, "routes", &mut view, SecretOp::Decrypt).unwrap();
+    let mut shown = view;
+    redact(ResourceKind::Route, &mut shown, &keyring);
+    assert_eq!(
+        shown["plugins"]["ai-proxy"]["auth"]["header"]["Authorization"],
+        "***"
+    );
+    assert_eq!(
+        shown["plugins"]["ai-proxy"]["auth"]["query"]["api-key"],
+        "***"
+    );
+    assert_eq!(shown["plugins"]["ai-proxy"]["options"]["model"], "gpt-4o");
+    assert!(!serde_json::to_string(&shown)
+        .unwrap()
+        .contains(ENVELOPE_SCHEME));
+
+    // 3) Control-plane reload decrypts back to the plaintext credentials the
+    // data plane injects at request time.
+    let mut reloaded = stored.clone();
+    transform_resource_secrets(&keyring, "routes", &mut reloaded, SecretOp::Decrypt).unwrap();
+    assert_eq!(reloaded, plaintext);
+}

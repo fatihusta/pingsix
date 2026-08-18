@@ -729,3 +729,150 @@ pub fn route_to_upstream(uri: &str, upstream_id: &str) -> serde_json::Value {
         "upstream_id": upstream_id
     })
 }
+
+// ---------------------------------------------------------------------------
+// Session-level mock: yields a canned HTTP/1.1 request, then EOF; captures
+// all response bytes. For plugin-pipeline integration tests.
+// ---------------------------------------------------------------------------
+
+use std::pin::Pin;
+use std::task::{Context, Poll};
+
+use async_trait::async_trait;
+use pingora_core::protocols::raw_connect::ProxyDigest;
+use pingora_core::protocols::{
+    GetProxyDigest, GetSocketDigest, GetTimingDigest, Peek, Shutdown, SocketDigest, Ssl,
+    TimingDigest, UniqueID, UniqueIDType, IO,
+};
+use pingora_proxy::Session;
+use tokio::io::ReadBuf;
+
+#[derive(Debug)]
+pub struct MockStream {
+    to_read: Vec<u8>,
+    read_offset: usize,
+    written: Arc<Mutex<Vec<u8>>>,
+}
+
+impl MockStream {
+    fn new(request: &[u8], written: Arc<Mutex<Vec<u8>>>) -> Self {
+        Self {
+            to_read: request.to_vec(),
+            read_offset: 0,
+            written,
+        }
+    }
+}
+
+impl tokio::io::AsyncRead for MockStream {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        _cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        if self.read_offset >= self.to_read.len() {
+            // EOF
+            return Poll::Ready(Ok(()));
+        }
+        let remaining = &self.to_read[self.read_offset..];
+        let n = remaining.len().min(buf.remaining());
+        buf.put_slice(&remaining[..n]);
+        self.read_offset += n;
+        Poll::Ready(Ok(()))
+    }
+}
+
+impl tokio::io::AsyncWrite for MockStream {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        _cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
+        self.written.lock().unwrap().extend_from_slice(buf);
+        Poll::Ready(Ok(buf.len()))
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Poll::Ready(Ok(()))
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Poll::Ready(Ok(()))
+    }
+}
+
+#[async_trait]
+impl Shutdown for MockStream {
+    async fn shutdown(&mut self) {}
+}
+
+impl UniqueID for MockStream {
+    fn id(&self) -> UniqueIDType {
+        0
+    }
+}
+
+impl Ssl for MockStream {}
+
+impl GetTimingDigest for MockStream {
+    fn get_timing_digest(&self) -> Vec<Option<TimingDigest>> {
+        Vec::new()
+    }
+}
+
+impl GetProxyDigest for MockStream {
+    fn get_proxy_digest(&self) -> Option<Arc<ProxyDigest>> {
+        None
+    }
+}
+
+impl GetSocketDigest for MockStream {
+    fn get_socket_digest(&self) -> Option<Arc<SocketDigest>> {
+        None
+    }
+}
+
+#[async_trait]
+impl Peek for MockStream {}
+
+/// Build a session whose downstream yields `request` and whose writes are
+/// captured into the returned buffer.
+pub async fn session_for(request: &[u8]) -> (Session, Arc<Mutex<Vec<u8>>>) {
+    let written = Arc::new(Mutex::new(Vec::new()));
+    let stream: Box<dyn IO> = Box::new(MockStream::new(request, written.clone()));
+    let mut session = Session::new_h1(stream);
+    session
+        .downstream_session
+        .read_request()
+        .await
+        .expect("canned request parses");
+    (session, written)
+}
+
+/// Split a raw HTTP/1.1 response into (status, body).
+pub fn status_and_body(raw: &[u8]) -> (u16, String) {
+    let text = String::from_utf8_lossy(raw);
+    let mut parts = text.splitn(2, "\r\n\r\n");
+    let head = parts.next().unwrap_or_default();
+    let body = parts.next().unwrap_or_default().to_string();
+
+    let status: u16 = head
+        .lines()
+        .next()
+        .and_then(|line| line.split_whitespace().nth(1))
+        .and_then(|code| code.parse().ok())
+        .expect("status line present");
+    (status, body)
+}
+
+/// First value of a response header, case-insensitive.
+pub fn header_value(raw: &[u8], name: &str) -> Option<String> {
+    let text = String::from_utf8_lossy(raw);
+    let head = text.split("\r\n\r\n").next().unwrap_or_default();
+    head.lines().skip(1).find_map(|line| {
+        let (k, v) = line.split_once(':')?;
+        k.trim()
+            .eq_ignore_ascii_case(name)
+            .then(|| v.trim().to_string())
+    })
+}

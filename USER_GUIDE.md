@@ -1373,7 +1373,7 @@ global_rules:
 
 ## Plugins
 
-PingSIX includes 28 built-in plugins for various functionalities:
+PingSIX includes 29 built-in plugins for various functionalities:
 
 ### Plugin Execution Order
 
@@ -1922,6 +1922,137 @@ abort:
   body: "Gateway Timeout"
   percentage: 5
 ```
+
+### AI Plugins
+
+#### AI Proxy (`ai-proxy`)
+
+APISIX-compatible LLM proxy (v1). Clients send **OpenAI Chat-format**
+requests; the plugin injects provider authentication, transforms the request
+body, switches the request onto the provider's upstream (per-provider
+keepalive/timeout settings), and passes responses through untouched —
+including SSE streaming responses (`"stream": true`).
+
+```yaml
+routes:
+  - id: llm-proxy
+    uri: /llm/*
+    upstream:                       # placeholder: ai-proxy overrides it per request
+      nodes:
+        "127.0.0.1:1980": 1
+    plugins:
+      ai-proxy:
+        provider: openai            # openai | openai-compatible | deepseek | anthropic
+        auth:
+          header:
+            Authorization: "Bearer ${OPENAI_API_KEY}"
+        options:                    # deep-merged into the client body (options win)
+          model: gpt-4o
+          temperature: 0.2
+        override:
+          llm_options:
+            max_tokens: 1024        # forced; mapped per provider
+        timeout: 30000              # ms, 1..=600000
+        max_req_body_size: 67108864 # request body cap, larger → 413
+        keepalive: true
+        keepalive_timeout: 60000    # ms, >= 1000
+        keepalive_pool: 30          # accepted (Pingora uses a process-global pool)
+        ssl_verify: true
+```
+
+**Configuration reference (v1):**
+
+| Field | Type | Default | Notes |
+|---|---|---|---|
+| `provider` | string | — (required) | `openai`, `openai-compatible`, `deepseek`, `anthropic` |
+| `auth.header` | map | — | header name → value, injected verbatim (`Authorization`, `x-api-key`, …) |
+| `auth.query` | map | — | query parameter → value; values are non-overridable |
+| `auth` | — | — | at least one of `header`/`query` must be non-empty (v1 has no gcp/aws auth) |
+| `options` | object | — | deep-merged into the client body; objects recurse, arrays/scalars replace |
+| `override.endpoint` | string | — | replaces the provider endpoint; an endpoint path wins over the provider default chat path |
+| `override.llm_options.max_tokens` | int ≥ 1 | — | forced token limit; openai → `max_completion_tokens` (legacy `max_tokens` removed), others → `max_tokens` |
+| `timeout` | ms | 30000 | upstream connect/send/read (seconds granularity, min 1s) |
+| `max_req_body_size` | bytes | 67108864 | request body cap; larger bodies → 413 |
+| `keepalive` | bool | true | `false` disables connection reuse |
+| `keepalive_timeout` | ms | 60000 | idle timeout, ≥ 1000 |
+| `keepalive_pool` | int | 30 | accepted for APISIX compatibility (not enforced by Pingora 0.8) |
+| `ssl_verify` | bool | true | `false` disables provider certificate verification |
+
+**Provider defaults:**
+
+| Provider | Endpoint | `max_tokens` maps to |
+|---|---|---|
+| `openai` | `https://api.openai.com/v1/chat/completions` | `max_completion_tokens` (deletes `max_tokens`) |
+| `deepseek` | `https://api.deepseek.com/chat/completions` | `max_tokens` |
+| `openai-compatible` | — (requires `override.endpoint`) | `max_tokens` |
+| `anthropic` | `https://api.anthropic.com/v1/messages` | `max_tokens` |
+
+**Anthropic conversion.** For `provider: anthropic` the client's OpenAI body
+is converted to Anthropic Messages format: `system`-role messages are
+extracted into the top-level `system` string; `user`/`assistant` messages
+pass through; `max_completion_tokens` falls back to `max_tokens`; `stop`
+becomes `stop_sequences`; a whitelist of compatible fields (`stream`,
+`temperature`, `top_p`, `top_k`) passes through and other OpenAI-only fields
+are dropped. The plugin injects `anthropic-version: 2023-06-01` (your
+`auth.header` entry, if any, wins).
+
+**Streaming.** The upstream read timeout is relaxed for every ai-proxy
+request — LLM upstreams legitimately go silent between reads, whether a
+non-streaming completion thinking before its first byte or an SSE stream
+between chunks, and pingora's `read_timeout` bounds the gap *between* reads.
+`timeout` still bounds connect and write. A total-duration bound
+(`max_stream_duration_ms`) is planned for v2. Responses are passed through
+unmodified (no re-buffering, no SSE normalization).
+
+**Security notes**
+
+- The client's `Authorization` header is **deleted** before proxying (the
+  provider never sees client credentials; provider auth comes from
+  `auth.header`/`auth.query`). This intentionally differs from APISIX,
+  which forwards client headers and overlays `auth.header`.
+- `auth.header.*` and `auth.query.*` values are field-encrypted at rest
+  (see [Encrypting Sensitive Plugin Fields](#encrypting-sensitive-plugin-fields))
+  and redacted in Admin API reads.
+- `Accept-Encoding` is stripped so responses reach clients uncompressed.
+
+**Request handling.** A non-JSON `Content-Type` or a bodyless request is
+rejected early with **400** (`{"error": "..."}`). Invalid JSON, a
+non-object body, a missing/malformed `messages` array, or a body larger
+than `max_req_body_size` are detected while streaming the body and surface
+as **400**/**413** with an empty body (`exit-transformer` can supply one).
+All gateway exits flow through `exit-transformer`.
+
+The upstream request is sent with `Transfer-Encoding: chunked` framing
+(the transformed body length is unknown until the client body completes),
+which every HTTP/1.1 provider accepts.
+
+**Caveats**
+
+- The route still needs an upstream configured (`Route` schema requires
+  one); ai-proxy overrides it at request time, so any placeholder works.
+- When ai-proxy and `request-validation` share a route scope, body schemas
+  are skipped once ai-proxy has transformed the body (the client-format
+  schema would misreject the provider-format body); header schemas still
+  apply. A *global*-scope request-validation still buffers before a
+  *route*-scope ai-proxy injects — avoid that combination.
+- `timeout` is applied at seconds granularity (500ms → 1s).
+
+**APISIX compatibility matrix (v1):**
+
+| Capability | Status |
+|---|---|
+| `provider`/`auth`/`options`/`override.llm_options`/`timeout`/`max_req_body_size`/`keepalive*`/`ssl_verify` | ✅ identical semantics and bounds |
+| openai / openai-compatible / deepseek / anthropic providers | ✅ |
+| SSE streaming passthrough | ✅ (with read-timeout relaxation) |
+| client `Authorization` header | ⚠️ deleted (APISIX forwards it; `auth.header` overlays) |
+| `anthropic-version` header | ⚠️ auto-injected `2023-06-01` (APISIX ≥ 3.17 expects the client or `auth.header`) |
+| `options` merge | ⚠️ deep merge; APISIX overwrites top-level keys wholesale (identical for scalar options) |
+| error bodies | ⚠️ JSON `{"error": ...}` (APISIX returns plain text messages) |
+| `override.request_body` / `request_body_force_override` | ❌ rejected (v2+) |
+| protocol auto-detection (`/v1/responses`, embeddings, anthropic-native clients, converters) | ❌ v1 accepts OpenAI Chat-format clients only |
+| response transforms, `max_response_bytes`, `max_stream_duration_ms`, token-usage vars | ❌ v2/v3 |
+| `auth.gcp` / `auth.aws` (SigV4), azure/gemini/openrouter/aimlapi/vertex-ai/bedrock | ❌ out of v1 scope |
+| `ai-proxy-multi` (multi-instance load balancing, fallback strategies) | ❌ planned |
 
 ### Compression
 

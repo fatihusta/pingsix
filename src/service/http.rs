@@ -58,6 +58,43 @@ fn is_websocket_upgrade(headers: &http::HeaderMap) -> bool {
     connection_has_upgrade && upgrade_is_websocket
 }
 
+/// Apply ai-proxy request-scoped peer adjustments after upstream selection.
+///
+/// Two flags travel on the request context because peer options cannot be
+/// expressed on the upstream resource (its TLS block carries only client
+/// certificates) or must be set for every ai-proxy request:
+///
+/// * read-timeout relaxation (`ai_proxy::relax_read_timeout`, set for every
+///   ai-proxy request): LLM upstreams legitimately go silent between reads —
+///   non-streaming completions before their first byte ("thinking"), SSE
+///   streams between chunks — and pingora's `read_timeout` bounds the gap
+///   *between* reads, so it is lifted. The write timeout stays as client-side
+///   abuse protection (same reasoning as the WebSocket branch above). A
+///   total-duration bound (`max_stream_duration_ms`) is planned for v2.
+/// * `ssl_verify: false`: disable certificate verification for the selected
+///   provider peer.
+fn apply_ai_proxy_peer_options(ctx: &ProxyContext, peer: &mut HttpPeer) {
+    if ctx
+        .get::<bool>(crate::plugins::ai_proxy::CTX_KEY_RELAX_READ_TIMEOUT)
+        .copied()
+        .unwrap_or(false)
+    {
+        peer.options.read_timeout = None;
+        log::debug!("ai-proxy request: relaxed upstream read_timeout");
+    }
+    if ctx
+        .get::<bool>(crate::plugins::ai_proxy::CTX_KEY_INSECURE_TLS)
+        .copied()
+        .unwrap_or(false)
+    {
+        peer.options.verify_cert = false;
+        peer.options.verify_hostname = false;
+        log::debug!(
+            "ai-proxy request: disabled upstream certificate verification (ssl_verify=false)"
+        );
+    }
+}
+
 static CACHE_REQUESTS: Lazy<IntCounterVec> = Lazy::new(|| {
     register_int_counter_vec!(
         "pingsix_cache_requests_total",
@@ -255,6 +292,8 @@ impl ProxyHttp for HttpService {
             peer.options.write_timeout = None;
             log::debug!("WebSocket request: disabled upstream read/write timeouts");
         }
+
+        apply_ai_proxy_peer_options(ctx, &mut peer);
 
         Ok(peer)
     }
@@ -586,5 +625,55 @@ mod tests {
 
         headers.insert(http::header::UPGRADE, "h2c".parse().unwrap());
         assert!(!is_websocket_upgrade(&headers));
+    }
+
+    fn configured_peer() -> HttpPeer {
+        let mut peer = HttpPeer::new("127.0.0.1:9443", true, "provider.internal".to_string());
+        peer.options.read_timeout = Some(Duration::from_secs(60));
+        peer.options.write_timeout = Some(Duration::from_secs(60));
+        peer.options.verify_cert = true;
+        peer.options.verify_hostname = true;
+        peer
+    }
+
+    #[test]
+    fn ai_proxy_flag_relaxes_read_timeout_only() {
+        let mut ctx = ProxyContext::default();
+        let mut peer = configured_peer();
+        apply_ai_proxy_peer_options(&ctx, &mut peer);
+        assert_eq!(peer.options.read_timeout, Some(Duration::from_secs(60)));
+        assert_eq!(peer.options.write_timeout, Some(Duration::from_secs(60)));
+        assert!(peer.options.verify_cert);
+
+        ctx.set(crate::plugins::ai_proxy::CTX_KEY_RELAX_READ_TIMEOUT, true);
+        apply_ai_proxy_peer_options(&ctx, &mut peer);
+        assert_eq!(
+            peer.options.read_timeout, None,
+            "ai-proxy requests must not be killed between upstream reads"
+        );
+        assert_eq!(
+            peer.options.write_timeout,
+            Some(Duration::from_secs(60)),
+            "write timeout stays as abuse protection"
+        );
+        assert!(
+            peer.options.verify_cert,
+            "relaxation alone must not touch TLS"
+        );
+    }
+
+    #[test]
+    fn ai_proxy_insecure_flag_disables_cert_verification_only() {
+        let mut ctx = ProxyContext::default();
+        ctx.set(crate::plugins::ai_proxy::CTX_KEY_INSECURE_TLS, true);
+        let mut peer = configured_peer();
+        apply_ai_proxy_peer_options(&ctx, &mut peer);
+        assert!(!peer.options.verify_cert);
+        assert!(!peer.options.verify_hostname);
+        assert_eq!(
+            peer.options.read_timeout,
+            Some(Duration::from_secs(60)),
+            "insecure TLS alone must not touch timeouts"
+        );
     }
 }
