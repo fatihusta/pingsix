@@ -46,6 +46,15 @@ pub(crate) fn cache_key_method(method: &str) -> &str {
     }
 }
 
+/// Whether a `PURGE` request may remove the matching cache entry.
+///
+/// PURGE is an opt-in because it is intentionally unauthenticated: an
+/// unconditional purge lets any client force cache misses (stampede DoS).
+/// Deployments that enable it must front the proxy with their own ACL.
+pub(crate) fn should_enable_purge(settings: Option<&Arc<CacheSettings>>) -> bool {
+    settings.is_some_and(|settings| settings.enable_purge)
+}
+
 pub(crate) fn should_enable_request_cache(
     headers: &http::HeaderMap,
     settings: Option<&Arc<CacheSettings>>,

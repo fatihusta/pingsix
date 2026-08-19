@@ -5,9 +5,11 @@
 //! - readiness becomes unavailable / process exits
 //! - process exits cleanly within a timeout
 
+use std::collections::HashSet;
 use std::io::{Read, Write};
-use std::net::TcpStream;
+use std::net::{TcpListener, TcpStream};
 use std::process::{Command, Stdio};
+use std::sync::{LazyLock, Mutex};
 use std::time::{Duration, Instant};
 
 /// Create a minimal static config YAML that doesn't require any external
@@ -36,10 +38,23 @@ routes: []
     )
 }
 
-/// Pick a random unused port by binding to port 0.
+/// Pick a random unused port, never returning the same port twice within
+/// this test process. The probe socket is held open while the port is
+/// registered, so concurrent calls cannot observe a duplicate (see
+/// tests/common/mod.rs for the listener/status port collision this prevents).
+static HANDED_OUT_PORTS: LazyLock<Mutex<HashSet<u16>>> =
+    LazyLock::new(|| Mutex::new(HashSet::new()));
+
 fn random_port() -> u16 {
-    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    listener.local_addr().unwrap().port()
+    loop {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let fresh = HANDED_OUT_PORTS.lock().unwrap().insert(port);
+        drop(listener);
+        if fresh {
+            return port;
+        }
+    }
 }
 
 fn http_status(addr: &str, path: &str) -> Option<u16> {

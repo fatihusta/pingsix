@@ -105,6 +105,11 @@ pub struct ProxyContext {
     pub pipeline: CompiledPluginPipeline,
     /// Request start timestamp for performance metrics and timeouts.
     pub request_start: Instant,
+    /// Bytes of the downstream request body streamed through the request-body
+    /// pipeline so far. Unowned by any plugin and updated in place; avoids
+    /// per-chunk `vars` allocation for body-size accounting (e.g.
+    /// `client-control`).
+    pub request_body_bytes: u64,
     /// Unique request identifier, set by request-id plugin if enabled.
     pub request_id: Option<String>,
     /// Whether the original downstream request contained authentication/session credentials.
@@ -127,6 +132,7 @@ impl Default for ProxyContext {
             tries: 0,
             pipeline: CompiledPluginPipeline::default(),
             request_start: Instant::now(),
+            request_body_bytes: 0,
             request_id: None,
             original_request_had_credentials: false,
             request_has_credentials: false,

@@ -1,10 +1,10 @@
 use std::{
     borrow::Cow,
-    collections::HashMap,
-    sync::{Arc, Mutex},
+    sync::Arc,
     time::{Duration, Instant},
 };
 
+use dashmap::DashMap;
 use futures::FutureExt;
 use hickory_resolver::TokioResolver;
 use http::Uri;
@@ -71,8 +71,10 @@ struct PassiveHealthState {
     config: config::PassiveCheck,
     /// Keyed by stable backend id (`selection::backend_id`) instead of the
     /// backend address string, so observe/select paths never allocate a
-    /// `String` per lookup.
-    counters: Mutex<HashMap<selection::BackendId, PassiveCounters>>,
+    /// `String` per lookup. A sharded map keeps per-key state off a single
+    /// global mutex: every ready-backend check during selection only locks
+    /// the shard of that one backend.
+    counters: DashMap<selection::BackendId, PassiveCounters>,
     #[cfg(test)]
     on_transition: Option<Box<dyn Fn(bool) + Send + Sync>>,
 }
@@ -99,8 +101,10 @@ struct PassiveCounters {
 
 impl PassiveHealthState {
     fn observe(&self, backend: &Backend, outcome: PassiveOutcome) {
-        let mut counters = self.counters.lock().unwrap_or_else(|e| e.into_inner());
-        let node = counters.entry(selection::backend_id(backend)).or_default();
+        let mut node = self
+            .counters
+            .entry(selection::backend_id(backend))
+            .or_default();
 
         let unhealthy = &self.config.unhealthy;
         let healthy_statuses = &self.config.healthy.http_statuses;
@@ -173,19 +177,14 @@ impl PassiveHealthState {
     }
 
     fn has_tripped(&self) -> bool {
-        self.counters
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .values()
-            .any(|node| node.tripped)
+        self.counters.iter().any(|entry| entry.value().tripped)
     }
 
     /// Admit at most one half-open request to a tripped node until its probe
     /// lease expires. Called only after no regular ready node was selectable,
     /// so healthy nodes always continue to receive normal traffic.
     fn take_probe(&self, backend: &Backend, now: Instant) -> bool {
-        let mut counters = self.counters.lock().unwrap_or_else(|e| e.into_inner());
-        let Some(node) = counters.get_mut(&selection::backend_id(backend)) else {
+        let Some(mut node) = self.counters.get_mut(&selection::backend_id(backend)) else {
             return false;
         };
         let lease_free = node.probe_lease.map(|d| d <= now).unwrap_or(true);
@@ -304,7 +303,7 @@ impl ProxyUpstream {
             .and_then(|c| c.passive.clone())
             .map(|config| PassiveHealthState {
                 config,
-                counters: Mutex::new(HashMap::new()),
+                counters: DashMap::new(),
                 #[cfg(test)]
                 on_transition: None,
             });
@@ -332,8 +331,6 @@ impl ProxyUpstream {
             self.passive.as_ref().is_none_or(|passive| {
                 !passive
                     .counters
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
                     .get(&selection::backend_id(backend))
                     .is_some_and(|node| node.tripped)
             })
@@ -524,7 +521,11 @@ where
         resolver: &Arc<TokioResolver>,
     ) -> ProxyResult<Self> {
         let refresh: HybridDiscovery = HybridDiscovery::build(upstream.clone(), resolver.clone())?;
-        let discovery = SeededDiscovery::new(prepared, refresh);
+        let discovery = SeededDiscovery::new(
+            prepared,
+            refresh,
+            Duration::from_secs(defaults.dns_resolution_timeout),
+        );
         let mut upstreams = LoadBalancer::<selection::PriorityGrouped<BS>>::from_backends(
             Backends::new(Box::new(discovery)),
         );
@@ -1208,7 +1209,7 @@ mod passive_tests {
                     http_failures,
                 },
             },
-            counters: Mutex::new(HashMap::new()),
+            counters: DashMap::new(),
             on_transition: Some(Box::new(move |enabled| {
                 if enabled {
                     restores_clone.fetch_add(1, std::sync::atomic::Ordering::SeqCst);

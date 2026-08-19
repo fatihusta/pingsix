@@ -22,6 +22,20 @@ use crate::{
 pub const PLUGIN_NAME: &str = "limit-count";
 const PRIORITY: i32 = 1002;
 
+/// Context key holding the request's rate-limit quota as one typed value.
+/// Keeping a single `vars` entry (instead of three string entries) avoids
+/// three key allocations per request on the hot path.
+const CTX_KEY_RATE_LIMIT_QUOTA: &str = "pingsix_rate_limit_quota";
+
+/// Typed rate-limit quota stored in the request context and expanded into
+/// response headers by [`PluginRateLimit::response_filter`].
+struct RateLimitQuota {
+    limit: u32,
+    remaining: isize,
+    reset: u32,
+    current_count: isize,
+}
+
 static RATE_LIMIT_REQUESTS: Lazy<IntCounterVec> = Lazy::new(|| {
     register_int_counter_vec!(
         "pingsix_rate_limit_requests_total",
@@ -206,9 +220,15 @@ impl ProxyPlugin for PluginRateLimit {
 
         // Store rate limit info in context for potential use by other plugins
         if self.config.show_limit_quota_header {
-            ctx.set("rate_limit_limit", self.config.count.to_string());
-            ctx.set("rate_limit_remaining", remaining.to_string());
-            ctx.set("rate_limit_reset", self.config.time_window.to_string());
+            ctx.set(
+                CTX_KEY_RATE_LIMIT_QUOTA,
+                RateLimitQuota {
+                    limit: self.config.count,
+                    remaining,
+                    reset: self.config.time_window,
+                    current_count,
+                },
+            );
         }
 
         Ok(false)
@@ -221,20 +241,17 @@ impl ProxyPlugin for PluginRateLimit {
         ctx: &mut ProxyContext,
     ) -> Result<()> {
         if self.config.show_limit_quota_header {
-            for (context_key, header) in [
-                ("rate_limit_limit", "X-Rate-Limit-Limit"),
-                ("rate_limit_remaining", "X-Rate-Limit-Remaining"),
-                ("rate_limit_reset", "X-Rate-Limit-Reset"),
-            ] {
-                if let Some(value) = ctx.get_str(context_key) {
-                    upstream_response.insert_header(header, value)?;
+            if let Some(quota) = ctx.get::<RateLimitQuota>(CTX_KEY_RATE_LIMIT_QUOTA) {
+                let headers = build_rate_limit_headers(
+                    quota.limit,
+                    quota.remaining,
+                    quota.reset,
+                    quota.current_count,
+                    true,
+                );
+                for (name, value) in headers {
+                    upstream_response.insert_header(name, value)?;
                 }
-            }
-            // Only expose the implementation scope when this plugin recorded
-            // quota data for the request. A short-circuited request may still
-            // reach this filter without ever being rate-limited.
-            if ctx.get_str("rate_limit_limit").is_some() {
-                upstream_response.insert_header("X-RateLimit-Scope", "local")?;
             }
         }
         Ok(())
@@ -284,9 +301,15 @@ impl PluginRateLimit {
                         .with_label_values(&["allowed", "local"])
                         .inc();
                     if self.config.show_limit_quota_header {
-                        ctx.set("rate_limit_limit", self.config.count.to_string());
-                        ctx.set("rate_limit_remaining", remaining.to_string());
-                        ctx.set("rate_limit_reset", self.config.time_window.to_string());
+                        ctx.set(
+                            CTX_KEY_RATE_LIMIT_QUOTA,
+                            RateLimitQuota {
+                                limit: self.config.count,
+                                remaining,
+                                reset: self.config.time_window,
+                                current_count,
+                            },
+                        );
                     }
                     Ok(false)
                 }

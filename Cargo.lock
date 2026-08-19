@@ -3131,6 +3131,7 @@ dependencies = [
  "serde_with",
  "serde_yml",
  "sha2",
+ "smallvec",
  "subtle",
  "tokio",
  "tokio-util",

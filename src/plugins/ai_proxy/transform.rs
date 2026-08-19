@@ -19,8 +19,10 @@
 //! 5. For anthropic, convert the structure to Anthropic Messages format and
 //!    enforce the provider's required fields (`model`, `max_tokens`, at
 //!    least one non-system message) locally.
-//! 6. Serialize once (`serde_json::to_vec`): the byte length is the exact
-//!    upstream Content-Length.
+//! 6. Serialize once (`serde_json::to_vec`). The runtime switches the upstream
+//!    request to chunked framing (see `ai_proxy/mod.rs`), so the exact byte
+//!    length is not written back as Content-Length; serializing once still
+//!    avoids a second transform pass and gives deterministic bytes.
 
 use bytes::Bytes;
 use serde_json::{Map, Value as JsonValue};
@@ -30,8 +32,9 @@ use super::provider::{provider_spec, MaxTokensField, Provider};
 /// The transformed outbound request.
 #[derive(Debug, Clone)]
 pub(crate) struct TransformedRequest {
-    /// Deterministically serialized provider-format body. Its length is the
-    /// recomputed upstream Content-Length.
+    /// Deterministically serialized provider-format body. Framing is chunked
+    /// upstream (see `ai_proxy/mod.rs`), so this buffer is emitted as one
+    /// chunk at end-of-stream rather than as a rewritten Content-Length.
     pub(crate) body: Bytes,
     /// Whether the final body carries `"stream": true`.
     pub(crate) streaming: bool,

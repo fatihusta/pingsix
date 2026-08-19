@@ -30,9 +30,6 @@ pub const PLUGIN_NAME: &str = "client-control";
 /// APISIX `client-control` runs at priority 22000 (before request-id 12015).
 const PRIORITY: i32 = 22000;
 
-/// Context key accumulating streamed request body bytes for this request.
-const CTX_KEY_BODY_BYTES: &str = "pingsix_client_control_body_bytes";
-
 /// Sentinel error type matched by `fail_to_proxy` to emit 413.
 pub const ERROR_PAYLOAD_TOO_LARGE: &str = "PayloadTooLarge";
 
@@ -124,11 +121,14 @@ impl ProxyPlugin for PluginClientControl {
             return Ok(());
         }
         if let Some(bytes) = body {
-            let accumulated =
-                ctx.get::<u64>(CTX_KEY_BODY_BYTES).copied().unwrap_or(0) + bytes.len() as u64;
-            ctx.set(CTX_KEY_BODY_BYTES, accumulated);
-            if accumulated > limit {
-                log::debug!("client-control: streamed {accumulated} bytes exceeds limit {limit}");
+            // Count in-place on the context: a `vars` map write would allocate
+            // a new key/box for every body chunk on large uploads.
+            ctx.request_body_bytes = ctx.request_body_bytes.saturating_add(bytes.len() as u64);
+            if ctx.request_body_bytes > limit {
+                log::debug!(
+                    "client-control: streamed {} bytes exceeds limit {limit}",
+                    ctx.request_body_bytes
+                );
                 return Err(Error::explain(
                     ErrorType::Custom(ERROR_PAYLOAD_TOO_LARGE),
                     format!("request body exceeded max_body_size {limit}"),

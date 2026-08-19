@@ -329,13 +329,19 @@ pub(crate) async fn prepare_upstream(
 pub(crate) struct SeededDiscovery {
     initial: Mutex<Option<PreparedUpstream>>,
     refresh: HybridDiscovery,
+    refresh_timeout: Duration,
 }
 
 impl SeededDiscovery {
-    pub(crate) fn new(initial: PreparedUpstream, refresh: HybridDiscovery) -> Self {
+    pub(crate) fn new(
+        initial: PreparedUpstream,
+        refresh: HybridDiscovery,
+        refresh_timeout: Duration,
+    ) -> Self {
         Self {
             initial: Mutex::new(Some(initial)),
             refresh,
+            refresh_timeout,
         }
     }
 }
@@ -351,7 +357,17 @@ impl ServiceDiscovery for SeededDiscovery {
         {
             return Ok((prepared.backends, prepared.health_checks));
         }
-        self.refresh.discover().await
+        // The candidate-preparation path already bounds DNS resolution with
+        // `dns_resolution_timeout`; periodic background refreshes must not be
+        // allowed to hang the health-check/refresh service forever.
+        tokio::time::timeout(self.refresh_timeout, self.refresh.discover())
+            .await
+            .map_err(|_| {
+                Error::explain(
+                    InternalError,
+                    format!("DNS refresh timed out after {:?}", self.refresh_timeout),
+                )
+            })?
     }
 }
 

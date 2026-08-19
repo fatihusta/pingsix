@@ -14,7 +14,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::{
     config::EffectiveDefaults,
-    core::{status::StatusStore, ProxyError},
+    core::{status::StatusStore, ProxyError, ProxyResult},
     proxy::{
         control_plane::{prepare_candidate, CandidateSnapshot, ResourceConfigSet},
         runtime::{RuntimeSnapshot, RuntimeStore},
@@ -415,24 +415,36 @@ impl ConfigurationGraph {
         };
         // Heavy CPU work (plugin/route/matcher/SSL build, route matcher
         // construction) runs OUTSIDE write_lock so a slow candidate compile
-        // does not block new watch/list submissions. The generation fence
-        // below discards the result if a newer generation superseded this one
-        // while it was compiling.
+        // does not block new watch/list submissions. It also runs on the
+        // blocking thread pool instead of a tokio worker, so a large graph
+        // cannot stall data-plane tasks sharing this runtime. The generation
+        // fence below discards the result if a newer generation superseded
+        // this one while it was compiling.
         let (plan, prepared) = prepared;
-        let candidate = match CandidateSnapshot::build_prepared(
-            logical.clone(),
-            &plan,
-            &prepared,
-            &previous,
-            &self.inner.defaults,
-            &self.inner.resolver,
-        ) {
-            Ok(candidate) => candidate,
-            Err(error) => return PrepareOutcome::Permanent(error),
-        };
-        let compiled = match RuntimeSnapshot::compile(candidate, revision) {
-            Ok(compiled) => compiled,
-            Err(error) => return PrepareOutcome::Permanent(error),
+        let previous = previous.clone();
+        let defaults = self.inner.defaults.clone();
+        let resolver = self.inner.resolver.clone();
+        let compiled = tokio::select! {
+            result = tokio::task::spawn_blocking(move || -> ProxyResult<RuntimeSnapshot> {
+                let candidate = CandidateSnapshot::build_prepared(
+                    logical,
+                    &plan,
+                    &prepared,
+                    &previous,
+                    &defaults,
+                    &resolver,
+                )?;
+                RuntimeSnapshot::compile(candidate, revision)
+            }) => match result {
+                Ok(Ok(compiled)) => compiled,
+                Ok(Err(error)) => return PrepareOutcome::Permanent(error),
+                Err(join_error) => {
+                    return PrepareOutcome::Permanent(ProxyError::Internal(format!(
+                        "control-plane compile task panicked: {join_error}"
+                    )))
+                }
+            },
+            _ = cancellation.cancelled() => return PrepareOutcome::Settled,
         };
         // Acquire write_lock only for the generation fence + atomic publish +
         // committed-graph update.

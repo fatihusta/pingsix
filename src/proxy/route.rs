@@ -396,7 +396,18 @@ impl MatchEntry {
         routes: &std::collections::HashMap<String, Arc<ProxyRoute>>,
     ) -> ProxyResult<Self> {
         let mut matcher = Self::default();
-        for route in routes.values() {
+        // Make the matcher deterministic across process restarts: `HashMap`
+        // iteration order is randomized, and equal-priority routes sharing the
+        // same URI keep insertion order in `insert_into_router`. Without an
+        // explicit tie-break, which route wins a tie could change on every boot.
+        let mut routes: Vec<_> = routes.values().cloned().collect();
+        routes.sort_by(|a, b| {
+            b.inner
+                .priority
+                .cmp(&a.inner.priority)
+                .then_with(|| a.inner.id.cmp(&b.inner.id))
+        });
+        for route in routes {
             matcher.insert_route(route.clone()).map_err(|e| {
                 ProxyError::Configuration(format!(
                     "Failed to build route matcher for '{}': {e}",
@@ -821,6 +832,57 @@ mod tests {
         .unwrap();
         let exec = proxy_route.build_plugin_executor();
         assert!(Arc::ptr_eq(&exec, &ProxyPluginExecutor::default_shared()));
+    }
+
+    #[test]
+    fn same_priority_same_uri_routes_follow_id_tie_break_across_builds() {
+        // Regression for determinism: equal-priority routes sharing one URI
+        // used to inherit HashMap iteration order, which is randomized per
+        // map instance / process. The matcher must always prefer the same
+        // route (smallest id) regardless of insertion order.
+        let resolver = crate::proxy::upstream::discovery::build_resolver_for_state().unwrap();
+        let mk = |id: &str| {
+            Arc::new(
+                ProxyRoute::build(
+                    config::Route {
+                        id: id.to_string(),
+                        name: None,
+                        uri: Some("/tie".to_string()),
+                        uris: vec![],
+                        methods: vec![],
+                        host: None,
+                        hosts: vec![],
+                        priority: 7,
+                        plugins: HashMap::new(),
+                        upstream: None,
+                        upstream_id: None,
+                        service_id: None,
+                        timeout: None,
+                        enable_websocket: false,
+                    },
+                    &HashMap::new(),
+                    &HashMap::new(),
+                    &HashMap::new(),
+                    &config::EffectiveDefaults::default(),
+                    &resolver,
+                )
+                .unwrap(),
+            )
+        };
+        let zebra = mk("zebra");
+        let alpha = mk("alpha");
+
+        for _ in 0..100 {
+            let mut routes = HashMap::new();
+            // Deliberately insert in the "wrong" order each time.
+            routes.insert("zebra".to_string(), zebra.clone());
+            routes.insert("alpha".to_string(), alpha.clone());
+            let matcher = MatchEntry::build(&routes).unwrap();
+            let (_, route) = matcher
+                .match_host_uri_method(None, "/tie", "GET")
+                .expect("route matches");
+            assert_eq!(route.inner.id, "alpha");
+        }
     }
 
     #[test]

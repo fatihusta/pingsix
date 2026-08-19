@@ -11,6 +11,8 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use etcd_client::Client;
+use std::collections::HashSet;
+use std::sync::LazyLock;
 
 pub const ADMIN_API_KEY: &str = "integration-test-key";
 pub const ETCD_IMAGE: &str = "quay.io/coreos/etcd:v3.5.21";
@@ -27,6 +29,7 @@ pub fn docker_available() -> bool {
 }
 
 static DOCKER_SKIP_NOTICE_PRINTED: AtomicBool = AtomicBool::new(false);
+static ETCD_CONTAINER_SEQ: AtomicUsize = AtomicUsize::new(0);
 
 /// Guard for Docker-backed tests.
 ///
@@ -49,9 +52,36 @@ pub fn require_docker(test_name: &str) -> bool {
     false
 }
 
+/// Ports already handed out by [`random_port`] in this test process.
+///
+/// The probe socket is dropped before the caller can bind the port for real,
+/// so the kernel is free to hand the same port to the very next `bind(:0)` —
+/// observed in CI as a config whose listener and status address collided,
+/// making the status app win the bind race and tests talk HTTP to it
+/// (`BrokenPipe`/`ConnectionRefused`). The registry makes every port handed
+/// out in this process single-use.
+static HANDED_OUT_PORTS: LazyLock<Mutex<HashSet<u16>>> =
+    LazyLock::new(|| Mutex::new(HashSet::new()));
+
+/// Pick a random unused port, never returning the same port twice within
+/// this test process.
+///
+/// The probe socket is held open while the port is registered below: a
+/// concurrent `random_port()` on another test thread cannot bind a port that
+/// is currently bound, so duplicates are impossible even under parallel test
+/// execution. The remaining window (some other process grabbing the freed
+/// port before our child binds it) is not preventable from the test side.
 pub fn random_port() -> u16 {
-    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-    listener.local_addr().unwrap().port()
+    loop {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let fresh = HANDED_OUT_PORTS.lock().unwrap().insert(port);
+        drop(listener); // keep the socket open until the port is registered
+        if fresh {
+            return port;
+        }
+        // Handed out earlier in this process: try again.
+    }
 }
 
 pub fn write_config(listen_port: u16, contents: &str) -> String {
@@ -64,6 +94,10 @@ pub fn cleanup_runtime_files(listen_port: u16, config_path: &str) {
     let _ = std::fs::remove_file(config_path);
     let _ = std::fs::remove_file(format!("/tmp/pingsix-it-{listen_port}.pid"));
     let _ = std::fs::remove_file(format!("/tmp/pingsix-it-{listen_port}.sock"));
+    // Also remove the spawned child's redirected log so passed runs do not
+    // accumulate .child.log files in /tmp (PingsixGuard removes it too; the
+    // double remove is harmless).
+    let _ = std::fs::remove_file(child_log_path(config_path));
 }
 
 /// Minimal pingora + pingsix header shared by etcd-mode configs.
@@ -342,38 +376,62 @@ impl EtcdFixture {
             );
         }
         let port = random_port();
-        let container_name = format!("pingsix-it-etcd-{}-{}", std::process::id(), port);
-        let output = Command::new("docker")
-            .args([
-                "run",
-                "-d",
-                "--name",
-                &container_name,
-                "-p",
-                &format!("{port}:2379"),
-                ETCD_IMAGE,
-                "/usr/local/bin/etcd",
-                "--name",
-                "s1",
-                "--data-dir",
-                "/etcd-data",
-                "--listen-client-urls",
-                "http://0.0.0.0:2379",
-                "--advertise-client-urls",
-                "http://0.0.0.0:2379",
-                "--listen-peer-urls",
-                "http://0.0.0.0:2380",
-                "--initial-advertise-peer-urls",
-                "http://0.0.0.0:2380",
-                "--initial-cluster",
-                "s1=http://0.0.0.0:2380",
-                "--initial-cluster-token",
-                "pingsix-it",
-                "--initial-cluster-state",
-                "new",
-            ])
-            .output()
-            .expect("failed to run docker");
+        // The port alone is not unique across repeated local runs: a stopped
+        // container from a previous run keeps its name but releases the port,
+        // so `random_port()` can collide with it. Add a per-process sequence
+        // number, and on a name conflict remove the stale container and retry
+        // once instead of failing the whole test binary.
+        let container_name = format!(
+            "pingsix-it-etcd-{}-{}-{}",
+            std::process::id(),
+            port,
+            ETCD_CONTAINER_SEQ.fetch_add(1, Ordering::Relaxed)
+        );
+        let run_container = || {
+            Command::new("docker")
+                .args([
+                    "run",
+                    "-d",
+                    "--name",
+                    &container_name,
+                    "-p",
+                    &format!("{port}:2379"),
+                    ETCD_IMAGE,
+                    "/usr/local/bin/etcd",
+                    "--name",
+                    "s1",
+                    "--data-dir",
+                    "/etcd-data",
+                    "--listen-client-urls",
+                    "http://0.0.0.0:2379",
+                    "--advertise-client-urls",
+                    "http://0.0.0.0:2379",
+                    "--listen-peer-urls",
+                    "http://0.0.0.0:2380",
+                    "--initial-advertise-peer-urls",
+                    "http://0.0.0.0:2380",
+                    "--initial-cluster",
+                    "s1=http://0.0.0.0:2380",
+                    "--initial-cluster-token",
+                    "pingsix-it",
+                    "--initial-cluster-state",
+                    "new",
+                ])
+                .output()
+                .expect("failed to run docker")
+        };
+        let mut output = run_container();
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            if stderr.contains("already in use") {
+                let _ = Command::new("docker")
+                    .args(["rm", "-f", &container_name])
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null())
+                    .status();
+                output = run_container();
+            }
+        }
         if !output.status.success() {
             panic!(
                 "docker run etcd failed: {}",

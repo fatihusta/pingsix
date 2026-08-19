@@ -2,7 +2,7 @@
 
 mod common;
 
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use common::*;
 
@@ -80,6 +80,112 @@ fn warm_and_assert_cached(listen_port: u16, upstream: &MockUpstream, needle: &st
         hits_after_miss,
         "second request must be served from cache"
     );
+}
+
+#[test]
+fn purge_requires_opt_in() {
+    if !require_docker("cache_isolation") {
+        return;
+    }
+    let etcd = EtcdFixture::start();
+    let prefix = etcd.unique_prefix();
+    let upstream = MockUpstream::start(MockUpstreamConfig {
+        body: "purge-me".into(),
+        ..Default::default()
+    });
+
+    let (listen_port, _status, admin_port, _guard) =
+        boot_cached_route(&etcd, &prefix, upstream.port);
+    let addr = format!("127.0.0.1:{listen_port}");
+    warm_and_assert_cached(listen_port, &upstream, "purge-me");
+    let hits_after_warm = upstream.hits();
+
+    // Default: `enable_purge` is off. A PURGE is ordinary client traffic and
+    // is proxied upstream; it must NOT evict the shared cache entry.
+    let purge = http_exchange(&addr, "PURGE", "/cache", &[], None).expect("purge reachable");
+    assert_eq!(
+        purge.status, 200,
+        "disabled PURGE should be proxied: {}",
+        purge.body
+    );
+    assert_eq!(
+        upstream.hits(),
+        hits_after_warm + 1,
+        "disabled PURGE must reach the upstream"
+    );
+    let after_purge = http_get(&addr, "/cache").expect("GET after disabled PURGE");
+    assert!(
+        after_purge.body.contains("purge-me"),
+        "cache entry must survive a disabled PURGE"
+    );
+    assert_eq!(
+        upstream.hits(),
+        hits_after_warm + 1,
+        "GET after disabled PURGE must still be a cache hit"
+    );
+
+    // Enable PURGE. The route-plugin edit rewrites the cache namespace, so
+    // warm the new namespace first.
+    let put = admin_put(
+        admin_port,
+        "routes",
+        "1",
+        &serde_json::json!({
+            "uri": "/cache",
+            "upstream_id": "1",
+            "plugins": {
+                "cache": { "ttl": 120, "enable_purge": true }
+            }
+        }),
+    );
+    assert_eq!(put.status, 200, "{}", put.body);
+
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        let before = upstream.hits();
+        let get = http_get(&addr, "/cache").expect("GET while warming new cache namespace");
+        assert!(
+            get.body.contains("purge-me"),
+            "unexpected body: {}",
+            get.body
+        );
+        if upstream.hits() == before {
+            // Cache hit: the new namespace is warm.
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "timed out waiting for the new cache namespace to warm"
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
+
+    // Once published, PURGE is intercepted by the cache path (no upstream
+    // request) and the following GET must miss.
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        let before = upstream.hits();
+        http_exchange(&addr, "PURGE", "/cache", &[], None).expect("purge reachable");
+        if upstream.hits() == before {
+            let get = http_get(&addr, "/cache").expect("GET after enabled PURGE");
+            assert!(
+                get.body.contains("purge-me"),
+                "unexpected body after purge: {}",
+                get.body
+            );
+            assert_eq!(
+                upstream.hits(),
+                before + 1,
+                "enabled PURGE must evict: the next GET must go upstream"
+            );
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "timed out waiting for enable_purge publication"
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
 }
 
 #[test]

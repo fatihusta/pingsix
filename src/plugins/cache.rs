@@ -55,6 +55,8 @@ pub struct CacheSettings {
     /// Lowercase, trimmed Vary header names from config, pre-normalized at plugin creation.
     pub vary: Arc<Vec<String>>,
     pub hide_cache_headers: bool,
+    /// Whether `PURGE` requests are wired to remove matching cache entries.
+    pub enable_purge: bool,
     pub max_file_size_bytes: usize,
     /// Enable Stale-While-Revalidate: serve stale content while fetching fresh content in background
     pub stale_while_revalidate: Option<Duration>,
@@ -93,6 +95,13 @@ pub struct PluginConfig {
 
     #[serde(default)]
     pub hide_cache_headers: bool,
+    /// Accept `PURGE` requests that delete the matching cache entry.
+    ///
+    /// Defaults to `false`: in a shared/edge deployment an unauthenticated
+    /// `PURGE` would let any client force cache misses (stampede DoS). This is
+    /// an opt-in for deployments that front PURGE with their own auth/ACL layer.
+    #[serde(default)]
+    pub enable_purge: bool,
 
     /// Cache entries, locks and SWR state are local to this process.
     #[serde(default)]
@@ -277,6 +286,7 @@ pub fn create_cache_plugin(
         statuses,
         vary,
         hide_cache_headers: config.hide_cache_headers,
+        enable_purge: config.enable_purge,
         max_file_size_bytes,
         stale_while_revalidate: config.stale_while_revalidate_secs.map(Duration::from_secs),
         respect_s_maxage: config.respect_s_maxage,
@@ -323,7 +333,9 @@ impl ProxyPlugin for PluginCache {
 
         // 1. PURGE requests must enable the cache too: `is_purge` needs the
         //    cache enabled with a matching key to delete the entry (Guide L46).
-        if method.as_str() == "PURGE" {
+        //    PURGE is opt-in (`enable_purge`) because it is unauthenticated:
+        //    with it disabled a PURGE is proxied like any other method.
+        if method.as_str() == "PURGE" && self.cache_settings.enable_purge {
             ctx.set(CTX_KEY_CACHE_SETTINGS, self.cache_settings.clone());
             log::trace!("Cache enabled for PURGE {path}");
             return Ok(false);
@@ -371,6 +383,7 @@ mod tests {
             statuses: Arc::new(config.cache_http_statuses.iter().cloned().collect()),
             vary: Arc::new(vec![]),
             hide_cache_headers: config.hide_cache_headers,
+            enable_purge: config.enable_purge,
             max_file_size_bytes: resolve_max_file_size(config.max_file_size_bytes, global_default),
             stale_while_revalidate: config.stale_while_revalidate_secs.map(Duration::from_secs),
             respect_s_maxage: config.respect_s_maxage,
@@ -388,6 +401,41 @@ mod tests {
     fn purge_uses_get_cache_key_method() {
         assert_eq!(http::cache_key_method("PURGE"), "GET");
         assert_eq!(http::cache_key_method("HEAD"), "HEAD");
+    }
+
+    #[test]
+    fn purge_is_disabled_by_default() {
+        let config = PluginConfig::try_from(serde_json::json!({ "ttl": 60 })).unwrap();
+        assert!(!config.enable_purge);
+        let settings = settings_from_json(serde_json::json!({ "ttl": 60 }));
+        assert!(!settings.enable_purge);
+    }
+
+    #[test]
+    fn purge_can_be_opted_in() {
+        let config = PluginConfig::try_from(serde_json::json!({
+            "ttl": 60,
+            "enable_purge": true
+        }))
+        .unwrap();
+        assert!(config.enable_purge);
+        let settings = settings_from_json(serde_json::json!({
+            "ttl": 60,
+            "enable_purge": true
+        }));
+        assert!(settings.enable_purge);
+    }
+
+    #[test]
+    fn purge_policy_requires_opt_in() {
+        let disabled = Arc::new(settings_from_json(serde_json::json!({ "ttl": 60 })));
+        let enabled = Arc::new(settings_from_json(serde_json::json!({
+            "ttl": 60,
+            "enable_purge": true
+        })));
+        assert!(http::should_enable_purge(Some(&enabled)));
+        assert!(!http::should_enable_purge(Some(&disabled)));
+        assert!(!http::should_enable_purge(None));
     }
 
     #[test]

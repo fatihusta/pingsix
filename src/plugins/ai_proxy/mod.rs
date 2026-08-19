@@ -289,12 +289,16 @@ fn merged_query(
     if pairs.is_empty() {
         return None;
     }
-    // Keep the first-appearance order, last value per key.
+    // Keep the first-appearance order, last value per key. Positions map makes
+    // dedup O(n) instead of a linear `find` per pair.
+    use std::collections::HashMap;
+    let mut positions: HashMap<String, usize> = HashMap::with_capacity(pairs.len());
     let mut deduped: Vec<(String, String)> = Vec::with_capacity(pairs.len());
     for (key, value) in pairs {
-        if let Some(existing) = deduped.iter_mut().find(|(k, _)| k == &key) {
-            existing.1 = value;
+        if let Some(&position) = positions.get(&key) {
+            deduped[position].1 = value;
         } else {
+            positions.insert(key.clone(), deduped.len());
             deduped.push((key, value));
         }
     }

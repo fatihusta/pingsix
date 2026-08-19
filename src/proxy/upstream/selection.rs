@@ -30,6 +30,7 @@ use pingora_load_balancing::{
     selection::{BackendIter, BackendSelection},
     Backend, LoadBalancer,
 };
+use smallvec::SmallVec;
 
 /// Opaque backend metadata: node priority (`i8`, default 0).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -191,10 +192,10 @@ where
             Some((only, [])) => PriorityGroupedIter::Flat(only.selector.iter(key)),
             Some(_) => PriorityGroupedIter::Grouped(GroupedCursor {
                 grouped: self.clone(),
-                key: key.into(),
+                key: key.iter().copied().collect(),
                 group: 0,
                 inner: None,
-                seen: Box::new([]),
+                seen: SmallVec::new(),
                 drawn: 0,
                 next: 0,
             }),
@@ -211,14 +212,18 @@ pub(crate) enum PriorityGroupedIter<BS: BackendSelection> {
 
 pub(crate) struct GroupedCursor<BS: BackendSelection> {
     grouped: Arc<PriorityGrouped<BS>>,
-    key: Box<[u8]>,
+    /// Selection key, copied once per selection. Stack-allocated for the
+    /// common short key (URI/header values) to avoid a per-request heap
+    /// allocation on the multi-priority-group path.
+    key: SmallVec<[u8; 64]>,
     /// Index into `grouped.groups`.
     group: usize,
     /// Inner iterator of the current group, built on first use.
     inner: Option<BS::Iter>,
-    /// Members of the current group already yielded, indexed by position in
-    /// [`PriorityGroup::backends`].
-    seen: Box<[bool]>,
+    /// Members of the current group already yielded, tracked as a bitset
+    /// indexed by position in [`PriorityGroup::backends`]. One `u64` covers
+    /// groups up to 64 backends; larger groups spill onto the heap only then.
+    seen: SmallVec<[u64; 1]>,
     /// Inner draws made for the current group. Bounds the inner phase so a
     /// cycling iterator (weighted round robin, fnv) cannot spin forever.
     drawn: usize,
@@ -253,9 +258,12 @@ where
         loop {
             let group = cursor.grouped.groups.get(cursor.group)?;
 
-            // (Re)initialize per-group state on first entry.
-            if cursor.seen.len() != group.backends.len() {
-                cursor.seen = vec![false; group.backends.len()].into_boxed_slice();
+            // (Re)initialize per-group state on first entry. The bitset is
+            // empty after a group is exhausted, so `is_empty()` doubles as the
+            // "needs init" marker.
+            if cursor.seen.is_empty() {
+                let words = group.backends.len().div_ceil(64);
+                cursor.seen = SmallVec::from_elem(0u64, words);
                 cursor.drawn = 0;
                 cursor.next = 0;
                 cursor.inner = Some(group.selector.iter(&cursor.key));
@@ -274,8 +282,8 @@ where
                 };
                 cursor.drawn += 1;
                 if let Ok(index) = group.backends.binary_search(backend) {
-                    if !cursor.seen[index] {
-                        cursor.seen[index] = true;
+                    if cursor.seen[index / 64] & (1u64 << (index % 64)) == 0 {
+                        cursor.seen[index / 64] |= 1u64 << (index % 64);
                         return group.backends.get(index);
                     }
                 }
@@ -287,8 +295,8 @@ where
             while cursor.next < group.backends.len() {
                 let index = cursor.next;
                 cursor.next += 1;
-                if !cursor.seen[index] {
-                    cursor.seen[index] = true;
+                if cursor.seen[index / 64] & (1u64 << (index % 64)) == 0 {
+                    cursor.seen[index / 64] |= 1u64 << (index % 64);
                     return group.backends.get(index);
                 }
             }
@@ -296,7 +304,7 @@ where
             // Group exhausted: move to the next priority level.
             cursor.group += 1;
             cursor.inner = None;
-            cursor.seen = Box::new([]);
+            cursor.seen = SmallVec::new();
         }
     }
 }

@@ -6,10 +6,13 @@
 //! - a real TLS client (`openssl s_client`) completes a handshake against a
 //!   spawned pingsix TLS listener with SNI `example.com`
 
-use std::net::TcpStream;
+use std::collections::HashSet;
+use std::net::{TcpListener, TcpStream};
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::sync::Arc;
+use std::sync::LazyLock;
+use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 fn testdata_path(name: &str) -> PathBuf {
@@ -20,9 +23,23 @@ fn testdata_path(name: &str) -> PathBuf {
         .join(name)
 }
 
+/// Ports already handed out in this test process. The probe socket is held
+/// open while the port is registered so a concurrent `random_port()` cannot
+/// bind the same port, and every port is single-use (see
+/// tests/common/mod.rs for the collision this prevents).
+static HANDED_OUT_PORTS: LazyLock<Mutex<HashSet<u16>>> =
+    LazyLock::new(|| Mutex::new(HashSet::new()));
+
 fn random_port() -> u16 {
-    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    listener.local_addr().unwrap().port()
+    loop {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let fresh = HANDED_OUT_PORTS.lock().unwrap().insert(port);
+        drop(listener);
+        if fresh {
+            return port;
+        }
+    }
 }
 
 fn wait_for_tcp(addr: &str, timeout: Duration) -> bool {

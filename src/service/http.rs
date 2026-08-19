@@ -33,7 +33,7 @@ use crate::{
     plugins::cache::{
         http::{
             cache_key, cache_vary, error_status, headers_indicate_shared_cache_credentials,
-            response_cacheability, should_enable_request_cache,
+            response_cacheability, should_enable_purge, should_enable_request_cache,
         },
         CacheSettings, CTX_KEY_CACHE_SETTINGS,
     },
@@ -436,13 +436,12 @@ impl ProxyHttp for HttpService {
 
     /// Intercept `PURGE` requests to delete the matching cache entry
     /// (Guide L46 / APISIX proxy-cache purge semantics). The cache plugin
-    /// enables the cache for PURGE requests and the key callback maps PURGE
-    /// onto the GET key, so this short-circuits before any upstream fetch.
+    /// enables the cache for PURGE requests only when `enable_purge` is on,
+    /// and the key callback maps PURGE onto the GET key, so this short-circuits
+    /// before any upstream fetch.
     fn is_purge(&self, session: &Session, ctx: &Self::CTX) -> bool {
         session.req_header().method.as_str() == "PURGE"
-            && ctx
-                .get::<Arc<CacheSettings>>(CTX_KEY_CACHE_SETTINGS)
-                .is_some()
+            && should_enable_purge(ctx.get::<Arc<CacheSettings>>(CTX_KEY_CACHE_SETTINGS))
     }
 
     fn request_cache_filter(&self, session: &mut Session, ctx: &mut Self::CTX) -> Result<()> {

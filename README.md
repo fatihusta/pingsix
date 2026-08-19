@@ -108,7 +108,7 @@ PingSIX includes 29 built-in plugins organized by category:
 - **`proxy-rewrite`** - Request modification
 - **`response-rewrite`** - Response headers modification
 - **`redirect`** - HTTP redirects with regex support
-- **`cache`** - Response caching with TTL, PURGE, and conditions
+- **`cache`** - Response caching with TTL, opt-in PURGE, and conditions
 - **`client-control`** - Request body size limiting (413 enforcement)
 
 ### 🤖 AI / LLM
@@ -211,7 +211,11 @@ PingSIX is designed for high performance:
 | Memory Usage | < 50MB |
 | CPU Usage | < 30% (4 cores) |
 
-> 📊 Benchmarks performed on AWS c5.xlarge instance with 4 vCPUs and 8GB RAM
+> 📊 The table above lists **design targets** from an AWS c5.xlarge (4 vCPU, 8GB RAM)
+> baseline. The repository does not yet ship a reproducible end-to-end load-test
+> harness that produces these numbers; treat them as goals, not guarantees.
+> Micro-benchmarks (`cargo bench --bench plugin_pipeline`, `--bench
+> route_matching`) cover plugin dispatch and route matching only.
 
 ## 🌐 Use Cases
 

@@ -58,8 +58,50 @@ impl TryFrom<JsonValue> for PluginConfig {
     fn try_from(value: JsonValue) -> Result<Self, Self::Error> {
         let config: PluginConfig =
             parse_and_validate_plugin_config(value, "Failed to parse response-rewrite config")?;
+        if let Some(headers) = &config.headers {
+            validate_no_framing_headers(headers)?;
+        }
         Ok(config)
     }
+}
+
+/// Header names that must be owned by the HTTP framing layer. Overriding them
+/// on a response (or removing them while the body is unchanged) can desync the
+/// downstream connection, so they are rejected at configuration time.
+fn is_framing_header(name: &str) -> bool {
+    name.eq_ignore_ascii_case("content-length") || name.eq_ignore_ascii_case("transfer-encoding")
+}
+
+fn validate_no_framing_headers(headers: &HeadersConfig) -> ProxyResult<()> {
+    let check = |name: &str| -> ProxyResult<()> {
+        if is_framing_header(name) {
+            return Err(ProxyError::validation_error(format!(
+                "response-rewrite must not modify framing header '{name}'"
+            )));
+        }
+        Ok(())
+    };
+    match headers {
+        HeadersConfig::Simple(map) => {
+            for name in map.keys() {
+                check(name)?;
+            }
+        }
+        HeadersConfig::Structured { add, set, remove } => {
+            for entry in add {
+                if let Some((name, _)) = entry.split_once(':') {
+                    check(name.trim())?;
+                }
+            }
+            for name in set.keys() {
+                check(name)?;
+            }
+            for name in remove {
+                check(name)?;
+            }
+        }
+    }
+    Ok(())
 }
 
 pub struct PluginResponseRewrite {
@@ -194,7 +236,34 @@ impl ProxyPlugin for PluginResponseRewrite {
 
 #[cfg(test)]
 mod tests {
-    use super::PluginResponseRewrite;
+    use super::{PluginConfig, PluginResponseRewrite};
+
+    #[test]
+    fn rejects_content_length_and_transfer_encoding_headers() {
+        for cfg in [
+            serde_json::json!({"headers": {"Content-Length": "0"}}),
+            serde_json::json!({
+                "headers": {"set": {"transfer-encoding": "chunked"}}
+            }),
+            serde_json::json!({
+                "headers": {"add": ["Content-Length: 0"]}
+            }),
+            serde_json::json!({
+                "headers": {"remove": ["content-length"]}
+            }),
+        ] {
+            assert!(
+                PluginConfig::try_from(cfg).is_err(),
+                "framing headers must be rejected"
+            );
+        }
+
+        let ok = PluginConfig::try_from(serde_json::json!({
+            "headers": {"set": {"X-Custom": "v"}}
+        }))
+        .unwrap();
+        assert!(ok.headers.is_some());
+    }
 
     #[test]
     fn expands_context_variables_and_preserves_unknown_variables() {

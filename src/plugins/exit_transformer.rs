@@ -87,6 +87,20 @@ impl TryFrom<JsonValue> for PluginConfig {
     fn try_from(value: JsonValue) -> Result<Self, Self::Error> {
         let config: PluginConfig =
             parse_and_validate_plugin_config(value, "Invalid exit-transformer plugin config")?;
+        for rule in &config.rules {
+            for name in rule.headers.keys() {
+                if name.eq_ignore_ascii_case("content-length") {
+                    return Err(ProxyError::validation_error(
+                        "exit-transformer must not set Content-Length; the gateway owns framing",
+                    ));
+                }
+                if name.eq_ignore_ascii_case("transfer-encoding") {
+                    return Err(ProxyError::validation_error(
+                        "exit-transformer must not set Transfer-Encoding; the gateway owns framing",
+                    ));
+                }
+            }
+        }
         Ok(config)
     }
 }
@@ -184,6 +198,24 @@ mod tests {
             "functions": ["return function() end"]
         }))
         .is_err());
+    }
+
+    #[test]
+    fn framing_headers_are_rejected() {
+        for headers in [
+            serde_json::json!({ "Content-Length": "0" }),
+            serde_json::json!({ "transfer-encoding": "chunked" }),
+        ] {
+            assert!(PluginConfig::try_from(serde_json::json!({
+                "rules": [{"codes": [500], "headers": headers}]
+            }))
+            .is_err());
+        }
+
+        assert!(PluginConfig::try_from(serde_json::json!({
+            "rules": [{"codes": [500], "headers": {"Retry-After": "30"}}]
+        }))
+        .is_ok());
     }
 
     #[test]

@@ -88,6 +88,14 @@ Routes define how incoming requests are matched and processed. Each route specif
 - **Plugins**: Additional processing to apply
 - **Name** (optional): Human-readable name
 
+> **Upstream requirement:** PingSIX currently requires every route to bind an
+> upstream, `upstream_id`, or `service_id` — even when a locally short-circuiting
+> plugin such as `redirect`, `echo`, or `fault-injection(abort)` would respond
+> without a backend. Use a placeholder upstream for such route-scoped plugins,
+> or configure the plugin on a **global rule** to avoid a dummy upstream.
+> This differs from APISIX, which allows upstream-less routes; the constraint is
+> enforced at config validation time with this error.
+
 ### Upstreams
 
 Upstreams define backend server pools with:
@@ -1539,6 +1547,12 @@ plugins:
 - **Automatic Token Generation**: Generates and distributes tokens in response cookies
 - **SameSite Cookie**: Sets SameSite=Lax for enhanced security
 
+> **HTTPS-only:** The CSRF cookie is always emitted with the `Secure`
+> attribute. Browsers only send `Secure` cookies over TLS, so this plugin is
+> only effective behind an HTTPS listener; on plain HTTP the double-submit
+> check cannot pass. This differs from a configurable `secure` flag and is a
+> deliberate fail-closed default.
+
 **Token Validation Flow:**
 1. Client receives token in response cookie and header
 2. For state-changing requests (POST, PUT, DELETE, PATCH), client must include token in request header
@@ -1853,6 +1867,12 @@ Semantics (APISIX parity):
   there. A `$ref` to a remote schema document is rejected at configuration
   time — validation is strictly offline.
 
+> **Memory model:** `body_schema` buffers the entire request body in memory up
+> to `max_req_body_size` (default 64 MiB) before validating it. Peak memory is
+> therefore `concurrent buffered requests × default/configured cap`; size
+> `max_req_body_size` and replica count accordingly. Streaming validation is
+> not supported in this release.
+
 #### Gateway Exit Transformer (exit-transformer)
 
 Declarative counterpart of APISIX's `exit-transformer`: rewrites responses
@@ -2006,6 +2026,11 @@ forever. `timeout` still bounds connect and write. A total-duration bound
 (`max_stream_duration_ms`) is planned for v2. Responses are passed through
 unmodified (no re-buffering, no SSE normalization).
 
+> **Memory model:** the client request body is fully buffered in memory up to
+> `max_req_body_size` (default 64 MiB) while it is transformed, so peak memory
+> scales with concurrent ai-proxy requests. Size the cap and replica count
+> accordingly; a streaming transform is planned for v2.
+
 **Scope precedence.** At most ONE ai-proxy instance handles a request. A
 route/service-scoped `ai-proxy` overrides a global-rule one (APISIX merge
 semantics), and any further instance is a no-op — provider credentials, TLS
@@ -2105,6 +2130,7 @@ plugins:
       - ".*no-cache.*"
     vary: ["Accept-Encoding"]     # Vary headers for cache keys
     hide_cache_headers: false     # Hide cache-related headers (default: false)
+    enable_purge: false           # Accept PURGE requests (default: false; no built-in auth)
     scope: local                  # Entries, locks and SWR state are process-local
     max_file_size_bytes: 1048576  # Max cacheable response size (bytes, 0 = no limit)
     stale_while_revalidate_secs: 60  # Serve stale content while revalidating (optional)
@@ -2130,6 +2156,18 @@ plugins:
   an explicit cache key.
 - **Cookie Safety**: Responses with `Set-Cookie` bypass caching independently. Enabling authenticated request caching does not enable cookie-response caching; `cache_set_cookie_responses: true` is a separate high-risk opt-in that can replay cookies across shared-cache clients.
 - **Vary Support**: Generate cache keys based on specified request headers
+- **PURGE (opt-in)**: `enable_purge: true` makes the cache plugin intercept
+  `PURGE` requests and delete the matching key. It is **disabled by default**
+  because an unauthenticated `PURGE` would let any client force cache misses
+  (stampede DoS). There is no built-in PURGE authentication; front the proxy
+  with your own ACL or a management path before enabling it. While disabled, a
+  `PURGE` request is treated as an ordinary client request and is forwarded
+  upstream.
+- **Client Bypass Header**: A request carrying `X-ByPass-Cache` (any value)
+  skips the shared cache for that request; `Cache-Control: no-cache` has the
+  same effect. This header is honored on every request and is not
+  authenticated — treat it as a cache-bypass capability available to all
+  clients.
 
 **Common Use Cases:**
 - CDN-like caching for static assets

@@ -83,7 +83,14 @@ impl Route {
         }
 
         if self.upstream_id.is_none() && self.service_id.is_none() && self.upstream.is_none() {
-            return Err(ValidationError::new("upstream_or_service_required"));
+            let mut err = ValidationError::new("upstream_or_service_required");
+            err.message = Some(
+                "route requires an upstream or service; locally short-circuiting plugins \
+                 (redirect/echo/fault-injection) must still bind a placeholder upstream, or \
+                 be configured on a global rule"
+                    .into(),
+            );
+            return Err(err);
         }
 
         // APISIX semantics treat inline `upstream` and `upstream_id` as
