@@ -214,9 +214,17 @@ impl ProxyPlugin for PluginPrometheus {
 
         // Route/service labels: use name when prefer_name is set, else id.
         // Empty/missing names fall back to id (APISIX-compatible prefer_name).
+        // Descriptive metadata lives behind the optional RouteLabels side
+        // trait; routes without label data fall back to id-only labels.
         let route_label = route.as_ref().map_or_else(
             || "",
-            |r| prefer_label(self.config.prefer_name, r.name(), r.id()),
+            |r| {
+                prefer_label(
+                    self.config.prefer_name,
+                    r.labels().and_then(|l| l.name()),
+                    r.id(),
+                )
+            },
         );
 
         // Use path template to avoid high cardinality issues
@@ -227,15 +235,23 @@ impl ProxyPlugin for PluginPrometheus {
         // controllable. Collapse multi-host / wildcard routes to "*" and bound
         // the total number of distinct host labels via max_unique_hosts.
         let host = route.as_ref().map_or(String::new(), |r| {
-            self.limit_host_label(select_host_label(r.effective_hosts()))
+            let hosts = r.labels().map_or(&[][..], |l| l.effective_hosts());
+            self.limit_host_label(select_host_label(hosts))
         });
 
         // Extract service, falling back to "unknown" if service_id is None
         let service = route.as_ref().map_or_else(
             || "unknown",
-            |r| match r.service_id() {
-                Some(id) => prefer_label(self.config.prefer_name, r.service_name(), id),
-                None => "unknown",
+            |r| {
+                let labels = r.labels();
+                match labels.and_then(|l| l.service_id()) {
+                    Some(id) => prefer_label(
+                        self.config.prefer_name,
+                        labels.and_then(|l| l.service_name()),
+                        id,
+                    ),
+                    None => "unknown",
+                }
             },
         );
 
@@ -309,7 +325,12 @@ impl PluginPrometheus {
     /// Prefer the matched route template, which avoids request-time regex work and
     /// naturally groups dynamic path parameters into one metric series.
     fn normalize_path_template(&self, session: &Session, ctx: &ProxyContext) -> String {
-        if let Some(template) = ctx.route.as_ref().and_then(|route| route.uri_template()) {
+        if let Some(template) = ctx
+            .route
+            .as_ref()
+            .and_then(|route| route.labels())
+            .and_then(|labels| labels.uri_template())
+        {
             return self.limit_path_label(template.to_string());
         }
 

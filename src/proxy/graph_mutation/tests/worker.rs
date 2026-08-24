@@ -1,8 +1,5 @@
 #[cfg(test)]
 mod worker_tests {
-    use crate::config;
-    use crate::config::EffectiveDefaults;
-    use crate::core::status::StatusStore;
     use crate::proxy::graph_mutation::InMemoryGraphStore;
     use crate::proxy::graph_mutation::*;
     use crate::proxy::graph_mutation::{GraphTestHarness, StoredChange, StoredResource};
@@ -618,21 +615,15 @@ mod worker_tests {
 
     #[test]
     fn load_static_publishes_empty_config() {
-        let status = std::sync::Arc::new(StatusStore::new());
-        let health_check = std::sync::Arc::new(
-            crate::proxy::upstream::health_check::SharedHealthCheckService::new(),
-        );
-        let runtime = std::sync::Arc::new(RuntimeStore::with_state(status.clone(), health_check));
-        let resolver = crate::proxy::upstream::discovery::build_resolver_for_state().unwrap();
-        let snapshot = ConfigurationGraph::load_static(
-            &config::Config::default(),
-            &status,
-            &runtime,
-            &EffectiveDefaults::default(),
-            &resolver,
-        )
-        .unwrap();
+        // Static mode owns ingestion through the graph authority: build a
+        // graph (filesystem-source analogue, in-memory store) and publish the
+        // empty static snapshot through the instance method.
+        let harness = GraphTestHarness::new(Arc::new(InMemoryGraphStore::new()));
+        let snapshot = harness
+            .graph
+            .load_static(&crate::proxy::control_plane::ResourceConfigSet::default())
+            .unwrap();
         assert!(snapshot.routes.is_empty());
-        assert_eq!(runtime.load().revision, snapshot.revision);
+        assert_eq!(harness.runtime.load().revision, snapshot.revision);
     }
 }

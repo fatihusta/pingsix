@@ -12,7 +12,10 @@ use arc_swap::ArcSwap;
 
 use crate::{
     config,
-    core::{status::StatusStore, ProxyPluginExecutor, ProxyResult},
+    core::{
+        status::StatusStore, HealthCheckFingerprint, HealthCheckSpec, ProxyPluginExecutor,
+        ProxyResult,
+    },
 };
 
 use super::{
@@ -22,10 +25,7 @@ use super::{
     service::ProxyService,
     ssl::{MatchEntry as SslMatcher, ProxySSL},
     upstream::{
-        health_check::{
-            HealthCheckFingerprint, HealthCheckRegistration, HealthCheckSpec,
-            SharedHealthCheckService,
-        },
+        health_check::{HealthCheckRegistration, SharedHealthCheckService},
         ProxyUpstream,
     },
 };

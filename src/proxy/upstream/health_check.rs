@@ -27,8 +27,6 @@ pub enum RegistryUpdate {
     },
 }
 
-pub use crate::core::{HealthCheckFingerprint, HealthCheckSpec};
-
 /// Identifies one registration of an upstream health check.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct HealthCheckRegistration {

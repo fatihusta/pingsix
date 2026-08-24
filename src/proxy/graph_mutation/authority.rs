@@ -10,11 +10,11 @@ use tokio::sync::Mutex as AsyncMutex;
 use validator::Validate;
 
 use crate::{
-    config::{self, Config, EffectiveDefaults, GlobalRule, Route, Service, Upstream, SSL},
+    config::{self, EffectiveDefaults, GlobalRule, Route, Service, Upstream, SSL},
     core::{status, status::StatusStore, ProxyError, ProxyResult},
     proxy::{
         control_plane::{
-            prepare_candidate, validate_config_set, CandidateSnapshot, ResourceConfigSet,
+            prepare_candidate, validate_runtime_form, CandidateSnapshot, ResourceConfigSet,
         },
         runtime::{RuntimeSnapshot, RuntimeStore},
         ssl::ProxySSL,
@@ -101,7 +101,7 @@ impl ConfigurationGraph {
             &self.inner.keyring,
         )
         .map_err(|e| GraphError::InvalidCandidate { source: e })?;
-        validate_config_set(&logical).map_err(|e| GraphError::InvalidCandidate { source: e })?;
+        validate_runtime_form(&logical).map_err(|e| GraphError::InvalidCandidate { source: e })?;
         self.submit(snapshot, logical)
     }
 
@@ -148,7 +148,7 @@ impl ConfigurationGraph {
         let stored = apply_watch_batch(&base, &batch)?;
         let logical = decode_graph(&stored, SecretMode::DecryptForRuntime, &self.inner.keyring)
             .map_err(|e| GraphError::InvalidCandidate { source: e })?;
-        validate_config_set(&logical).map_err(|e| GraphError::InvalidCandidate { source: e })?;
+        validate_runtime_form(&logical).map_err(|e| GraphError::InvalidCandidate { source: e })?;
         self.submit(stored, logical)
     }
 
@@ -202,21 +202,17 @@ impl ConfigurationGraph {
         }
     }
 
-    /// Static startup path: prepare DNS fully before returning and publishing.
+    /// Static startup path: this graph ingests the static YAML snapshot
+    /// through the same validate → prepare → compile → publish funnel as the
+    /// dynamic list/watch path (filesystem as source instead of watch), but
+    /// driven synchronously: DNS preparation must finish before listeners
+    /// start, and unresolvable DNS-only upstreams fail the process.
     ///
-    /// Unlike the dynamic path, preparation must finish before listeners start;
-    /// unresolvable DNS-only upstreams fail the process. The candidate passes
-    /// the same whole-graph validation as the dynamic path. All state is
-    /// injected.
-    pub fn load_static(
-        config: &Config,
-        status: &StatusStore,
-        runtime: &RuntimeStore,
-        defaults: &EffectiveDefaults,
-        resolver: &Arc<TokioResolver>,
-    ) -> ProxyResult<Arc<RuntimeSnapshot>> {
-        let resources = ResourceConfigSet::from_yaml_config(config);
-        validate_config_set(&resources)?;
+    /// Single-writer: this call is the one and only publication in static
+    /// mode; the graph never runs a watch loop and accepts no further
+    /// submissions.
+    pub fn load_static(&self, resources: &ResourceConfigSet) -> ProxyResult<Arc<RuntimeSnapshot>> {
+        validate_runtime_form(resources)?;
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -225,7 +221,7 @@ impl ConfigurationGraph {
             })?;
         // The pre-publish runtime is the reuse baseline for the static path; at
         // boot it is the empty snapshot, so every occurrence is prepared.
-        let previous = runtime.load();
+        let previous = self.inner.runtime.load();
         let prepared = rt.block_on(async {
             #[cfg(unix)]
             {
@@ -234,7 +230,7 @@ impl ConfigurationGraph {
                     ProxyError::Configuration(format!("Failed to install SIGTERM handler: {e}"))
                 })?;
                 tokio::select! {
-                    result = prepare_candidate(&resources, &previous, defaults, resolver) => result,
+                    result = prepare_candidate(resources, &previous, &self.inner.defaults, &self.inner.resolver) => result,
                     _ = sigterm.recv() => Err(ProxyError::Configuration(
                         "Static configuration DNS preparation cancelled by SIGTERM".into(),
                     )),
@@ -242,16 +238,22 @@ impl ConfigurationGraph {
             }
             #[cfg(not(unix))]
             {
-                prepare_candidate(&resources, &previous, defaults, resolver).await
+                prepare_candidate(resources, &previous, &self.inner.defaults, &self.inner.resolver)
+                    .await
             }
         })?;
         let (plan, prepared) = prepared;
         let candidate = CandidateSnapshot::build_prepared(
-            resources, &plan, &prepared, &previous, defaults, resolver,
+            resources.clone(),
+            &plan,
+            &prepared,
+            &previous,
+            &self.inner.defaults,
+            &self.inner.resolver,
         )?;
         let snapshot = RuntimeSnapshot::compile(candidate, 0)?;
-        let published = runtime.publish(snapshot)?;
-        status.mark_ready(status::ConfigSource::Yaml);
+        let published = self.inner.runtime.publish(snapshot)?;
+        self.inner.status.mark_ready(status::ConfigSource::Yaml);
         Ok(published)
     }
 }

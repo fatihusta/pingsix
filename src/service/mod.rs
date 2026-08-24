@@ -298,15 +298,21 @@ fn init_config_source(
         ))
     } else {
         log::debug!("Loading static configurations from config file");
-        ConfigurationGraph::load_static(
-            config,
-            &state.status,
-            &state.runtime,
-            &state.defaults,
-            &state.resolver,
-        )
-        .map_err(|e| format!("Failed to load static configurations: {e}"))?;
-        Ok((None, None))
+        // Static mode runs through a ConfigurationGraph instance too: the
+        // filesystem is the source, there is exactly one synchronous
+        // publication, and no watch loop ever starts.
+        let graph = Arc::new(ConfigurationGraph::with_state(
+            Arc::new(crate::proxy::graph_mutation::InMemoryGraphStore::new()),
+            state.status.clone(),
+            state.runtime.clone(),
+            state.defaults.clone(),
+            state.keyring.clone(),
+            state.resolver.clone(),
+        ));
+        graph
+            .load_static(&config.resources)
+            .map_err(|e| format!("Failed to load static configurations: {e}"))?;
+        Ok((None, Some(graph)))
     }
 }
 
@@ -398,7 +404,10 @@ fn add_optional_services(
         }
     }
 
-    if let (Some(graph), Some(admin_cfg)) = (config_graph, &cfg.admin) {
+    // Admin mutates the stored graph only; static (etcd-less) mode has no
+    // external store to persist mutations into, so Admin still starts solely
+    // when etcd is configured — the graph now existing in both modes.
+    if let (Some(graph), Some(admin_cfg), Some(_)) = (config_graph, &cfg.admin, &cfg.etcd) {
         admin_cfg.validate_bind_safety().map_err(|e| {
             log::error!("{e}");
             e

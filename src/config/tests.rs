@@ -114,10 +114,13 @@ services:
     assert_eq!(0, conf.pingora.client_bind_to_ipv6.len());
     assert_eq!(1, conf.pingora.version);
     assert_eq!(2, conf.pingsix.listeners.len());
-    assert_eq!(1, conf.routes.len());
-    assert_eq!(1, conf.upstreams.len());
-    assert_eq!(1, conf.services.len());
-    assert_eq!(vec![Method::GET, Method::POST], conf.routes[0].methods);
+    assert_eq!(1, conf.resources.routes.len());
+    assert_eq!(1, conf.resources.upstreams.len());
+    assert_eq!(1, conf.resources.services.len());
+    assert_eq!(
+        vec![Method::GET, Method::POST],
+        conf.resources.routes["1"].methods
+    );
     print!("{}", conf.to_yaml());
 }
 
@@ -173,10 +176,10 @@ services:
     assert_eq!(0, conf.pingora.client_bind_to_ipv6.len());
     assert_eq!(1, conf.pingora.version);
     assert_eq!(2, conf.pingsix.listeners.len());
-    assert_eq!(1, conf.routes.len());
-    assert_eq!(2, conf.upstreams.len());
-    assert_eq!(1, conf.services.len());
-    assert_eq!(vec![Method::GET], conf.routes[0].methods);
+    assert_eq!(1, conf.resources.routes.len());
+    assert_eq!(2, conf.resources.upstreams.len());
+    assert_eq!(1, conf.resources.services.len());
+    assert_eq!(vec![Method::GET], conf.resources.routes["1"].methods);
     print!("{}", conf.to_yaml());
 }
 
@@ -571,6 +574,52 @@ upstreams:
 }
 
 #[test]
+fn duplicate_id_error_names_the_duplicated_id() {
+    init_log();
+    // Duplicate-id detection comes from ResourceConfigSet map construction
+    // now; the error must still name the duplicated id.
+    let conf_str = r#"
+---
+pingsix:
+  listeners:
+    - address: "[::1]:8080"
+
+upstreams:
+  - id: "dupe"
+    nodes:
+      "127.0.0.1:1980": 1
+  - id: "dupe"
+    nodes:
+      "127.0.0.1:1981": 1
+        "#;
+    let err = Config::from_yaml(conf_str).expect_err("duplicate upstream id must fail");
+    assert!(
+        format!("{err:?}").contains("Duplicate upstream ID found: dupe"),
+        "error must name the duplicated id, got: {err:?}"
+    );
+}
+
+#[test]
+fn empty_resource_id_rejected_with_machine_testable_error() {
+    init_log();
+    let conf_str = r#"
+---
+pingsix:
+  listeners:
+    - address: "[::1]:8080"
+
+upstreams:
+  - nodes:
+      "127.0.0.1:1980": 1
+        "#;
+    let err = Config::from_yaml(conf_str).expect_err("empty upstream id must fail");
+    assert!(
+        format!("{err:?}").contains("id_required"),
+        "error must carry the id_required token, got: {err:?}"
+    );
+}
+
+#[test]
 fn test_invalid_node_key() {
     init_log();
     let conf_str = r#"
@@ -664,18 +713,18 @@ upstreams:
         -----END EC PRIVATE KEY-----
         "#;
     let conf = Config::from_yaml(conf_str).unwrap();
-    assert_eq!(1, conf.routes.len());
-    assert_eq!(1, conf.upstreams.len());
+    assert_eq!(1, conf.resources.routes.len());
+    assert_eq!(1, conf.resources.upstreams.len());
 
     // Check route upstream TLS config
-    let route_upstream = conf.routes[0].upstream.as_ref().unwrap();
+    let route_upstream = conf.resources.routes["1"].upstream.as_ref().unwrap();
     assert!(route_upstream.tls.is_some());
     let route_tls = route_upstream.tls.as_ref().unwrap();
     assert!(route_tls.client_cert.contains("BEGIN CERTIFICATE"));
     assert!(route_tls.client_key.contains("BEGIN EC PRIVATE KEY"));
 
     // Check upstream TLS config
-    let upstream = &conf.upstreams[0];
+    let upstream = &conf.resources.upstreams["1"];
     assert!(upstream.tls.is_some());
     let upstream_tls = upstream.tls.as_ref().unwrap();
     assert!(upstream_tls.client_cert.contains("BEGIN CERTIFICATE"));

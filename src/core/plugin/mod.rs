@@ -18,7 +18,9 @@ use serde_json::Value as JsonValue;
 
 use crate::core::error::ProxyResult;
 
-pub use pipeline::{CompiledPluginPipeline, ProxyContext, ProxyPluginExecutor, RouteContext};
+pub use pipeline::{
+    CompiledPluginPipeline, ProxyContext, ProxyPluginExecutor, RouteContext, RouteLabels,
+};
 pub use rewrite::apply_regex_uri_template;
 pub use upstream::{
     HealthCheckFingerprint, HealthCheckSpec, PassiveOutcome, SelectedUpstream, UpstreamSelection,

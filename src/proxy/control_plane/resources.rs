@@ -1,14 +1,19 @@
 use std::collections::{HashMap, HashSet};
 
+use serde::Serialize;
 use validator::Validate;
 
 use crate::{
-    config::{self, GlobalRule, Route, Service, Upstream, SSL},
+    config::{GlobalRule, Identifiable, Route, Service, Upstream, SSL},
     core::{ProxyError, ProxyResult},
 };
 
 /// Deserialized raw configuration graph used by the control plane.
-#[derive(Clone, Debug, Default)]
+///
+/// This is the single bootstrap representation: static YAML resource sections
+/// decode into it via [`ResourceConfigSet::from_yaml_sections`], and the etcd
+/// list/watch path decodes its stored snapshots into the same shape.
+#[derive(Clone, Debug, Default, Serialize)]
 pub struct ResourceConfigSet {
     pub upstreams: HashMap<String, Upstream>,
     pub services: HashMap<String, Service>,
@@ -18,25 +23,55 @@ pub struct ResourceConfigSet {
 }
 
 impl ResourceConfigSet {
-    pub fn from_yaml_config(config: &config::Config) -> Self {
-        let mut set = Self::default();
-        for upstream in &config.upstreams {
-            set.upstreams.insert(upstream.id.clone(), upstream.clone());
-        }
-        for service in &config.services {
-            set.services.insert(service.id.clone(), service.clone());
-        }
-        for rule in &config.global_rules {
-            set.global_rules.insert(rule.id.clone(), rule.clone());
-        }
-        for route in &config.routes {
-            set.routes.insert(route.id.clone(), route.clone());
-        }
-        for ssl in &config.ssls {
-            set.ssls.insert(ssl.id.clone(), ssl.clone());
-        }
-        set
+    /// Build the bootstrap set from the static YAML resource sections.
+    ///
+    /// Each resource is schema-validated and must carry a non-empty id;
+    /// duplicate ids are rejected at map-construction time, naming the
+    /// duplicated id (the same error wording the former Vec layer produced).
+    /// Cross-resource reference checks stay with the graph-authority gates
+    /// (`validate_runtime_form`), not with YAML parsing.
+    pub fn from_yaml_sections(
+        routes: Vec<Route>,
+        upstreams: Vec<Upstream>,
+        services: Vec<Service>,
+        global_rules: Vec<GlobalRule>,
+        ssls: Vec<SSL>,
+    ) -> ProxyResult<Self> {
+        Ok(Self {
+            upstreams: collect_by_id(upstreams, "upstream", "Upstream")?,
+            services: collect_by_id(services, "service", "Service")?,
+            global_rules: collect_by_id(global_rules, "global_rule", "GlobalRule")?,
+            routes: collect_by_id(routes, "route", "Route")?,
+            ssls: collect_by_id(ssls, "ssl", "SSL")?,
+        })
     }
+}
+
+/// Schema-validate each section entry and collect it into an id-keyed map,
+/// rejecting empty and duplicate ids with machine-testable messages.
+fn collect_by_id<T: Validate + Identifiable>(
+    items: Vec<T>,
+    resource_name: &str,
+    label: &str,
+) -> ProxyResult<HashMap<String, T>> {
+    let mut map = HashMap::with_capacity(items.len());
+    for item in items {
+        let id = item.id().to_string();
+        if id.is_empty() {
+            return Err(ProxyError::Configuration(format!(
+                "{label} resource id must be non-empty (id_required)"
+            )));
+        }
+        item.validate().map_err(|e| {
+            ProxyError::Configuration(format!("{label} '{id}' validation failed: {e}"))
+        })?;
+        if map.insert(id.clone(), item).is_some() {
+            return Err(ProxyError::Configuration(format!(
+                "Duplicate {resource_name} ID found: {id}"
+            )));
+        }
+    }
+    Ok(map)
 }
 
 /// Validation gate named after the *runtime form* of a candidate graph:
@@ -63,9 +98,9 @@ pub fn validate_stored_form(set: &ResourceConfigSet) -> ProxyResult<()> {
 }
 
 /// Whole-graph validation without a form name: structural validation of
-/// every resource plus cross-resource reference checks. Retained for
-/// existing authority call sites (which validate the runtime form); new call
-/// sites must use [`validate_runtime_form`] or [`validate_stored_form`].
+/// every resource plus cross-resource reference checks. This is the shared
+/// body of the two named gates; call sites must use [`validate_runtime_form`]
+/// or [`validate_stored_form`] to state which form they hold.
 pub fn validate_config_set(set: &ResourceConfigSet) -> ProxyResult<()> {
     for upstream in set.upstreams.values() {
         upstream.validate().map_err(|e| {
@@ -300,6 +335,74 @@ mod tests {
         route.plugins = traffic_split_plugin("payments");
         set.routes.insert("r1".into(), route);
         assert!(validate_stored_form(&set).is_err());
+    }
+
+    // ---------------------------------------------------------------------
+    // Static YAML bootstrap: sections decode directly into id-keyed maps.
+    // ---------------------------------------------------------------------
+
+    #[test]
+    fn from_yaml_sections_keys_resources_by_id() {
+        let set = ResourceConfigSet::from_yaml_sections(
+            vec![route_with_upstream_id("r1", "/", "u1")],
+            vec![upstream("u1", "10.0.0.1:80")],
+            vec![],
+            vec![global_rule("g1")],
+            vec![],
+        )
+        .unwrap();
+        assert_eq!(set.upstreams.len(), 1);
+        assert_eq!(set.routes["r1"].upstream_id.as_deref(), Some("u1"));
+        assert!(set.global_rules.contains_key("g1"));
+    }
+
+    #[test]
+    fn from_yaml_sections_rejects_duplicate_id_naming_it() {
+        let err = ResourceConfigSet::from_yaml_sections(
+            vec![],
+            vec![
+                upstream("dupe", "10.0.0.1:80"),
+                upstream("dupe", "10.0.0.2:80"),
+            ],
+            vec![],
+            vec![],
+            vec![],
+        )
+        .expect_err("duplicate id must fail");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("Duplicate upstream ID found: dupe"),
+            "error must name the duplicated id, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn from_yaml_sections_rejects_empty_id() {
+        let err = ResourceConfigSet::from_yaml_sections(
+            vec![route_with_upstream_id("", "/", "u1")],
+            vec![],
+            vec![],
+            vec![],
+            vec![],
+        )
+        .expect_err("empty id must fail");
+        assert!(
+            err.to_string().contains("id_required"),
+            "error must carry the id_required token, got: {err}"
+        );
+    }
+
+    #[test]
+    fn from_yaml_sections_runs_per_resource_schema_validation() {
+        let mut route = route_with_upstream_id("r1", "/", "u1");
+        route.uri = None; // a route needs uri or uris
+        let err =
+            ResourceConfigSet::from_yaml_sections(vec![route], vec![], vec![], vec![], vec![])
+                .expect_err("schema-invalid route must fail");
+        assert!(
+            err.to_string().contains("Route 'r1'"),
+            "error must identify the resource, got: {err}"
+        );
     }
 
     #[test]

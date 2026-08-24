@@ -10,7 +10,7 @@ use crate::{
     config::{self, Identifiable},
     core::{
         sort_plugins_by_priority_desc, ErrorContext, ProxyError, ProxyPlugin, ProxyPluginExecutor,
-        ProxyResult, RouteContext, UpstreamSelection, UpstreamSelector,
+        ProxyResult, RouteContext, RouteLabels, UpstreamSelection, UpstreamSelector,
     },
     plugins::{build_plugin_with_upstreams, cors},
     utils::request::get_request_host,
@@ -249,24 +249,6 @@ impl RouteContext for ProxyRoute {
         &self.inner.id
     }
 
-    fn name(&self) -> Option<&str> {
-        self.inner.name.as_deref()
-    }
-
-    fn service_id(&self) -> Option<&str> {
-        self.inner.service_id.as_deref()
-    }
-
-    fn service_name(&self) -> Option<&str> {
-        self.service_name.as_deref()
-    }
-
-    fn uri_template(&self) -> Option<&str> {
-        // A route with multiple URIs does not retain which alternative matched;
-        // use runtime normalization for those to avoid assigning the wrong label.
-        self.inner.uri.as_deref()
-    }
-
     fn enable_websocket(&self) -> bool {
         self.inner.enable_websocket
     }
@@ -303,10 +285,6 @@ impl RouteContext for ProxyRoute {
         self.plugin_executor.clone()
     }
 
-    fn effective_hosts(&self) -> &[String] {
-        &self.effective_hosts
-    }
-
     fn cache_namespace_fingerprint(&self) -> u64 {
         self.cache_namespace_fingerprint
     }
@@ -317,6 +295,34 @@ impl RouteContext for ProxyRoute {
 
     fn timeout(&self) -> Option<&config::Timeout> {
         self.inner.timeout.as_ref()
+    }
+
+    fn labels(&self) -> Option<&dyn RouteLabels> {
+        Some(self)
+    }
+}
+
+impl RouteLabels for ProxyRoute {
+    fn name(&self) -> Option<&str> {
+        self.inner.name.as_deref()
+    }
+
+    fn service_id(&self) -> Option<&str> {
+        self.inner.service_id.as_deref()
+    }
+
+    fn service_name(&self) -> Option<&str> {
+        self.service_name.as_deref()
+    }
+
+    fn uri_template(&self) -> Option<&str> {
+        // A route with multiple URIs does not retain which alternative matched;
+        // use runtime normalization for those to avoid assigning the wrong label.
+        self.inner.uri.as_deref()
+    }
+
+    fn effective_hosts(&self) -> &[String] {
+        &self.effective_hosts
     }
 }
 

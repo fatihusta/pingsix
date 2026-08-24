@@ -646,14 +646,6 @@ mod tests {
             "mock-route"
         }
 
-        fn service_id(&self) -> Option<&str> {
-            None
-        }
-
-        fn uri_template(&self) -> Option<&str> {
-            None
-        }
-
         fn select_upstream(&self, _session: &mut Session) -> ProxyResult<UpstreamSelection> {
             unimplemented!("not needed for ownership tests")
         }

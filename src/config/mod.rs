@@ -1,14 +1,15 @@
 pub mod etcd;
 mod node;
 
-use std::{collections::HashSet, fs, net::SocketAddr};
+use std::{fs, net::SocketAddr};
 
 use pingora::server::configuration::{Opt, ServerConf};
 use pingora_error::{Error, ErrorType::*, OrErr, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
-use serde_with::serde_as;
 use validator::{Validate, ValidationError};
+
+use crate::proxy::control_plane::ResourceConfigSet;
 
 pub use node::{Node, Nodes};
 
@@ -52,35 +53,47 @@ impl_identifiable!(GlobalRule);
 impl_identifiable!(SSL);
 
 /// Root configuration structure combining Pingora framework config with Pingsix-specific settings.
-#[serde_as]
-#[derive(Default, Debug, Serialize, Deserialize, Validate)]
-#[validate(schema(function = "Config::validate_resource_id"))]
-#[serde(deny_unknown_fields)]
+///
+/// Static resources are carried in control-plane vocabulary
+/// ([`ResourceConfigSet`], id-keyed) from the start: [`Config::from_yaml`]
+/// converts the on-disk sequence sections directly into it, so there is no
+/// intermediate Vec-of-resources layer and duplicate ids fail at map
+/// construction. User-facing YAML schema is unchanged.
+#[derive(Default, Debug, Serialize, Validate)]
 pub struct Config {
     /// Pingora framework configuration (workers, logging, etc.)
-    #[serde(default)]
     pub pingora: ServerConf,
 
     /// Pingsix-specific configuration (listeners, etcd, plugins, etc.)
     #[validate(nested)]
     pub pingsix: Pingsix,
 
-    // Static resource definitions - used when etcd is not configured
-    #[validate(nested)]
+    /// Static resource definitions, keyed by id — used only when etcd is not
+    /// configured. Parsed from the YAML `routes`/`upstreams`/`services`/
+    /// `global_rules`/`ssls` sequence sections.
+    pub resources: ResourceConfigSet,
+}
+
+/// On-disk YAML shape of [`Config`]: deserialization-only adapter so the
+/// resource sections keep their sequence form for users (zero schema change,
+/// including `deny_unknown_fields` behavior) while the loader converts them
+/// into the id-keyed [`ResourceConfigSet`] in one pass.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ConfigFile {
     #[serde(default)]
-    pub routes: Vec<Route>,
-    #[validate(nested)]
+    pingora: ServerConf,
+    pingsix: Pingsix,
     #[serde(default)]
-    pub upstreams: Vec<Upstream>,
-    #[validate(nested)]
+    routes: Vec<Route>,
     #[serde(default)]
-    pub services: Vec<Service>,
-    #[validate(nested)]
+    upstreams: Vec<Upstream>,
     #[serde(default)]
-    pub global_rules: Vec<GlobalRule>,
-    #[validate(nested)]
+    services: Vec<Service>,
     #[serde(default)]
-    pub ssls: Vec<SSL>,
+    global_rules: Vec<GlobalRule>,
+    #[serde(default)]
+    ssls: Vec<SSL>,
 }
 
 // Configuration loading and validation methods
@@ -113,33 +126,39 @@ impl Config {
 
     /// Parses YAML configuration string with comprehensive validation.
     pub fn from_yaml(conf_str: &str) -> Result<Self> {
-        let conf: Config = serde_yml::from_str(conf_str)
+        let file: ConfigFile = serde_yml::from_str(conf_str)
             .or_err_with(ReadError, || "Unable to parse yaml configuration")?;
+
+        // Static resource sections: schema-validate each entry, require
+        // non-empty ids, and reject duplicate ids at map construction. The
+        // error wording stays machine-testable (e.g. names the duplicated id).
+        let resources = ResourceConfigSet::from_yaml_sections(
+            file.routes,
+            file.upstreams,
+            file.services,
+            file.global_rules,
+            file.ssls,
+        )
+        .map_err(|e| Error::explain(FileReadError, e.to_string()))?;
+
+        let conf = Config {
+            pingora: file.pingora,
+            pingsix: file.pingsix,
+            resources,
+        };
 
         log::debug!(
             "Loaded configuration with {} routes, {} upstreams, {} services, {} global rules, and {} SSL entries",
-            conf.routes.len(),
-            conf.upstreams.len(),
-            conf.services.len(),
-            conf.global_rules.len(),
-            conf.ssls.len(),
+            conf.resources.routes.len(),
+            conf.resources.upstreams.len(),
+            conf.resources.services.len(),
+            conf.resources.global_rules.len(),
+            conf.resources.ssls.len(),
         );
 
-        // Validate configuration structure and constraints
+        // Validate server-settings structure and constraints (pingora, pingsix).
         conf.validate()
             .or_err_with(FileReadError, || "Conf file validation failed")?;
-
-        // Ensure all resource IDs are unique within their respective types
-        Self::validate_unique_ids(&conf.routes, "route")
-            .or_err_with(FileReadError, || "Route ID validation failed")?;
-        Self::validate_unique_ids(&conf.upstreams, "upstream")
-            .or_err_with(FileReadError, || "Upstream ID validation failed")?;
-        Self::validate_unique_ids(&conf.services, "service")
-            .or_err_with(FileReadError, || "Service ID validation failed")?;
-        Self::validate_unique_ids(&conf.global_rules, "global_rule")
-            .or_err_with(FileReadError, || "Global rule ID validation failed")?;
-        Self::validate_unique_ids(&conf.ssls, "ssl")
-            .or_err_with(FileReadError, || "SSL ID validation failed")?;
 
         // Best-effort unrecognized-field warnings for static YAML resources.
         // Unknown fields are still accepted (ingress metadata compatibility);
@@ -165,43 +184,6 @@ impl Config {
         if opt.daemon {
             self.pingora.daemon = true;
         }
-    }
-
-    fn validate_resource_id(&self) -> Result<(), ValidationError> {
-        Self::validate_non_empty_ids(&self.upstreams, "upstream")?;
-        Self::validate_non_empty_ids(&self.routes, "route")?;
-        Self::validate_non_empty_ids(&self.services, "service")?;
-        Self::validate_non_empty_ids(&self.global_rules, "global_rule")?;
-        Self::validate_non_empty_ids(&self.ssls, "ssl")?;
-        Ok(())
-    }
-
-    /// Validates that all resources in the slice have non-empty IDs.
-    ///
-    /// Uses generic constraint on `Identifiable` trait to work with any resource type.
-    fn validate_non_empty_ids<T: Identifiable>(
-        items: &[T],
-        resource_name: &str,
-    ) -> Result<(), ValidationError> {
-        if items.iter().any(|item| item.id().is_empty()) {
-            let mut err = ValidationError::new("id_required");
-            err.add_param("resource".into(), &resource_name);
-            return Err(err);
-        }
-        Ok(())
-    }
-
-    fn validate_unique_ids<T: Identifiable>(items: &[T], resource_name: &str) -> Result<()> {
-        let mut ids = HashSet::new();
-        for item in items {
-            if !ids.insert(item.id().to_string()) {
-                return Error::e_explain(
-                    FileReadError,
-                    format!("Duplicate {} ID found: {}", resource_name, item.id()),
-                );
-            }
-        }
-        Ok(())
     }
 }
 

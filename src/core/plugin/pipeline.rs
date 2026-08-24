@@ -27,27 +27,19 @@ const REQUEST_BODY_REPLACED_KEY: &str = "core::request_body_replaced";
 ///
 /// Lives next to [`ProxyPluginExecutor`] because `build_plugin_executor`
 /// returns that type; moving it to `upstream` would cycle the modules.
+///
+/// This seam carries only what the request path provably needs (identity,
+/// upstream selection, per-route peer policy, cache namespacing). Descriptive
+/// metadata used to derive observability labels lives behind the optional
+/// [`RouteLabels`] side trait reached via [`RouteContext::labels`].
 pub trait RouteContext: Send + Sync {
     /// Get the route identifier.
     fn id(&self) -> &str;
 
-    /// Optional human-readable route name from configuration.
-    fn name(&self) -> Option<&str> {
-        None
-    }
-
-    /// Get the service ID if available.
-    fn service_id(&self) -> Option<&str>;
-
-    /// Optional human-readable service name from the bound service configuration.
-    fn service_name(&self) -> Option<&str> {
-        None
-    }
-
-    /// Return the configured URI template used to match this route.
-    fn uri_template(&self) -> Option<&str>;
-
     /// Whether WebSocket upgrade requests are enabled for this route.
+    ///
+    /// Read by the service's `upstream_peer` (peer timeout relaxation), so it
+    /// stays on the request-path seam rather than the label side trait.
     fn enable_websocket(&self) -> bool {
         false
     }
@@ -55,14 +47,6 @@ pub trait RouteContext: Send + Sync {
     /// Select an upstream peer for the route, compiling the selection artifact
     /// (peer plus owning selector) used by all downstream callbacks.
     fn select_upstream(&self, session: &mut Session) -> ProxyResult<UpstreamSelection>;
-
-    /// Return the effective host patterns used to match this route.
-    ///
-    /// Exposed so plugins can derive bounded labels from route configuration
-    /// instead of attacker-controllable request input. Default is empty.
-    fn effective_hosts(&self) -> &[String] {
-        &[]
-    }
 
     /// Fingerprint of the compiled route's cache namespace inputs (route/service
     /// identity and response-affecting plugin configuration). Combined with the
@@ -80,6 +64,47 @@ pub trait RouteContext: Send + Sync {
     /// Route-level timeout; applied by the service's upstream selection to
     /// every selection path (route and traffic-split override).
     fn timeout(&self) -> Option<&crate::config::Timeout>;
+
+    /// Optional descriptive metadata for label-deriving plugins. `None` (the
+    /// default) means the implementation carries no label data; callers fall
+    /// back to label-free behavior, matching the old per-method defaults.
+    fn labels(&self) -> Option<&dyn RouteLabels> {
+        None
+    }
+}
+
+/// Optional, non-hot-path route metadata: human-readable names, matching
+/// templates, and host patterns.
+///
+/// Kept off [`RouteContext`] so the cycle-breaker seam only pays for what the
+/// request path uses. Observability plugins (e.g. prometheus) opt into this
+/// trait via [`RouteContext::labels`] to derive bounded metric labels from
+/// route configuration instead of attacker-controllable request input.
+pub trait RouteLabels: Send + Sync {
+    /// Optional human-readable route name from configuration.
+    fn name(&self) -> Option<&str> {
+        None
+    }
+
+    /// Get the service ID if available.
+    fn service_id(&self) -> Option<&str> {
+        None
+    }
+
+    /// Optional human-readable service name from the bound service configuration.
+    fn service_name(&self) -> Option<&str> {
+        None
+    }
+
+    /// Return the configured URI template used to match this route.
+    fn uri_template(&self) -> Option<&str> {
+        None
+    }
+
+    /// Return the effective host patterns used to match this route.
+    fn effective_hosts(&self) -> &[String] {
+        &[]
+    }
 }
 
 /// Request-scoped context shared across all plugin phases.
