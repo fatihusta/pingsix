@@ -228,7 +228,7 @@ impl PluginFaultInjection {
                     serde_json::Value::Bool(b) => b.to_string(),
                     _ => continue, // Skip complex types
                 };
-                rejection.headers.push((name.clone(), value_str));
+                rejection = rejection.with_header(name.clone(), value_str);
             }
         }
 

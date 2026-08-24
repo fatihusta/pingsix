@@ -237,9 +237,9 @@ impl PluginAiProxy {
     /// Build the rejection value (the pipeline writes it through the shared
     /// exit helper, so exit-transformer applies). JSON error body, mirroring
     /// the gateway's other rejections.
-    fn reject(status: u16, message: &str) -> Rejection {
+    fn reject(status: http::StatusCode, message: &str) -> Rejection {
         let body = serde_json::json!({ "error": message }).to_string();
-        Rejection::new(http::StatusCode::from_u16(status).unwrap_or(http::StatusCode::BAD_REQUEST))
+        Rejection::new(status)
             .with_body(body)
             .with_content_type("application/json")
     }
@@ -377,12 +377,15 @@ impl ProxyPlugin for PluginAiProxy {
         }
 
         if let Some(message) = content_type_error(&session.req_header().headers) {
-            return Ok(FilterVerdict::Reject(Self::reject(400, message)));
+            return Ok(FilterVerdict::Reject(Self::reject(
+                http::StatusCode::BAD_REQUEST,
+                message,
+            )));
         }
 
         if !request_declares_body(&session.req_header().headers) {
             return Ok(FilterVerdict::Reject(Self::reject(
-                400,
+                http::StatusCode::BAD_REQUEST,
                 "request body required",
             )));
         }

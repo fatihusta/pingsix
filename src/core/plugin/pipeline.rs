@@ -402,7 +402,8 @@ impl ProxyPluginExecutor {
     }
 
     /// Whether the plugin named `name` was partitioned into `phase` at
-    /// construction. A single-bit `PluginPhases` identifies one partition.
+    /// construction. A single-bit `PluginPhases` identifies one partition;
+    /// any other input (empty, `ALL`, or a union) returns `false`.
     ///
     /// Exposed so construction wiring (builtin `PLUGIN_META` phases, embedder
     /// declarations) can be asserted through the public API instead of
@@ -425,7 +426,7 @@ impl ProxyPluginExecutor {
         } else if phase == PluginPhases::UPSTREAM_PEER {
             &self.upstream_peer
         } else {
-            panic!("has_plugin_in_phase expects a single-phase constant")
+            return false;
         };
         partition.iter().any(|plugin| plugin.name() == name)
     }
