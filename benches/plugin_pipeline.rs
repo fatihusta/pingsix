@@ -5,23 +5,15 @@
 //! `CompiledPlugin::Builtin` enum could actually make, rather than comparing it
 //! with a different (unboxed) hook API.
 
-use std::{
-    pin::Pin,
-    sync::Arc,
-    task::{Context, Poll},
-};
+use std::sync::Arc;
 
 use async_trait::async_trait;
 use criterion::{black_box, criterion_group, criterion_main, BatchSize, Criterion};
 use futures::executor::block_on;
-use pingora_core::protocols::{
-    raw_connect::ProxyDigest, GetProxyDigest, GetSocketDigest, GetTimingDigest, Peek, Shutdown,
-    SocketDigest, Ssl, TimingDigest, UniqueID, UniqueIDType, IO,
-};
 use pingora_error::Result;
 use pingora_proxy::Session;
 use pingsix::core::{PluginPhases, ProxyContext, ProxyPlugin, ProxyPluginExecutor};
-use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
+use pingsix::utils::testing::noop_session;
 
 struct HotPhasePlugin {
     name: &'static str,
@@ -88,64 +80,8 @@ fn static_plugins(count: usize) -> Vec<BenchmarkBuiltin> {
         .collect()
 }
 
-/// Minimal initialized Pingora session for the no-op hook benchmark.
-#[derive(Debug)]
-struct BenchmarkStream;
-
-impl AsyncRead for BenchmarkStream {
-    fn poll_read(
-        self: Pin<&mut Self>,
-        _: &mut Context<'_>,
-        _: &mut ReadBuf<'_>,
-    ) -> Poll<std::io::Result<()>> {
-        Poll::Ready(Ok(()))
-    }
-}
-impl AsyncWrite for BenchmarkStream {
-    fn poll_write(
-        self: Pin<&mut Self>,
-        _: &mut Context<'_>,
-        buf: &[u8],
-    ) -> Poll<std::io::Result<usize>> {
-        Poll::Ready(Ok(buf.len()))
-    }
-    fn poll_flush(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<std::io::Result<()>> {
-        Poll::Ready(Ok(()))
-    }
-    fn poll_shutdown(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<std::io::Result<()>> {
-        Poll::Ready(Ok(()))
-    }
-}
-#[async_trait]
-impl Shutdown for BenchmarkStream {
-    async fn shutdown(&mut self) {}
-}
-impl UniqueID for BenchmarkStream {
-    fn id(&self) -> UniqueIDType {
-        0
-    }
-}
-impl Ssl for BenchmarkStream {}
-impl GetTimingDigest for BenchmarkStream {
-    fn get_timing_digest(&self) -> Vec<Option<TimingDigest>> {
-        Vec::new()
-    }
-}
-impl GetProxyDigest for BenchmarkStream {
-    fn get_proxy_digest(&self) -> Option<Arc<ProxyDigest>> {
-        None
-    }
-}
-impl GetSocketDigest for BenchmarkStream {
-    fn get_socket_digest(&self) -> Option<Arc<SocketDigest>> {
-        None
-    }
-}
-#[async_trait]
-impl Peek for BenchmarkStream {}
-
 fn benchmark_session() -> Session {
-    Session::new_h1(Box::new(BenchmarkStream) as Box<dyn IO>)
+    noop_session()
 }
 
 fn bench_hot_request_phase(c: &mut Criterion, plugin_count: usize) {

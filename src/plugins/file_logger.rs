@@ -804,115 +804,12 @@ impl LogFormat {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::utils::testing::session_from_request as session_for;
     use base64::engine::general_purpose::STANDARD as BASE64;
-    use pingora_core::protocols::raw_connect::ProxyDigest;
-    use pingora_core::protocols::{
-        GetProxyDigest, GetSocketDigest, GetTimingDigest, Peek, Shutdown, SocketDigest, Ssl,
-        TimingDigest, UniqueID, UniqueIDType, IO,
-    };
     use serde_json::json;
     use std::path::PathBuf;
-    use std::pin::Pin;
     use std::sync::atomic::AtomicUsize;
-    use std::task::{Context, Poll};
     use std::time::{SystemTime, UNIX_EPOCH};
-    use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
-
-    // Minimal downstream mock (same pattern as utils/apisix_vars.rs tests).
-    #[derive(Debug)]
-    struct MockStream {
-        data: Vec<u8>,
-        pos: usize,
-    }
-
-    impl MockStream {
-        fn with_request(wire: &str) -> Self {
-            Self {
-                data: wire.as_bytes().to_vec(),
-                pos: 0,
-            }
-        }
-    }
-
-    impl AsyncRead for MockStream {
-        fn poll_read(
-            mut self: Pin<&mut Self>,
-            _cx: &mut Context<'_>,
-            buf: &mut ReadBuf<'_>,
-        ) -> Poll<std::io::Result<()>> {
-            if self.pos >= self.data.len() {
-                return Poll::Ready(Ok(()));
-            }
-            let remaining = &self.data[self.pos..];
-            let to_copy = remaining.len().min(buf.remaining());
-            buf.put_slice(&remaining[..to_copy]);
-            self.pos += to_copy;
-            Poll::Ready(Ok(()))
-        }
-    }
-
-    impl AsyncWrite for MockStream {
-        fn poll_write(
-            self: Pin<&mut Self>,
-            _cx: &mut Context<'_>,
-            buf: &[u8],
-        ) -> Poll<std::io::Result<usize>> {
-            Poll::Ready(Ok(buf.len()))
-        }
-
-        fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
-            Poll::Ready(Ok(()))
-        }
-
-        fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
-            Poll::Ready(Ok(()))
-        }
-    }
-
-    #[async_trait]
-    impl Shutdown for MockStream {
-        async fn shutdown(&mut self) {}
-    }
-
-    impl UniqueID for MockStream {
-        fn id(&self) -> UniqueIDType {
-            0
-        }
-    }
-
-    impl Ssl for MockStream {}
-
-    impl GetTimingDigest for MockStream {
-        fn get_timing_digest(&self) -> Vec<Option<TimingDigest>> {
-            Vec::new()
-        }
-    }
-
-    impl GetProxyDigest for MockStream {
-        fn get_proxy_digest(&self) -> Option<Arc<ProxyDigest>> {
-            None
-        }
-    }
-
-    impl GetSocketDigest for MockStream {
-        fn get_socket_digest(&self) -> Option<Arc<SocketDigest>> {
-            None
-        }
-    }
-
-    #[async_trait]
-    impl Peek for MockStream {}
-
-    async fn session_for(wire: &str) -> Session {
-        let stream: Box<dyn IO> = Box::new(MockStream::with_request(wire));
-        let mut session = Session::new_h1(stream);
-        session
-            .downstream_session
-            .read_request()
-            .await
-            .expect("canned request parses");
-        session
-    }
 
     async fn write_ok_response(session: &mut Session) {
         session

@@ -3120,6 +3120,7 @@ dependencies = [
  "pingora-load-balancing",
  "pingora-proxy",
  "pingora-runtime",
+ "pingsix",
  "pingsix-macros",
  "prometheus",
  "rand 0.8.5",

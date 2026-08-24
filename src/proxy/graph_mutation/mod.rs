@@ -15,9 +15,9 @@ mod test_harness;
 pub use authority::{ConfigurationGraph, PublicationState, PublicationView};
 pub use secrets::{redact, restore_redacted_secrets};
 pub use store::{
-    CommitRevision, GraphCommit, GraphError, GraphStore, ResourceKey, ResourceKind, ResourceView,
-    SecretMode, SecretOperation, StoreError, StoredChange, StoredGraph, StoredMutation,
-    StoredResource, WatchBatch,
+    CommitRevision, GraphCommit, GraphError, GraphStore, InMemoryGraphStore, ResourceKey,
+    ResourceKind, ResourceView, SecretMode, SecretOperation, StoreError, StoredChange, StoredGraph,
+    StoredMutation, StoredResource, WatchBatch,
 };
 #[cfg(test)]
 pub(crate) use test_harness::GraphTestHarness;

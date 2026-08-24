@@ -197,52 +197,6 @@ impl PassiveHealthState {
     }
 }
 
-/// Fingerprint of every upstream field that can change which origin is contacted
-/// or which virtual host / TLS identity is used. Private key material is hashed
-/// via `secret_digest` and never placed in the cache key in cleartext.
-pub(crate) fn cache_origin_fingerprint(upstream: &config::Upstream) -> u64 {
-    use std::collections::hash_map::DefaultHasher;
-    use std::hash::{Hash, Hasher};
-
-    let mut hasher = DefaultHasher::new();
-    upstream.id.hash(&mut hasher);
-    upstream.scheme.hash(&mut hasher);
-    upstream.r#type.hash(&mut hasher);
-    upstream.hash_on.hash(&mut hasher);
-    upstream.key.hash(&mut hasher);
-    upstream.pass_host.hash(&mut hasher);
-    upstream.upstream_host.hash(&mut hasher);
-    upstream.retries.hash(&mut hasher);
-    upstream.retry_timeout.hash(&mut hasher);
-    if let Some(timeout) = &upstream.timeout {
-        timeout.connect.hash(&mut hasher);
-        timeout.send.hash(&mut hasher);
-        timeout.read.hash(&mut hasher);
-    }
-    // HashMap wire order / list insertion order must not change the fingerprint
-    // for an otherwise identical node set. Sort by the canonical node key, and
-    // hash the *effective* port so "no port" and an explicit scheme-default
-    // port (e.g. `example.com` vs `example.com:80` over http) are the same
-    // origin.
-    let mut nodes: Vec<_> = upstream.nodes.iter().collect();
-    nodes.sort_by_key(|n| n.sort_key());
-    for node in nodes {
-        node.bare_host().hash(&mut hasher);
-        node.effective_port(&upstream.scheme).hash(&mut hasher);
-        node.weight.hash(&mut hasher);
-        node.priority.hash(&mut hasher);
-    }
-    if let Some(tls) = &upstream.tls {
-        // Digest PEM material so client identity changes invalidate cache without
-        // embedding secrets in the key.
-        crate::core::secret_digest(&tls.client_cert).hash(&mut hasher);
-        crate::core::secret_digest(&tls.client_key).hash(&mut hasher);
-    } else {
-        0u8.hash(&mut hasher);
-    }
-    hasher.finish()
-}
-
 impl Identifiable for ProxyUpstream {
     fn id(&self) -> &str {
         &self.inner.id
@@ -278,7 +232,8 @@ impl ProxyUpstream {
             log::debug!("Generated ID for inline upstream: {}", upstream.id);
         }
 
-        let cache_origin_fingerprint = cache_origin_fingerprint(&upstream);
+        let cache_origin_fingerprint =
+            upstream.fingerprint(config::UpstreamFingerprintProfile::CacheOrigin);
         let lb = SelectionLB::from_prepared(upstream.clone(), prepared, defaults, resolver)
             .map_err(|e| {
                 ProxyError::Configuration(format!("Failed to create load balancer: {e}"))
@@ -730,6 +685,12 @@ mod tests {
             weight: 1,
             priority,
         }
+    }
+
+    /// Cache-origin (cache namespace) fingerprint via the config-declared
+    /// profile; kept under the old test helper name for readability.
+    fn cache_origin_fingerprint(upstream: &config::Upstream) -> u64 {
+        upstream.fingerprint(config::UpstreamFingerprintProfile::CacheOrigin)
     }
 
     fn sample_upstream(id: &str, timeout: Option<Timeout>) -> config::Upstream {

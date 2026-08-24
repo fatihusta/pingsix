@@ -382,22 +382,8 @@ mod tests {
 
     /// A session fed a canned request, for exercising key resolution against
     /// a live (non-socket) request.
-    async fn request_session(raw: &'static str) -> Session {
-        use tokio::io::AsyncWriteExt;
-
-        let (client, mut server) = tokio::io::duplex(1024);
-        server
-            .write_all(raw.as_bytes())
-            .await
-            .expect("write canned request");
-        drop(server);
-        let mut session = Session::new_h1(Box::new(client));
-        session
-            .downstream_session
-            .read_request()
-            .await
-            .expect("canned request parses");
-        session
+    async fn request_session(raw: &str) -> Session {
+        crate::utils::testing::session_from_request(raw).await
     }
 
     #[tokio::test]

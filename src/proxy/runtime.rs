@@ -5,7 +5,6 @@
 
 use std::{
     collections::HashMap,
-    hash::{Hash, Hasher},
     sync::{Arc, Mutex},
 };
 
@@ -86,34 +85,13 @@ impl RuntimeSnapshot {
     }
 }
 
-fn health_check_fingerprint(upstream: &config::Upstream) -> HealthCheckFingerprint {
-    fingerprint_upstream_for_health_check(upstream)
-}
-
 /// Stable fingerprint of upstream fields that affect health-check behavior.
 ///
-/// Includes scheme, node addresses (not weights or priorities), and `checks`.
-/// Excludes retries, pass_host, and similar LB-only fields so unrelated edits
-/// do not restart HC tasks. Ports are hashed at their *effective* value so an
-/// omitted port and an explicit scheme-default port probe the same targets.
-pub fn fingerprint_upstream_for_health_check(
-    upstream: &config::Upstream,
-) -> HealthCheckFingerprint {
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    if let Ok(scheme) = serde_json::to_vec(&upstream.scheme) {
-        scheme.hash(&mut hasher);
-    }
-
-    let mut nodes: Vec<_> = upstream.nodes.iter().collect();
-    nodes.sort_by_key(|n| n.sort_key());
-    for node in nodes {
-        node.bare_host().hash(&mut hasher);
-        node.effective_port(&upstream.scheme).hash(&mut hasher);
-    }
-    if let Ok(bytes) = serde_json::to_vec(&upstream.checks) {
-        bytes.hash(&mut hasher);
-    }
-    HealthCheckFingerprint(hasher.finish())
+/// The field policy (scheme, effective node addresses, `checks`; no weights,
+/// retries or other LB-only fields) is declared next to the type as
+/// [`config::UpstreamFingerprintProfile::HealthCheck`].
+fn health_check_fingerprint(upstream: &config::Upstream) -> HealthCheckFingerprint {
+    HealthCheckFingerprint(upstream.fingerprint(config::UpstreamFingerprintProfile::HealthCheck))
 }
 
 fn collect_health_checks(snapshot: &RuntimeSnapshot) -> Vec<HealthCheckSpec> {
@@ -416,8 +394,8 @@ mod tests {
         let a = sample_upstream("u", &[("10.0.0.2:80", 1), ("10.0.0.1:80", 2)]);
         let b = sample_upstream("u", &[("10.0.0.1:80", 2), ("10.0.0.2:80", 1)]);
         assert_eq!(
-            fingerprint_upstream_for_health_check(&a),
-            fingerprint_upstream_for_health_check(&b)
+            a.fingerprint(config::UpstreamFingerprintProfile::HealthCheck),
+            b.fingerprint(config::UpstreamFingerprintProfile::HealthCheck)
         );
     }
 
@@ -426,8 +404,8 @@ mod tests {
         let a = sample_upstream("u", &[("10.0.0.1:80", 1)]);
         let b = sample_upstream("u", &[("10.0.0.1:80", 99)]);
         assert_eq!(
-            fingerprint_upstream_for_health_check(&a),
-            fingerprint_upstream_for_health_check(&b)
+            a.fingerprint(config::UpstreamFingerprintProfile::HealthCheck),
+            b.fingerprint(config::UpstreamFingerprintProfile::HealthCheck)
         );
     }
 
@@ -550,8 +528,12 @@ mod tests {
         let gen2 = store.health_check_generation("upstream/u1").unwrap();
         assert!(!Arc::ptr_eq(&before, &after));
         assert_eq!(
-            fingerprint_upstream_for_health_check(&before.inner),
-            fingerprint_upstream_for_health_check(&after.inner)
+            before
+                .inner
+                .fingerprint(config::UpstreamFingerprintProfile::HealthCheck),
+            after
+                .inner
+                .fingerprint(config::UpstreamFingerprintProfile::HealthCheck)
         );
         assert_ne!(
             gen1, gen2,

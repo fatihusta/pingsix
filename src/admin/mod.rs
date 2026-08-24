@@ -2,7 +2,6 @@ use std::{
     collections::{BTreeMap, HashMap},
     error::Error,
     fmt,
-    marker::PhantomData,
     sync::Arc,
 };
 
@@ -15,7 +14,7 @@ use pingora::{
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    config::{self, etcd::canonicalize_prefix, Admin, Pingsix},
+    config::{etcd::canonicalize_prefix, Admin, Pingsix},
     core::{constant_time_eq, ProxyError},
     proxy::graph_mutation::{ConfigurationGraph, GraphError, ResourceKey, ResourceKind},
     utils::response::{CommonErrors, ResponseBuilder},
@@ -212,54 +211,50 @@ type RequestParams = BTreeMap<String, String>;
 // Maximum request body size for admin API (1 MB)
 const MAX_BODY_SIZE: usize = 1_048_576;
 
-/// Resource kinds the Admin API serves.
-///
-/// Route registration, URL key extraction, and per-kind validation dispatch
-/// (which lives in the configuration graph authority) use the typed
-/// [`ResourceKind`]. HTTP-specific concerns stay in the handlers below.
-trait AdminResource: Send + Sync + 'static {
-    const RESOURCE_KIND: ResourceKind;
+// Handlers are value-parameterized by [`ResourceKind`]: one handler instance
+// per operation and resource kind is constructed at route registration.
+// Per-kind validation dispatch lives in the configuration graph authority;
+// the handlers below only carry HTTP-specific concerns.
+
+struct ResourceHandler {
+    kind: ResourceKind,
 }
 
-impl AdminResource for config::Route {
-    const RESOURCE_KIND: ResourceKind = ResourceKind::Route;
+struct GetHandler {
+    kind: ResourceKind,
 }
 
-impl AdminResource for config::Upstream {
-    const RESOURCE_KIND: ResourceKind = ResourceKind::Upstream;
+struct DeleteHandler {
+    kind: ResourceKind,
 }
 
-impl AdminResource for config::Service {
-    const RESOURCE_KIND: ResourceKind = ResourceKind::Service;
+struct ListHandler {
+    kind: ResourceKind,
 }
 
-impl AdminResource for config::GlobalRule {
-    const RESOURCE_KIND: ResourceKind = ResourceKind::GlobalRule;
+impl ResourceHandler {
+    fn new(kind: ResourceKind) -> Self {
+        Self { kind }
+    }
 }
 
-impl AdminResource for config::SSL {
-    const RESOURCE_KIND: ResourceKind = ResourceKind::Ssl;
+impl GetHandler {
+    fn new(kind: ResourceKind) -> Self {
+        Self { kind }
+    }
 }
 
-macro_rules! admin_handler {
-    ($name:ident) => {
-        struct $name<T: AdminResource> {
-            _phantom: PhantomData<T>,
-        }
-        impl<T: AdminResource> $name<T> {
-            fn new() -> Self {
-                Self {
-                    _phantom: PhantomData,
-                }
-            }
-        }
-    };
+impl DeleteHandler {
+    fn new(kind: ResourceKind) -> Self {
+        Self { kind }
+    }
 }
 
-admin_handler!(ResourceHandler);
-admin_handler!(GetHandler);
-admin_handler!(DeleteHandler);
-admin_handler!(ListHandler);
+impl ListHandler {
+    fn new(kind: ResourceKind) -> Self {
+        Self { kind }
+    }
+}
 
 struct PublicationHandler;
 
@@ -292,14 +287,12 @@ impl Handler for PublicationHandler {
     }
 }
 
-impl<T: AdminResource> ResourceHandler<T> {
-    fn extract_key(params: &RequestParams) -> ApiResult<ResourceKey> {
-        let id = params
-            .get("id")
-            .ok_or_else(|| ApiError::MissingParameter("id".into()))?;
+fn extract_key(kind: ResourceKind, params: &RequestParams) -> ApiResult<ResourceKey> {
+    let id = params
+        .get("id")
+        .ok_or_else(|| ApiError::MissingParameter("id".into()))?;
 
-        ResourceKey::new(T::RESOURCE_KIND, id).map_err(ApiError::from)
-    }
+    ResourceKey::new(kind, id).map_err(ApiError::from)
 }
 
 #[async_trait]
@@ -315,7 +308,7 @@ trait Handler {
 
 // PUT handler
 #[async_trait]
-impl<T: AdminResource> Handler for ResourceHandler<T> {
+impl Handler for ResourceHandler {
     async fn handle(
         &self,
         graph: &ConfigurationGraph,
@@ -329,7 +322,7 @@ impl<T: AdminResource> Handler for ResourceHandler<T> {
             .await
             .map_err(|e| ApiError::RequestBodyReadError(e.to_string()))?;
 
-        let key = Self::extract_key(&params)?;
+        let key = extract_key(self.kind, &params)?;
 
         let value: serde_json::Value = serde_json::from_slice(&body_data)
             .map_err(|e| ApiError::ValidationError(format!("Invalid JSON: {e}")))?;
@@ -354,7 +347,7 @@ impl<T: AdminResource> Handler for ResourceHandler<T> {
 
 // GET handler - separate type needed to distinguish operation types
 #[async_trait]
-impl<T: AdminResource> Handler for GetHandler<T> {
+impl Handler for GetHandler {
     async fn handle(
         &self,
         graph: &ConfigurationGraph,
@@ -362,7 +355,7 @@ impl<T: AdminResource> Handler for GetHandler<T> {
         _http_session: &mut ServerSession,
         params: RequestParams,
     ) -> ApiResult<ApiResponse> {
-        let key = ResourceHandler::<T>::extract_key(&params)?;
+        let key = extract_key(self.kind, &params)?;
 
         match graph.get(&key).await? {
             Some(view) => Ok(ResponseBuilder::success_json(&ValueWrapper {
@@ -375,7 +368,7 @@ impl<T: AdminResource> Handler for GetHandler<T> {
 
 // DELETE handler
 #[async_trait]
-impl<T: AdminResource> Handler for DeleteHandler<T> {
+impl Handler for DeleteHandler {
     async fn handle(
         &self,
         graph: &ConfigurationGraph,
@@ -383,7 +376,7 @@ impl<T: AdminResource> Handler for DeleteHandler<T> {
         _http_session: &mut ServerSession,
         params: RequestParams,
     ) -> ApiResult<ApiResponse> {
-        let key = ResourceHandler::<T>::extract_key(&params)?;
+        let key = extract_key(self.kind, &params)?;
 
         let committed = graph.delete(key).await?;
 
@@ -403,7 +396,7 @@ impl<T: AdminResource> Handler for DeleteHandler<T> {
 
 // LIST handler
 #[async_trait]
-impl<T: AdminResource> Handler for ListHandler<T> {
+impl Handler for ListHandler {
     async fn handle(
         &self,
         graph: &ConfigurationGraph,
@@ -411,7 +404,7 @@ impl<T: AdminResource> Handler for ListHandler<T> {
         _http_session: &mut ServerSession,
         _params: RequestParams,
     ) -> ApiResult<ApiResponse> {
-        let views = graph.list(T::RESOURCE_KIND).await?;
+        let views = graph.list(self.kind).await?;
 
         let list_items: Vec<serde_json::Value> = views
             .into_iter()
@@ -458,30 +451,34 @@ impl AdminHttpApp {
             router: Router::new(),
         };
 
-        // Register routes with type safety and reduced boilerplate
+        // Register routes for each resource kind.
         this.route(
             "/apisix/admin/publications/{revision}",
             Method::GET,
             Box::new(PublicationHandler),
-        )
-        .register_resource_routes::<config::Route>()
-        .register_resource_routes::<config::Upstream>()
-        .register_resource_routes::<config::Service>()
-        .register_resource_routes::<config::GlobalRule>()
-        .register_resource_routes::<config::SSL>();
+        );
+
+        for kind in [
+            ResourceKind::Route,
+            ResourceKind::Upstream,
+            ResourceKind::Service,
+            ResourceKind::GlobalRule,
+            ResourceKind::Ssl,
+        ] {
+            this.register_resource_routes(kind);
+        }
 
         this
     }
 
-    fn register_resource_routes<T: AdminResource>(&mut self) -> &mut Self {
-        let kind = T::RESOURCE_KIND.as_str();
-        let path = format!("/apisix/admin/{kind}/{{id}}");
-        let list_path = format!("/apisix/admin/{kind}");
+    fn register_resource_routes(&mut self, kind: ResourceKind) -> &mut Self {
+        let path = format!("/apisix/admin/{}/{{id}}", kind.as_str());
+        let list_path = format!("/apisix/admin/{}", kind.as_str());
 
-        self.route(&path, Method::PUT, Box::new(ResourceHandler::<T>::new()))
-            .route(&path, Method::GET, Box::new(GetHandler::<T>::new()))
-            .route(&path, Method::DELETE, Box::new(DeleteHandler::<T>::new()))
-            .route(&list_path, Method::GET, Box::new(ListHandler::<T>::new()));
+        self.route(&path, Method::PUT, Box::new(ResourceHandler::new(kind)))
+            .route(&path, Method::GET, Box::new(GetHandler::new(kind)))
+            .route(&path, Method::DELETE, Box::new(DeleteHandler::new(kind)))
+            .route(&list_path, Method::GET, Box::new(ListHandler::new(kind)));
 
         self
     }
@@ -649,7 +646,7 @@ mod tests {
     #[test]
     fn empty_api_key_config_is_rejected_by_validator() {
         use validator::Validate;
-        let admin = config::Admin {
+        let admin = Admin {
             address: "127.0.0.1:9181".parse().unwrap(),
             api_key: "   ".into(),
             allow_insecure_remote: false,

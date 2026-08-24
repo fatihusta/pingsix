@@ -47,119 +47,12 @@ pub fn match_apisix_vars(session: &mut Session, vars: &[Vec<String>]) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use std::pin::Pin;
-    use std::sync::Arc;
-    use std::task::{Context, Poll};
-
-    use async_trait::async_trait;
-    use pingora_core::protocols::raw_connect::ProxyDigest;
-    use pingora_core::protocols::{
-        GetProxyDigest, GetSocketDigest, GetTimingDigest, Peek, Shutdown, SocketDigest, Ssl,
-        TimingDigest, UniqueID, UniqueIDType, IO,
-    };
-    use pingora_proxy::Session;
-    use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
+    use crate::utils::testing::{http_get_wire, session_from_request};
 
     use super::*;
 
-    #[derive(Debug)]
-    struct MockStream {
-        data: Vec<u8>,
-        pos: usize,
-    }
-
-    impl MockStream {
-        fn with_request(path: &str, headers: &[(&str, &str)]) -> Self {
-            let mut wire = format!("GET {path} HTTP/1.1\r\n");
-            for (name, value) in headers {
-                wire.push_str(name);
-                wire.push(':');
-                wire.push(' ');
-                wire.push_str(value);
-                wire.push_str("\r\n");
-            }
-            wire.push_str("\r\n");
-            Self {
-                data: wire.into_bytes(),
-                pos: 0,
-            }
-        }
-    }
-
-    impl AsyncRead for MockStream {
-        fn poll_read(
-            mut self: Pin<&mut Self>,
-            _cx: &mut Context<'_>,
-            buf: &mut ReadBuf<'_>,
-        ) -> Poll<std::io::Result<()>> {
-            if self.pos >= self.data.len() {
-                return Poll::Ready(Ok(()));
-            }
-            let remaining = &self.data[self.pos..];
-            let to_copy = remaining.len().min(buf.remaining());
-            buf.put_slice(&remaining[..to_copy]);
-            self.pos += to_copy;
-            Poll::Ready(Ok(()))
-        }
-    }
-
-    impl AsyncWrite for MockStream {
-        fn poll_write(
-            self: Pin<&mut Self>,
-            _cx: &mut Context<'_>,
-            buf: &[u8],
-        ) -> Poll<std::io::Result<usize>> {
-            Poll::Ready(Ok(buf.len()))
-        }
-
-        fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
-            Poll::Ready(Ok(()))
-        }
-
-        fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
-            Poll::Ready(Ok(()))
-        }
-    }
-
-    #[async_trait]
-    impl Shutdown for MockStream {
-        async fn shutdown(&mut self) {}
-    }
-
-    impl UniqueID for MockStream {
-        fn id(&self) -> UniqueIDType {
-            0
-        }
-    }
-
-    impl Ssl for MockStream {}
-
-    impl GetTimingDigest for MockStream {
-        fn get_timing_digest(&self) -> Vec<Option<TimingDigest>> {
-            Vec::new()
-        }
-    }
-
-    impl GetProxyDigest for MockStream {
-        fn get_proxy_digest(&self) -> Option<Arc<ProxyDigest>> {
-            None
-        }
-    }
-
-    impl GetSocketDigest for MockStream {
-        fn get_socket_digest(&self) -> Option<Arc<SocketDigest>> {
-            None
-        }
-    }
-
-    #[async_trait]
-    impl Peek for MockStream {}
-
     async fn make_session(path: &str, headers: &[(&str, &str)]) -> Session {
-        let stream: Box<dyn IO> = Box::new(MockStream::with_request(path, headers));
-        let mut session = Session::new_h1(stream);
-        session.as_downstream_mut().read_request().await.unwrap();
-        session
+        session_from_request(&http_get_wire(path, headers)).await
     }
 
     #[tokio::test]

@@ -58,7 +58,16 @@ aes-gcm = "0.10"
 argon2 = "0.5"
 jsonschema = { version = "0.49.9", default-features = false }
 
+[features]
+# Exposes `utils::testing` (mock-IO/session helpers) to tests/ and benches/,
+# which link the library without cfg(test). Off by default; release builds
+# are unaffected.
+test-utils = []
+
 [dev-dependencies]
+# Self dev-dependency: enables `test-utils` on the library so integration
+# tests and benches can `use pingsix::utils::testing`.
+pingsix = { path = ".", features = ["test-utils"] }
 criterion = "0.5"
 etcd-client = { version = "0.18.0", features = ["tls"] }
 jsonwebtoken = "9.3.1"

@@ -256,6 +256,118 @@ impl fmt::Display for GraphError {
 
 impl std::error::Error for GraphError {}
 
+/// Minimal faithful stand-in for the external configuration store.
+///
+/// The local-substitutable [`GraphStore`] adapter: models only the behavior
+/// the authority relies on — whole-graph snapshots and guarded atomic CAS —
+/// with no watch, lease, or TLS semantics. It is a normal public item (not a
+/// test-gated fixture) so both in-crate tests/harnesses and integration tests
+/// can drive hermetic authority/worker/CAS scenarios without a live etcd.
+pub struct InMemoryGraphStore {
+    state: tokio::sync::Mutex<InMemoryState>,
+}
+
+struct InMemoryState {
+    graph: StoredGraph,
+    next_revision: i64,
+}
+
+impl InMemoryGraphStore {
+    pub fn new() -> Self {
+        Self {
+            state: tokio::sync::Mutex::new(InMemoryState {
+                graph: StoredGraph::default(),
+                next_revision: 1,
+            }),
+        }
+    }
+}
+
+impl Default for InMemoryGraphStore {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[async_trait]
+impl GraphStore for InMemoryGraphStore {
+    async fn get_exact(&self, key: &ResourceKey) -> Result<Option<StoredResource>, StoreError> {
+        Ok(self.state.lock().await.graph.resources.get(key).cloned())
+    }
+
+    async fn list_kind(
+        &self,
+        kind: ResourceKind,
+    ) -> Result<Vec<(ResourceKey, StoredResource)>, StoreError> {
+        Ok(self
+            .state
+            .lock()
+            .await
+            .graph
+            .resources
+            .iter()
+            .filter(|(key, _)| key.kind == kind)
+            .map(|(key, resource)| (key.clone(), resource.clone()))
+            .collect())
+    }
+
+    async fn snapshot(&self) -> Result<StoredGraph, StoreError> {
+        Ok(self.state.lock().await.graph.clone())
+    }
+
+    async fn compare_and_swap(&self, commit: GraphCommit) -> Result<CommitRevision, StoreError> {
+        let mut state = self.state.lock().await;
+        let target_key = match &commit.mutation {
+            StoredMutation::Put { key, .. } | StoredMutation::Delete { key } => key,
+        };
+        let target_ok = match commit.expected_target_mod_revision {
+            None => !state.graph.resources.contains_key(target_key),
+            Some(expected) => {
+                state
+                    .graph
+                    .resources
+                    .get(target_key)
+                    .map(|r| r.mod_revision)
+                    == Some(expected)
+            }
+        };
+        let guard_ok = match commit.expected_guard_mod_revision {
+            None => state.graph.guard_mod_revision.is_none(),
+            Some(expected) => state.graph.guard_mod_revision == Some(expected),
+        };
+        if !target_ok || !guard_ok {
+            return Err(StoreError::Conflict);
+        }
+
+        let revision = state.next_revision;
+        state.next_revision += 1;
+        match commit.mutation {
+            StoredMutation::Put { key, value } => {
+                let create_revision = state
+                    .graph
+                    .resources
+                    .get(&key)
+                    .map(|r| r.create_revision)
+                    .unwrap_or(revision);
+                state.graph.resources.insert(
+                    key,
+                    StoredResource {
+                        value,
+                        create_revision,
+                        mod_revision: revision,
+                    },
+                );
+            }
+            StoredMutation::Delete { key } => {
+                state.graph.resources.remove(&key);
+            }
+        }
+        state.graph.guard_mod_revision = Some(revision);
+        state.graph.revision = revision;
+        Ok(CommitRevision(revision))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -287,5 +399,115 @@ mod tests {
                 .logical_path(),
             "routes/r1"
         );
+    }
+
+    #[tokio::test]
+    async fn in_memory_store_cas_contract() {
+        let store = InMemoryGraphStore::new();
+        let key = ResourceKey::new(ResourceKind::Route, "r1").unwrap();
+        let body = b"{\"id\":\"r1\"}".to_vec();
+
+        // Create: absent target + absent guard.
+        let commit = GraphCommit {
+            mutation: StoredMutation::Put {
+                key: key.clone(),
+                value: body.clone(),
+            },
+            expected_target_mod_revision: None,
+            expected_guard_mod_revision: None,
+        };
+        let rev1 = store.compare_and_swap(commit).await.unwrap();
+        assert_eq!(rev1, CommitRevision(1));
+        let snapshot = store.snapshot().await.unwrap();
+        assert_eq!(snapshot.resources[&key].mod_revision, 1);
+        assert_eq!(snapshot.guard_mod_revision, Some(1));
+
+        // Replace with exact mod revision.
+        let commit = GraphCommit {
+            mutation: StoredMutation::Put {
+                key: key.clone(),
+                value: body.clone(),
+            },
+            expected_target_mod_revision: Some(1),
+            expected_guard_mod_revision: Some(1),
+        };
+        assert_eq!(
+            store.compare_and_swap(commit).await.unwrap(),
+            CommitRevision(2)
+        );
+
+        // Stale target mod revision conflicts.
+        let commit = GraphCommit {
+            mutation: StoredMutation::Put {
+                key: key.clone(),
+                value: body,
+            },
+            expected_target_mod_revision: Some(1),
+            expected_guard_mod_revision: Some(2),
+        };
+        assert!(matches!(
+            store.compare_and_swap(commit).await,
+            Err(StoreError::Conflict)
+        ));
+
+        // Stale guard conflicts even with correct target.
+        let commit = GraphCommit {
+            mutation: StoredMutation::Put {
+                key: key.clone(),
+                value: b"x".to_vec(),
+            },
+            expected_target_mod_revision: Some(2),
+            expected_guard_mod_revision: Some(1),
+        };
+        assert!(matches!(
+            store.compare_and_swap(commit).await,
+            Err(StoreError::Conflict)
+        ));
+
+        // Conflict leaves state unchanged.
+        let after = store.snapshot().await.unwrap();
+        assert_eq!(after.resources[&key].mod_revision, 2);
+        assert_eq!(after.guard_mod_revision, Some(2));
+
+        // Delete of a missing target conflicts.
+        let ghost = ResourceKey::new(ResourceKind::Route, "ghost").unwrap();
+        let commit = GraphCommit {
+            mutation: StoredMutation::Delete { key: ghost },
+            expected_target_mod_revision: Some(2),
+            expected_guard_mod_revision: Some(2),
+        };
+        assert!(matches!(
+            store.compare_and_swap(commit).await,
+            Err(StoreError::Conflict)
+        ));
+
+        // Delete of existing target succeeds and removes only the target.
+        let commit = GraphCommit {
+            mutation: StoredMutation::Delete { key: key.clone() },
+            expected_target_mod_revision: Some(2),
+            expected_guard_mod_revision: Some(2),
+        };
+        assert_eq!(
+            store.compare_and_swap(commit).await.unwrap(),
+            CommitRevision(3)
+        );
+        let after = store.snapshot().await.unwrap();
+        assert!(!after.resources.contains_key(&key));
+        assert_eq!(after.guard_mod_revision, Some(3));
+        assert!(after.resources.is_empty());
+
+        // Recreate after delete: create_revision tracks the new creation.
+        let commit = GraphCommit {
+            mutation: StoredMutation::Put {
+                key: key.clone(),
+                value: b"new".to_vec(),
+            },
+            expected_target_mod_revision: None,
+            expected_guard_mod_revision: Some(3),
+        };
+        store.compare_and_swap(commit).await.unwrap();
+        let after = store.snapshot().await.unwrap();
+        assert_eq!(after.resources[&key].create_revision, 4);
+        assert_eq!(after.resources[&key].mod_revision, 4);
     }
 }

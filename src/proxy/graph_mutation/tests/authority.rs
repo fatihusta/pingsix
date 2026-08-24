@@ -1,10 +1,10 @@
 #[cfg(test)]
 mod authority_tests {
-    use crate::config::etcd::InMemoryGraphStore;
     use crate::proxy::graph_mutation::authority::validate_resource_json;
     use crate::proxy::graph_mutation::state::{
         safe_preparation_error, PublicationRegistry, PUBLICATION_REGISTRY_CAPACITY,
     };
+    use crate::proxy::graph_mutation::InMemoryGraphStore;
     use crate::proxy::graph_mutation::*;
     use crate::proxy::graph_mutation::{GraphCommit, StoredMutation};
     use async_trait::async_trait;

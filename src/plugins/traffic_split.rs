@@ -7,10 +7,10 @@ use serde_json::Value as JsonValue;
 use std::{collections::HashMap, sync::Arc};
 use validator::Validate;
 
-use crate::config::Upstream;
+use crate::config::{self, Upstream};
 use crate::core::{
-    HealthCheckSpec, PluginPhases, ProxyContext, ProxyError, ProxyPlugin, ProxyResult,
-    UpstreamSelector,
+    HealthCheckFingerprint, HealthCheckSpec, PluginPhases, ProxyContext, ProxyError, ProxyPlugin,
+    ProxyResult, UpstreamSelector,
 };
 use crate::proxy::upstream::{
     PreparedUpstreams, ProxyUpstream, TrafficSplitOwner, UpstreamOccurrence,
@@ -310,8 +310,10 @@ pub(crate) fn create_traffic_split_plugin_with_upstreams(
                 )?);
                 health_check_specs.push(HealthCheckSpec {
                     key: format!("traffic-split/{rule_idx}/{upstream_idx}"),
-                    fingerprint: crate::proxy::runtime::fingerprint_upstream_for_health_check(
-                        &upstream.inner,
+                    fingerprint: HealthCheckFingerprint(
+                        upstream
+                            .inner
+                            .fingerprint(config::UpstreamFingerprintProfile::HealthCheck),
                     ),
                     service: upstream.health_check_service(),
                 });

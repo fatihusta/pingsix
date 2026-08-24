@@ -65,7 +65,7 @@ impl GraphTestHarness {
 #[cfg(test)]
 mod isolation_tests {
     use super::*;
-    use crate::config::etcd::InMemoryGraphStore;
+    use crate::proxy::graph_mutation::InMemoryGraphStore;
     use crate::proxy::graph_mutation::{ResourceKey, ResourceKind, StoredGraph, StoredResource};
     use std::time::Duration;
 

@@ -1,9 +1,9 @@
 #[cfg(test)]
 mod worker_tests {
     use crate::config;
-    use crate::config::etcd::InMemoryGraphStore;
     use crate::config::EffectiveDefaults;
     use crate::core::status::StatusStore;
+    use crate::proxy::graph_mutation::InMemoryGraphStore;
     use crate::proxy::graph_mutation::*;
     use crate::proxy::graph_mutation::{GraphTestHarness, StoredChange, StoredResource};
     use crate::proxy::runtime::RuntimeStore;

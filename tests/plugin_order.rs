@@ -17,105 +17,26 @@
 //! every phase (early-request, request, upstream-request, response,
 //! response-body, logging) so a precedence change in any phase is caught here.
 
-use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use std::task::{Context, Poll};
 
 use async_trait::async_trait;
 use bytes::Bytes;
-use pingora_core::protocols::raw_connect::ProxyDigest;
-use pingora_core::protocols::{
-    GetProxyDigest, GetSocketDigest, GetTimingDigest, Peek, Shutdown, SocketDigest, Ssl,
-    TimingDigest, UniqueID, UniqueIDType, IO,
-};
 use pingora_error::Result;
 use pingora_http::RequestHeader;
 use pingora_proxy::Session;
-use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
 use pingsix::core::{
     CompiledPluginPipeline, PluginPhases, ProxyContext, ProxyPlugin, ProxyPluginExecutor,
 };
 
 // ---------------------------------------------------------------------------
-// Minimal downstream stream so we can construct a `pingora_proxy::Session`
-// without a real TCP connection. The stub plugins below never read from or
-// write to the session, so an immediately-EOF stream is sufficient. All
-// `pingora_core::protocols::IO` supertraits are implemented with no-op/empty
-// defaults; the blanket `IO` impl then applies.
+// Session shell over the shared mock stream (pingora `IO` with immediate EOF);
+// the stub plugins below never read from or write to the session.
 // ---------------------------------------------------------------------------
 
-#[derive(Debug)]
-struct MockStream;
-
-impl AsyncRead for MockStream {
-    fn poll_read(
-        self: Pin<&mut Self>,
-        _cx: &mut Context<'_>,
-        _buf: &mut ReadBuf<'_>,
-    ) -> Poll<std::io::Result<()>> {
-        // Immediately signal EOF: nothing to read.
-        Poll::Ready(Ok(()))
-    }
-}
-
-impl AsyncWrite for MockStream {
-    fn poll_write(
-        self: Pin<&mut Self>,
-        _cx: &mut Context<'_>,
-        buf: &[u8],
-    ) -> Poll<std::io::Result<usize>> {
-        // Discard writes silently.
-        Poll::Ready(Ok(buf.len()))
-    }
-
-    fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
-        Poll::Ready(Ok(()))
-    }
-
-    fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
-        Poll::Ready(Ok(()))
-    }
-}
-
-#[async_trait]
-impl Shutdown for MockStream {
-    async fn shutdown(&mut self) {}
-}
-
-impl UniqueID for MockStream {
-    fn id(&self) -> UniqueIDType {
-        0
-    }
-}
-
-impl Ssl for MockStream {}
-
-impl GetTimingDigest for MockStream {
-    fn get_timing_digest(&self) -> Vec<Option<TimingDigest>> {
-        Vec::new()
-    }
-}
-
-impl GetProxyDigest for MockStream {
-    fn get_proxy_digest(&self) -> Option<Arc<ProxyDigest>> {
-        None
-    }
-}
-
-impl GetSocketDigest for MockStream {
-    fn get_socket_digest(&self) -> Option<Arc<SocketDigest>> {
-        None
-    }
-}
-
-#[async_trait]
-impl Peek for MockStream {}
-
 fn make_session() -> Session {
-    let stream: Box<dyn IO> = Box::new(MockStream);
-    Session::new_h1(stream)
+    pingsix::utils::testing::noop_session()
 }
 
 // ---------------------------------------------------------------------------

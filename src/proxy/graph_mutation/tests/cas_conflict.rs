@@ -1,6 +1,6 @@
 #[cfg(test)]
 mod cas_conflict_tests {
-    use crate::config::etcd::InMemoryGraphStore;
+    use crate::proxy::graph_mutation::InMemoryGraphStore;
     use crate::proxy::graph_mutation::*;
     use crate::proxy::graph_mutation::{GraphCommit, StoredMutation};
     use async_trait::async_trait;

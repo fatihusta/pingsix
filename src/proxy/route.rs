@@ -28,49 +28,6 @@ fn build_plugin_name_index(plugins: &[Arc<dyn ProxyPlugin>]) -> Vec<String> {
     names
 }
 
-/// Stable hash of plugin configuration that can change response content or
-/// origin selection (response-rewrite, proxy-rewrite, traffic-split, cache, …).
-fn hash_plugin_map(
-    plugins: &HashMap<String, serde_json::Value>,
-    hasher: &mut impl std::hash::Hasher,
-) {
-    use std::hash::Hash;
-    let mut keys: Vec<_> = plugins.keys().collect();
-    keys.sort();
-    for key in keys {
-        key.hash(hasher);
-        match serde_json::to_string(plugins.get(key).unwrap()) {
-            Ok(encoded) => encoded.hash(hasher),
-            Err(_) => "unencodable".hash(hasher),
-        }
-    }
-}
-
-fn route_cache_namespace_fingerprint(route: &config::Route, service: Option<&ProxyService>) -> u64 {
-    use std::collections::hash_map::DefaultHasher;
-    use std::hash::{Hash, Hasher};
-
-    let mut hasher = DefaultHasher::new();
-    route.id.hash(&mut hasher);
-    route.service_id.hash(&mut hasher);
-    route.uri.hash(&mut hasher);
-    route.uris.hash(&mut hasher);
-    route.host.hash(&mut hasher);
-    route.hosts.hash(&mut hasher);
-    route.priority.hash(&mut hasher);
-    if let Some(timeout) = &route.timeout {
-        timeout.connect.hash(&mut hasher);
-        timeout.send.hash(&mut hasher);
-        timeout.read.hash(&mut hasher);
-    }
-    hash_plugin_map(&route.plugins, &mut hasher);
-    if let Some(service) = service {
-        service.inner.id.hash(&mut hasher);
-        hash_plugin_map(&service.inner.plugins, &mut hasher);
-    }
-    hasher.finish()
-}
-
 fn route_overrides_plugin(route_plugin_names: &[String], plugin_name: &str) -> bool {
     // route_plugin_names is sorted
     route_plugin_names
@@ -258,7 +215,7 @@ impl ProxyRoute {
         let serves_preflight = plugin_executor.has_plugin(cors::PLUGIN_NAME);
 
         let cache_namespace_fingerprint =
-            route_cache_namespace_fingerprint(&route, service.as_deref());
+            route.cache_namespace_fingerprint(service.as_ref().map(|service| &service.inner));
 
         let service_name = service.as_ref().and_then(|s| s.inner.name.clone());
 
