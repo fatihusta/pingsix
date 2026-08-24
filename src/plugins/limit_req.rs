@@ -26,7 +26,7 @@ use serde_json::Value as JsonValue;
 use validator::{Validate, ValidationError};
 
 use crate::{
-    core::{PluginPhases, ProxyContext, ProxyError, ProxyPlugin, ProxyResult},
+    core::{FilterVerdict, ProxyContext, ProxyError, ProxyPlugin, ProxyResult},
     plugins::{
         config::parse_and_validate_plugin_config,
         limiting::{
@@ -188,11 +188,11 @@ impl ProxyPlugin for PluginLimitReq {
     fn priority(&self) -> i32 {
         PRIORITY
     }
-    fn phases(&self) -> PluginPhases {
-        PluginPhases::REQUEST
-    }
-
-    async fn request_filter(&self, session: &mut Session, ctx: &mut ProxyContext) -> Result<bool> {
+    async fn request_filter(
+        &self,
+        session: &mut Session,
+        _ctx: &mut ProxyContext,
+    ) -> Result<FilterVerdict> {
         let key = apisix_key(
             session,
             &self.config.key,
@@ -236,14 +236,14 @@ impl ProxyPlugin for PluginLimitReq {
         };
 
         if rejected {
-            return self.reject.reject(session, ctx).await;
+            return Ok(FilterVerdict::Reject(self.reject.rejection()));
         }
 
         let delay = delay.expect("not rejected implies a delay");
         if delay > 0.0 && !self.config.nodelay {
             tokio::time::sleep(Duration::from_secs_f64(delay)).await;
         }
-        Ok(false)
+        Ok(FilterVerdict::Continue)
     }
 }
 

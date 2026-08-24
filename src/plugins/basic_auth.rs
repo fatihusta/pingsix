@@ -12,11 +12,11 @@ use validator::Validate;
 
 use crate::{
     core::{
-        constant_time_digest_eq, secret_digest, PluginPhases, ProxyContext, ProxyError,
-        ProxyPlugin, ProxyResult,
+        constant_time_digest_eq, secret_digest, FilterVerdict, ProxyContext, ProxyError,
+        ProxyPlugin, ProxyResult, Rejection,
     },
     plugins::config::{parse_and_validate_plugin_config, validate_apisix_realm},
-    utils::{request, response::ResponseBuilder},
+    utils::{request, response::content_type},
 };
 
 pub const PLUGIN_NAME: &str = "basic-auth";
@@ -125,11 +125,11 @@ impl ProxyPlugin for PluginBasicAuth {
     fn priority(&self) -> i32 {
         PRIORITY
     }
-    fn phases(&self) -> PluginPhases {
-        PluginPhases::REQUEST
-    }
-
-    async fn request_filter(&self, session: &mut Session, ctx: &mut ProxyContext) -> Result<bool> {
+    async fn request_filter(
+        &self,
+        session: &mut Session,
+        ctx: &mut ProxyContext,
+    ) -> Result<FilterVerdict> {
         let auth_header =
             request::get_req_header_value(session.req_header(), header::AUTHORIZATION.as_str());
 
@@ -144,15 +144,12 @@ impl ProxyPlugin for PluginBasicAuth {
 
         if !is_valid {
             // Return 401 and include the standard Basic challenge header
-            let challenge = self.build_challenge();
-            ResponseBuilder::send_proxy_error(
-                session,
-                StatusCode::UNAUTHORIZED,
-                Some("Invalid user authorization"),
-                Some(&[("WWW-Authenticate", challenge.as_str())]),
-            )
-            .await?;
-            return Ok(true);
+            return Ok(FilterVerdict::Reject(
+                Rejection::new(StatusCode::UNAUTHORIZED)
+                    .with_body("Invalid user authorization")
+                    .with_content_type(content_type::TEXT_PLAIN)
+                    .with_header("WWW-Authenticate", self.build_challenge()),
+            ));
         }
 
         // Record the verified credential for shared-cache consumer
@@ -168,7 +165,7 @@ impl ProxyPlugin for PluginBasicAuth {
                 .remove_header(&header::AUTHORIZATION);
         }
 
-        Ok(false)
+        Ok(FilterVerdict::Continue)
     }
 }
 

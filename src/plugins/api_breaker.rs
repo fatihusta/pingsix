@@ -27,10 +27,10 @@ use serde_json::Value as JsonValue;
 use validator::{Validate, ValidationError};
 
 use crate::{
-    core::{PluginPhases, ProxyContext, ProxyError, ProxyPlugin, ProxyResult},
+    core::{FilterVerdict, ProxyContext, ProxyError, ProxyPlugin, ProxyResult, Rejection},
     plugins::{
         config::parse_and_validate_plugin_config,
-        limiting::{send_rejection, Shard},
+        limiting::{rejection, Shard},
     },
     utils::request::render_apisix_request_template,
 };
@@ -326,21 +326,20 @@ impl PluginApiBreaker {
         }
     }
 
-    async fn reject(&self, session: &mut Session, ctx: &ProxyContext) -> Result<bool> {
+    /// Build the breaker-open rejection (T10: a returned value; the pipeline
+    /// writes it). Header templates render against the request session.
+    fn reject(&self, session: &mut Session) -> Rejection {
         let mut headers: Vec<(String, String)> = Vec::new();
         for h in &self.config.break_response_headers {
             let value = render_apisix_request_template(session, &h.value);
             headers.push((h.key.clone(), value));
         }
-        send_rejection(
-            session,
-            ctx,
+        rejection(
             StatusCode::from_u16(self.config.break_response_code)
                 .unwrap_or(StatusCode::SERVICE_UNAVAILABLE),
             self.config.break_response_body.as_deref(),
             &headers,
         )
-        .await
     }
 }
 
@@ -353,16 +352,16 @@ impl ProxyPlugin for PluginApiBreaker {
     fn priority(&self) -> i32 {
         PRIORITY
     }
-    fn phases(&self) -> PluginPhases {
-        PluginPhases::REQUEST | PluginPhases::RESPONSE
-    }
-
-    async fn request_filter(&self, session: &mut Session, ctx: &mut ProxyContext) -> Result<bool> {
+    async fn request_filter(
+        &self,
+        session: &mut Session,
+        ctx: &mut ProxyContext,
+    ) -> Result<FilterVerdict> {
         if self.is_open(Self::state_key(session, ctx), Instant::now()) {
             log::debug!("api-breaker: circuit open, rejecting request");
-            return self.reject(session, ctx).await;
+            return Ok(FilterVerdict::Reject(self.reject(session)));
         }
-        Ok(false)
+        Ok(FilterVerdict::Continue)
     }
 
     async fn response_filter(

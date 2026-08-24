@@ -4,7 +4,7 @@ use async_trait::async_trait;
 use http::{header, uri::Scheme, StatusCode, Uri};
 use ipnetwork::IpNetwork;
 use pingora_error::Result;
-use pingora_http::{RequestHeader, ResponseHeader};
+use pingora_http::RequestHeader;
 use pingora_proxy::Session;
 use regex::Regex;
 use serde::{Deserialize, Serialize};
@@ -16,7 +16,8 @@ use crate::utils::request::{
 };
 use crate::{
     core::{
-        apply_regex_uri_template, PluginPhases, ProxyContext, ProxyError, ProxyPlugin, ProxyResult,
+        apply_regex_uri_template, FilterVerdict, ProxyContext, ProxyError, ProxyPlugin,
+        ProxyResult, Rejection,
     },
     plugins::config::parse_and_validate_plugin_config,
 };
@@ -176,20 +177,20 @@ impl ProxyPlugin for PluginRedirect {
     fn priority(&self) -> i32 {
         PRIORITY
     }
-    fn phases(&self) -> PluginPhases {
-        PluginPhases::REQUEST
-    }
-
-    async fn request_filter(&self, session: &mut Session, _ctx: &mut ProxyContext) -> Result<bool> {
+    async fn request_filter(
+        &self,
+        session: &mut Session,
+        _ctx: &mut ProxyContext,
+    ) -> Result<FilterVerdict> {
         if self.config.http_to_https && self.needs_https_redirect(session) {
             return self.redirect_https(session).await;
         }
 
         if let Some(new_uri) = self.construct_uri(session).await {
-            return self.send_redirect_response(session, new_uri).await;
+            return self.redirect_response(new_uri);
         }
 
-        Ok(false)
+        Ok(FilterVerdict::Continue)
     }
 }
 
@@ -232,7 +233,7 @@ impl PluginRedirect {
         self.trusted_proxies.iter().any(|net| net.contains(ip))
     }
 
-    async fn redirect_https(&self, session: &mut Session) -> Result<bool> {
+    async fn redirect_https(&self, session: &mut Session) -> Result<FilterVerdict> {
         let current_uri = session.req_header().uri.clone();
 
         // redirect_host is required for http_to_https (validated at config load).
@@ -261,7 +262,7 @@ impl PluginRedirect {
             .build()
             .map_err(|e| ProxyError::Internal(format!("Failed to build HTTPS URI: {e}")))?;
 
-        self.send_redirect_response(session, new_uri).await
+        self.redirect_response(new_uri)
     }
 
     async fn construct_uri(&self, session: &mut Session) -> Option<Uri> {
@@ -353,20 +354,18 @@ impl PluginRedirect {
         }
     }
 
-    async fn send_redirect_response(&self, session: &mut Session, new_uri: Uri) -> Result<bool> {
+    /// The redirect as a rejection value (the pipeline writes it through
+    /// the shared exit helper: `Location`, `text/plain`, empty body).
+    fn redirect_response(&self, new_uri: Uri) -> Result<FilterVerdict> {
         let status_code = StatusCode::from_u16(self.config.ret_code).unwrap_or(StatusCode::FOUND); // Fallback to 302 if invalid
-        let mut res_headers = ResponseHeader::build(status_code, Some(1))?;
-        res_headers.append_header(header::LOCATION, new_uri.to_string())?;
-        res_headers.append_header(header::CONTENT_TYPE, "text/plain")?;
-        res_headers.append_header(header::CONTENT_LENGTH, 0)?;
-
-        session
-            .write_response_header(Box::new(res_headers), false)
-            .await?;
-        session
-            .write_response_body(Some(bytes::Bytes::from_static(b"")), true)
-            .await?;
-        Ok(true)
+                                                                                                   // Content-Type travels as a plain header (not `content_type`) so it
+                                                                                                   // is emitted even though the redirect body is empty, matching the
+                                                                                                   // historical response shape (`text/plain`, `Content-Length: 0`).
+        Ok(FilterVerdict::Reject(
+            Rejection::new(status_code)
+                .with_header(header::LOCATION.as_str(), new_uri.to_string())
+                .with_header(header::CONTENT_TYPE.as_str(), "text/plain"),
+        ))
     }
 }
 

@@ -38,7 +38,7 @@ use serde_json::Value as JsonValue;
 
 use crate::{
     config::Upstream,
-    core::{PluginCreateFn, ProxyError, ProxyPlugin, ProxyResult},
+    core::{PluginCreateFn, PluginEntry, PluginPhases, ProxyError, ProxyPlugin, ProxyResult},
     proxy::upstream::{PreparedUpstreams, ProxyUpstream, TrafficSplitOwner, UpstreamOccurrence},
 };
 
@@ -88,6 +88,10 @@ pub(crate) enum PluginFactory {
 /// graph, and secret-handling choices visible in one entry.
 pub(crate) struct PluginMeta {
     pub name: &'static str,
+    /// Lifecycle phases the executor must partition this plugin into (T10: the
+    /// single declaration of a builtin's hooks; `ProxyPlugin::phases()` no
+    /// longer exists).
+    pub phases: PluginPhases,
     pub factory: PluginFactory,
     pub secrets_transform: Option<crate::utils::encryption::PluginSecretsTransform>,
     /// Deterministic structural validation (Admin pre-check, no graph context).
@@ -103,6 +107,7 @@ pub(crate) struct PluginMeta {
 static PLUGIN_META: &[PluginMeta] = &[
     PluginMeta {
         name: client_control::PLUGIN_NAME,
+        phases: PluginPhases::REQUEST.union(PluginPhases::REQUEST_BODY),
         factory: PluginFactory::Plain(client_control::create_client_control_plugin),
         secrets_transform: None,
         validate: None,
@@ -111,6 +116,7 @@ static PLUGIN_META: &[PluginMeta] = &[
     },
     PluginMeta {
         name: exit_transformer::PLUGIN_NAME,
+        phases: PluginPhases::empty(),
         factory: PluginFactory::Plain(exit_transformer::create_exit_transformer_plugin),
         secrets_transform: None,
         validate: None,
@@ -119,6 +125,7 @@ static PLUGIN_META: &[PluginMeta] = &[
     },
     PluginMeta {
         name: request_id::PLUGIN_NAME,
+        phases: PluginPhases::REQUEST.union(PluginPhases::RESPONSE),
         factory: PluginFactory::Plain(request_id::create_request_id_plugin),
         secrets_transform: None,
         validate: None,
@@ -127,6 +134,7 @@ static PLUGIN_META: &[PluginMeta] = &[
     },
     PluginMeta {
         name: fault_injection::PLUGIN_NAME,
+        phases: PluginPhases::REQUEST,
         factory: PluginFactory::Plain(fault_injection::create_fault_injection_plugin),
         secrets_transform: None,
         validate: None,
@@ -135,6 +143,7 @@ static PLUGIN_META: &[PluginMeta] = &[
     },
     PluginMeta {
         name: cors::PLUGIN_NAME,
+        phases: PluginPhases::REQUEST.union(PluginPhases::RESPONSE),
         factory: PluginFactory::Plain(cors::create_cors_plugin),
         secrets_transform: None,
         validate: None,
@@ -143,6 +152,7 @@ static PLUGIN_META: &[PluginMeta] = &[
     },
     PluginMeta {
         name: ip_restriction::PLUGIN_NAME,
+        phases: PluginPhases::REQUEST,
         factory: PluginFactory::Plain(ip_restriction::create_ip_restriction_plugin),
         secrets_transform: None,
         validate: None,
@@ -151,6 +161,7 @@ static PLUGIN_META: &[PluginMeta] = &[
     },
     PluginMeta {
         name: uri_blocker::PLUGIN_NAME,
+        phases: PluginPhases::REQUEST,
         factory: PluginFactory::Plain(uri_blocker::create_uri_blocker_plugin),
         secrets_transform: None,
         validate: None,
@@ -159,6 +170,10 @@ static PLUGIN_META: &[PluginMeta] = &[
     },
     PluginMeta {
         name: ai_proxy::PLUGIN_NAME,
+        phases: PluginPhases::REQUEST
+            .union(PluginPhases::UPSTREAM_REQUEST)
+            .union(PluginPhases::REQUEST_BODY)
+            .union(PluginPhases::UPSTREAM_PEER),
         factory: PluginFactory::WithUpstreams(ai_proxy::create_ai_proxy_plugin_with_context),
         secrets_transform: Some(ai_proxy::SECRETS_TRANSFORM),
         validate: Some(ai_proxy::validate_ai_proxy_config),
@@ -167,6 +182,7 @@ static PLUGIN_META: &[PluginMeta] = &[
     },
     PluginMeta {
         name: request_validation::PLUGIN_NAME,
+        phases: PluginPhases::REQUEST.union(PluginPhases::REQUEST_BODY),
         factory: PluginFactory::Plain(request_validation::create_request_validation_plugin),
         secrets_transform: None,
         validate: None,
@@ -175,6 +191,7 @@ static PLUGIN_META: &[PluginMeta] = &[
     },
     PluginMeta {
         name: csrf::PLUGIN_NAME,
+        phases: PluginPhases::REQUEST.union(PluginPhases::RESPONSE),
         factory: PluginFactory::Plain(csrf::create_csrf_plugin),
         secrets_transform: Some(csrf::SECRETS_TRANSFORM),
         validate: None,
@@ -183,6 +200,7 @@ static PLUGIN_META: &[PluginMeta] = &[
     },
     PluginMeta {
         name: basic_auth::PLUGIN_NAME,
+        phases: PluginPhases::REQUEST,
         factory: PluginFactory::Plain(basic_auth::create_basic_auth_plugin),
         secrets_transform: Some(basic_auth::SECRETS_TRANSFORM),
         validate: None,
@@ -191,6 +209,7 @@ static PLUGIN_META: &[PluginMeta] = &[
     },
     PluginMeta {
         name: jwt_auth::PLUGIN_NAME,
+        phases: PluginPhases::REQUEST.union(PluginPhases::RESPONSE),
         factory: PluginFactory::Plain(jwt_auth::create_jwt_auth_plugin),
         secrets_transform: Some(jwt_auth::SECRETS_TRANSFORM),
         validate: None,
@@ -199,6 +218,7 @@ static PLUGIN_META: &[PluginMeta] = &[
     },
     PluginMeta {
         name: key_auth::PLUGIN_NAME,
+        phases: PluginPhases::REQUEST,
         factory: PluginFactory::Plain(key_auth::create_key_auth_plugin),
         secrets_transform: Some(key_auth::SECRETS_TRANSFORM),
         validate: None,
@@ -207,6 +227,7 @@ static PLUGIN_META: &[PluginMeta] = &[
     },
     PluginMeta {
         name: cache::PLUGIN_NAME,
+        phases: PluginPhases::REQUEST,
         factory: PluginFactory::Plain(cache::create_cache_plugin),
         secrets_transform: None,
         validate: None,
@@ -215,6 +236,7 @@ static PLUGIN_META: &[PluginMeta] = &[
     },
     PluginMeta {
         name: proxy_rewrite::PLUGIN_NAME,
+        phases: PluginPhases::UPSTREAM_REQUEST,
         factory: PluginFactory::Plain(proxy_rewrite::create_proxy_rewrite_plugin),
         secrets_transform: None,
         validate: None,
@@ -223,6 +245,7 @@ static PLUGIN_META: &[PluginMeta] = &[
     },
     PluginMeta {
         name: api_breaker::PLUGIN_NAME,
+        phases: PluginPhases::REQUEST.union(PluginPhases::RESPONSE),
         factory: PluginFactory::Plain(api_breaker::create_api_breaker_plugin),
         secrets_transform: None,
         validate: None,
@@ -231,6 +254,9 @@ static PLUGIN_META: &[PluginMeta] = &[
     },
     PluginMeta {
         name: proxy_mirror::PLUGIN_NAME,
+        phases: PluginPhases::REQUEST
+            .union(PluginPhases::UPSTREAM_REQUEST)
+            .union(PluginPhases::REQUEST_BODY),
         factory: PluginFactory::Plain(proxy_mirror::create_proxy_mirror_plugin),
         secrets_transform: None,
         validate: None,
@@ -239,6 +265,7 @@ static PLUGIN_META: &[PluginMeta] = &[
     },
     PluginMeta {
         name: limit_conn::PLUGIN_NAME,
+        phases: PluginPhases::REQUEST.union(PluginPhases::LOGGING),
         factory: PluginFactory::Plain(limit_conn::create_limit_conn_plugin),
         secrets_transform: None,
         validate: None,
@@ -247,6 +274,7 @@ static PLUGIN_META: &[PluginMeta] = &[
     },
     PluginMeta {
         name: limit_count::PLUGIN_NAME,
+        phases: PluginPhases::REQUEST.union(PluginPhases::RESPONSE),
         factory: PluginFactory::Plain(limit_count::create_limit_count_plugin),
         secrets_transform: None,
         validate: None,
@@ -255,6 +283,7 @@ static PLUGIN_META: &[PluginMeta] = &[
     },
     PluginMeta {
         name: limit_req::PLUGIN_NAME,
+        phases: PluginPhases::REQUEST,
         factory: PluginFactory::Plain(limit_req::create_limit_req_plugin),
         secrets_transform: None,
         validate: None,
@@ -263,6 +292,7 @@ static PLUGIN_META: &[PluginMeta] = &[
     },
     PluginMeta {
         name: brotli::PLUGIN_NAME,
+        phases: PluginPhases::EARLY_REQUEST,
         factory: PluginFactory::Plain(brotli::create_brotli_plugin),
         secrets_transform: None,
         validate: None,
@@ -271,6 +301,7 @@ static PLUGIN_META: &[PluginMeta] = &[
     },
     PluginMeta {
         name: gzip::PLUGIN_NAME,
+        phases: PluginPhases::EARLY_REQUEST,
         factory: PluginFactory::Plain(gzip::create_gzip_plugin),
         secrets_transform: None,
         validate: None,
@@ -279,6 +310,7 @@ static PLUGIN_META: &[PluginMeta] = &[
     },
     PluginMeta {
         name: redirect::PLUGIN_NAME,
+        phases: PluginPhases::REQUEST,
         factory: PluginFactory::Plain(redirect::create_redirect_plugin),
         secrets_transform: None,
         validate: None,
@@ -287,6 +319,7 @@ static PLUGIN_META: &[PluginMeta] = &[
     },
     PluginMeta {
         name: response_rewrite::PLUGIN_NAME,
+        phases: PluginPhases::RESPONSE.union(PluginPhases::RESPONSE_BODY),
         factory: PluginFactory::Plain(response_rewrite::create_response_rewrite_plugin),
         secrets_transform: None,
         validate: None,
@@ -295,6 +328,10 @@ static PLUGIN_META: &[PluginMeta] = &[
     },
     PluginMeta {
         name: grpc_web::PLUGIN_NAME,
+        phases: PluginPhases::EARLY_REQUEST
+            .union(PluginPhases::REQUEST)
+            .union(PluginPhases::REQUEST_BODY)
+            .union(PluginPhases::RESPONSE),
         factory: PluginFactory::Plain(grpc_web::create_grpc_web_plugin),
         secrets_transform: None,
         validate: None,
@@ -303,6 +340,7 @@ static PLUGIN_META: &[PluginMeta] = &[
     },
     PluginMeta {
         name: prometheus::PLUGIN_NAME,
+        phases: PluginPhases::LOGGING,
         factory: PluginFactory::Plain(prometheus::create_prometheus_plugin),
         secrets_transform: None,
         validate: None,
@@ -311,6 +349,7 @@ static PLUGIN_META: &[PluginMeta] = &[
     },
     PluginMeta {
         name: echo::PLUGIN_NAME,
+        phases: PluginPhases::RESPONSE.union(PluginPhases::RESPONSE_BODY),
         factory: PluginFactory::Plain(echo::create_echo_plugin),
         secrets_transform: None,
         validate: None,
@@ -319,6 +358,9 @@ static PLUGIN_META: &[PluginMeta] = &[
     },
     PluginMeta {
         name: file_logger::PLUGIN_NAME,
+        phases: PluginPhases::LOGGING
+            .union(PluginPhases::REQUEST_BODY)
+            .union(PluginPhases::RESPONSE_BODY),
         factory: PluginFactory::Plain(file_logger::create_file_logger_plugin),
         secrets_transform: None,
         validate: None,
@@ -327,6 +369,7 @@ static PLUGIN_META: &[PluginMeta] = &[
     },
     PluginMeta {
         name: traffic_split::PLUGIN_NAME,
+        phases: PluginPhases::REQUEST,
         factory: PluginFactory::WithUpstreams(
             traffic_split::create_traffic_split_plugin_with_context,
         ),
@@ -394,17 +437,20 @@ pub(crate) fn plugin_upstream_jobs(
     Ok(jobs)
 }
 
-/// Creates plugin instances from configuration using a factory pattern.
+/// Creates a plugin entry (instance + declared phases) from configuration
+/// using a factory pattern.
 ///
 /// Looks up the plugin builder function in the global registry and invokes it
-/// with the provided configuration. Fails fast for unknown plugin types.
+/// with the provided configuration, pairing the instance with the phases its
+/// `PLUGIN_META` entry declares — construction is the single place phases are
+/// attached (T10). Fails fast for unknown plugin types.
 ///
 /// # Arguments
 /// - `name`: Plugin identifier (must match registry keys)
 /// - `cfg`: Plugin configuration as JSON
 ///
 /// # Returns
-/// Arc-wrapped plugin instance for thread-safe sharing across requests
+/// A [`PluginEntry`] for executor construction, shareable across requests.
 ///
 /// # Errors
 /// Returns `ReadError` for unknown plugin names or configuration parsing failures
@@ -416,11 +462,11 @@ pub(crate) fn build_plugin_with_upstreams(
     owner: &TrafficSplitOwner,
     defaults: &crate::config::EffectiveDefaults,
     resolver: &Arc<hickory_resolver::TokioResolver>,
-) -> ProxyResult<Arc<dyn ProxyPlugin>> {
+) -> ProxyResult<PluginEntry> {
     let meta = plugin_meta(name)
         .ok_or_else(|| ProxyError::Plugin(format!("Unknown plugin type: {name}")))?;
-    match meta.factory {
-        PluginFactory::Plain(factory) => factory(cfg, defaults),
+    let plugin = match meta.factory {
+        PluginFactory::Plain(factory) => factory(cfg, defaults)?,
         PluginFactory::WithUpstreams(factory) => {
             let context = PluginBuildContext {
                 upstreams,
@@ -429,9 +475,10 @@ pub(crate) fn build_plugin_with_upstreams(
                 defaults,
                 resolver,
             };
-            factory(cfg, &context)
+            factory(cfg, &context)?
         }
-    }
+    };
+    Ok(PluginEntry::new(plugin, meta.phases))
 }
 
 /// Transform a plugin config's declared secret fields, if any.
@@ -470,76 +517,73 @@ pub fn build_plugin_by_name(name: &str, cfg: JsonValue) -> ProxyResult<Arc<dyn P
     build_plugin(name, cfg, &crate::config::EffectiveDefaults::default())
 }
 
+/// Public plugin-entry construction by name: the instance paired with the
+/// phases its `PLUGIN_META` entry declares, ready for
+/// [`crate::core::ProxyPluginExecutor`] construction (embedders and
+/// integration tests).
+pub fn build_plugin_entry_by_name(name: &str, cfg: JsonValue) -> ProxyResult<PluginEntry> {
+    build_plugin_entry(name, cfg, &crate::config::EffectiveDefaults::default())
+}
+
+/// Plugin-entry construction for plain (upstream-free) builtins.
+pub(crate) fn build_plugin_entry(
+    name: &str,
+    cfg: JsonValue,
+    defaults: &crate::config::EffectiveDefaults,
+) -> ProxyResult<PluginEntry> {
+    let meta = plugin_meta(name)
+        .ok_or_else(|| ProxyError::Plugin(format!("Unknown plugin type: {name}")))?;
+    Ok(PluginEntry::new(
+        build_plugin(name, cfg, defaults)?,
+        meta.phases,
+    ))
+}
+
 #[cfg(test)]
 mod builtin_phases_tests {
-    use super::*;
+    use std::collections::HashSet;
+
     use serde_json::json;
 
-    use crate::core::PluginPhases;
+    use super::*;
+    use crate::core::{PluginEntry, ProxyPluginExecutor};
     use crate::proxy::upstream::discovery::build_resolver_for_state;
 
-    fn expected_phases() -> HashMap<&'static str, PluginPhases> {
-        let request = PluginPhases::REQUEST;
-        let early = PluginPhases::EARLY_REQUEST;
-        let logging = PluginPhases::LOGGING;
-        HashMap::from([
-            (
-                client_control::PLUGIN_NAME,
-                request | PluginPhases::REQUEST_BODY,
-            ),
-            (exit_transformer::PLUGIN_NAME, PluginPhases::empty()),
-            (request_id::PLUGIN_NAME, request | PluginPhases::RESPONSE),
-            (fault_injection::PLUGIN_NAME, request),
-            (cors::PLUGIN_NAME, request | PluginPhases::RESPONSE),
-            (ip_restriction::PLUGIN_NAME, request),
-            (uri_blocker::PLUGIN_NAME, request),
-            (
-                ai_proxy::PLUGIN_NAME,
-                request
-                    | PluginPhases::UPSTREAM_REQUEST
-                    | PluginPhases::REQUEST_BODY
-                    | PluginPhases::UPSTREAM_PEER,
-            ),
-            (
-                request_validation::PLUGIN_NAME,
-                request | PluginPhases::REQUEST_BODY,
-            ),
-            (csrf::PLUGIN_NAME, request | PluginPhases::RESPONSE),
-            (basic_auth::PLUGIN_NAME, request),
-            (jwt_auth::PLUGIN_NAME, request | PluginPhases::RESPONSE),
-            (key_auth::PLUGIN_NAME, request),
-            (cache::PLUGIN_NAME, request),
-            (proxy_rewrite::PLUGIN_NAME, PluginPhases::UPSTREAM_REQUEST),
-            (
-                proxy_mirror::PLUGIN_NAME,
-                request | PluginPhases::UPSTREAM_REQUEST | PluginPhases::REQUEST_BODY,
-            ),
-            (api_breaker::PLUGIN_NAME, request | PluginPhases::RESPONSE),
-            (limit_conn::PLUGIN_NAME, request | logging),
-            (limit_count::PLUGIN_NAME, request | PluginPhases::RESPONSE),
-            (limit_req::PLUGIN_NAME, request),
-            (gzip::PLUGIN_NAME, early),
-            (brotli::PLUGIN_NAME, early),
-            (redirect::PLUGIN_NAME, request),
-            (
-                echo::PLUGIN_NAME,
-                PluginPhases::RESPONSE | PluginPhases::RESPONSE_BODY,
-            ),
-            (
-                response_rewrite::PLUGIN_NAME,
-                PluginPhases::RESPONSE | PluginPhases::RESPONSE_BODY,
-            ),
-            (
-                grpc_web::PLUGIN_NAME,
-                early | PluginPhases::REQUEST | PluginPhases::REQUEST_BODY | PluginPhases::RESPONSE,
-            ),
-            (prometheus::PLUGIN_NAME, logging),
-            (
-                file_logger::PLUGIN_NAME,
-                logging | PluginPhases::REQUEST_BODY | PluginPhases::RESPONSE_BODY,
-            ),
-            (traffic_split::PLUGIN_NAME, request),
-        ])
+    /// All builtin plugin names; anchors the inventory-completion assertion.
+    fn builtin_names() -> HashSet<&'static str> {
+        [
+            client_control::PLUGIN_NAME,
+            exit_transformer::PLUGIN_NAME,
+            request_id::PLUGIN_NAME,
+            fault_injection::PLUGIN_NAME,
+            cors::PLUGIN_NAME,
+            ip_restriction::PLUGIN_NAME,
+            uri_blocker::PLUGIN_NAME,
+            ai_proxy::PLUGIN_NAME,
+            request_validation::PLUGIN_NAME,
+            csrf::PLUGIN_NAME,
+            basic_auth::PLUGIN_NAME,
+            jwt_auth::PLUGIN_NAME,
+            key_auth::PLUGIN_NAME,
+            cache::PLUGIN_NAME,
+            proxy_rewrite::PLUGIN_NAME,
+            api_breaker::PLUGIN_NAME,
+            proxy_mirror::PLUGIN_NAME,
+            limit_conn::PLUGIN_NAME,
+            limit_count::PLUGIN_NAME,
+            limit_req::PLUGIN_NAME,
+            brotli::PLUGIN_NAME,
+            gzip::PLUGIN_NAME,
+            redirect::PLUGIN_NAME,
+            response_rewrite::PLUGIN_NAME,
+            grpc_web::PLUGIN_NAME,
+            prometheus::PLUGIN_NAME,
+            echo::PLUGIN_NAME,
+            file_logger::PLUGIN_NAME,
+            traffic_split::PLUGIN_NAME,
+        ]
+        .into_iter()
+        .collect()
     }
 
     fn minimal_config(name: &str) -> JsonValue {
@@ -576,7 +620,7 @@ mod builtin_phases_tests {
 
     #[test]
     fn plugin_meta_inventory_is_complete_and_unique() {
-        let expected_names: std::collections::HashSet<_> = expected_phases().into_keys().collect();
+        let expected_names = builtin_names();
         let inventory_names: std::collections::HashSet<_> =
             PLUGIN_META.iter().map(|meta| meta.name).collect();
         assert_eq!(
@@ -622,50 +666,67 @@ mod builtin_phases_tests {
             .is_none());
     }
 
+    /// The wiring is tested, not a second copy of the data: each builtin is
+    /// built through the same construction path the proxy uses, and the
+    /// resulting executor partition must match the plugin's `PLUGIN_META`
+    /// phases — that is the whole point of construction-time derivation.
     #[test]
-    fn builtin_plugin_phases_match_table() {
+    fn builtin_executor_partition_matches_meta_phases() {
         let defaults = crate::config::EffectiveDefaults::default();
-        let expected = expected_phases();
 
         for meta in PLUGIN_META {
-            assert!(
-                expected.contains_key(meta.name),
-                "builtin phase table is missing {}",
-                meta.name
-            );
-        }
-
-        for (name, phases) in &expected {
-            if *name == traffic_split::PLUGIN_NAME || *name == ai_proxy::PLUGIN_NAME {
+            if matches!(meta.factory, PluginFactory::WithUpstreams(_)) {
+                // traffic-split / ai-proxy need upstream build context; their
+                // pairing is pinned below in their own assertions.
                 continue;
             }
-            let plugin = build_plugin(name, minimal_config(name), &defaults)
-                .unwrap_or_else(|err| panic!("build {name}: {err}"));
-            assert_eq!(plugin.phases(), *phases, "phases mismatch for {name}");
+            let entry = build_plugin_entry(meta.name, minimal_config(meta.name), &defaults)
+                .unwrap_or_else(|err| panic!("build {}: {err}", meta.name));
+            assert_eq!(
+                entry.phases, meta.phases,
+                "construction pairs {} with its PLUGIN_META phases",
+                meta.name
+            );
+            assert_partition_matches_phases(&entry, meta.phases, meta.name);
         }
 
         let split = traffic_split::create_traffic_split_plugin_with_upstreams(
             json!({"rules":[{"weighted_upstreams":[{"weight": 1}]}]}),
             &HashMap::new(),
             &HashMap::new(),
-            TrafficSplitOwner::Route("phase-table".into()),
+            TrafficSplitOwner::Route("phase-wiring".into()),
             &defaults,
             &build_resolver_for_state().expect("resolver"),
         )
         .expect("traffic-split");
-        assert_eq!(
-            split.phases(),
-            expected[traffic_split::PLUGIN_NAME],
-            "phases mismatch for traffic-split"
-        );
+        let phases = plugin_meta(traffic_split::PLUGIN_NAME).unwrap().phases;
+        assert_partition_matches_phases(&PluginEntry::new(split, phases), phases, "traffic-split");
 
-        // ai-proxy is also WithUpstreams: build through its sync embedder
-        // constructor (IP-literal endpoint, no DNS needed).
         let ai = ai_proxy::build_ai_proxy_plugin(minimal_config("ai-proxy")).expect("ai-proxy");
-        assert_eq!(
-            ai.phases(),
-            expected[ai_proxy::PLUGIN_NAME],
-            "phases mismatch for ai-proxy"
-        );
+        let phases = plugin_meta(ai_proxy::PLUGIN_NAME).unwrap().phases;
+        assert_partition_matches_phases(&PluginEntry::new(ai, phases), phases, "ai-proxy");
+    }
+
+    /// An executor built from `entry` must partition the plugin into exactly
+    /// the declared phases and no others.
+    fn assert_partition_matches_phases(entry: &PluginEntry, phases: PluginPhases, name: &str) {
+        const ALL: &[PluginPhases] = &[
+            PluginPhases::EARLY_REQUEST,
+            PluginPhases::REQUEST,
+            PluginPhases::UPSTREAM_REQUEST,
+            PluginPhases::REQUEST_BODY,
+            PluginPhases::RESPONSE,
+            PluginPhases::RESPONSE_BODY,
+            PluginPhases::LOGGING,
+            PluginPhases::UPSTREAM_PEER,
+        ];
+        let executor = ProxyPluginExecutor::new(vec![entry.clone()]);
+        for phase in ALL {
+            assert_eq!(
+                executor.has_plugin_in_phase(name, *phase),
+                phases.contains(*phase),
+                "{name}: executor partition membership must equal PLUGIN_META phases"
+            );
+        }
     }
 }

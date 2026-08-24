@@ -177,6 +177,29 @@ pub fn noop_session() -> Session {
     Session::new_h1(Box::new(MockStream::new()) as Box<dyn IO>)
 }
 
+/// Run one plugin's `request_filter` the way the compiled pipeline does (T10):
+/// a returned `FilterVerdict::Reject` is written through the shared
+/// exit-response helper exactly once (exit-transformer rules on
+/// `ctx.pipeline` apply), then the request reports short-circuited.
+///
+/// Single-plugin wire-format tests use this instead of calling
+/// `request_filter` directly: plugins return rejection values and never write
+/// to the session themselves (multi-plugin composition is exercised through
+/// `crate::core::CompiledPluginPipeline` instead).
+pub async fn run_request_filter(
+    plugin: &dyn crate::core::ProxyPlugin,
+    session: &mut Session,
+    ctx: &mut crate::core::ProxyContext,
+) -> pingora_error::Result<bool> {
+    match plugin.request_filter(session, ctx).await? {
+        crate::core::FilterVerdict::Continue => Ok(false),
+        crate::core::FilterVerdict::Reject(rejection) => {
+            crate::utils::response::send_rejection(session, &rejection, ctx).await?;
+            Ok(true)
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

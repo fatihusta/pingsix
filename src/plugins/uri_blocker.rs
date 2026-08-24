@@ -13,6 +13,7 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use http::StatusCode;
 use pingora_error::Result;
 use pingora_proxy::Session;
 use regex::Regex;
@@ -21,9 +22,9 @@ use serde_json::Value as JsonValue;
 use validator::Validate;
 
 use crate::{
-    core::{PluginPhases, ProxyContext, ProxyError, ProxyPlugin, ProxyResult},
+    core::{FilterVerdict, ProxyContext, ProxyError, ProxyPlugin, ProxyResult, Rejection},
     plugins::config::parse_and_validate_plugin_config,
-    utils::response::{content_type, send_exit_response},
+    utils::response::content_type,
 };
 
 pub const PLUGIN_NAME: &str = "uri-blocker";
@@ -150,11 +151,11 @@ impl ProxyPlugin for PluginUriBlocker {
         PRIORITY
     }
 
-    fn phases(&self) -> PluginPhases {
-        PluginPhases::REQUEST
-    }
-
-    async fn request_filter(&self, session: &mut Session, ctx: &mut ProxyContext) -> Result<bool> {
+    async fn request_filter(
+        &self,
+        session: &mut Session,
+        _ctx: &mut ProxyContext,
+    ) -> Result<FilterVerdict> {
         let uri = request_uri(session);
         if self.matched_matcher().is_match(&uri) {
             log::debug!("uri-blocker: blocked request URI '{uri}'");
@@ -162,19 +163,18 @@ impl ProxyPlugin for PluginUriBlocker {
                 serde_json::to_string(&serde_json::json!({ "error_msg": msg }))
                     .expect("error_msg serializes")
             });
-            send_exit_response(
-                session,
-                self.config.rejected_code,
-                body.as_deref(),
-                body.as_ref().map(|_| content_type::APPLICATION_JSON),
-                &[],
-                ctx,
-            )
-            .await?;
-            return Ok(true);
+            let mut rejection = Rejection::new(
+                StatusCode::from_u16(self.config.rejected_code).unwrap_or(StatusCode::FORBIDDEN),
+            );
+            if let Some(body) = body {
+                rejection = rejection
+                    .with_body(body)
+                    .with_content_type(content_type::APPLICATION_JSON);
+            }
+            return Ok(FilterVerdict::Reject(rejection));
         }
 
-        Ok(false)
+        Ok(FilterVerdict::Continue)
     }
 }
 

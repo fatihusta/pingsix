@@ -30,13 +30,13 @@ use serde_json::Value as JsonValue;
 use validator::{Validate, ValidationError};
 
 use crate::{
-    core::{PluginPhases, ProxyContext, ProxyError, ProxyPlugin, ProxyResult},
+    core::{FilterVerdict, ProxyContext, ProxyError, ProxyPlugin, ProxyResult},
     plugins::{
         config::parse_and_validate_plugin_config,
         limiting::{
-            default_rejected_code, next_instance_ctx_key, select_rules, send_rejection,
-            validate_key, validate_rejected_msg, BoundedShardMap, KeyType, Policy, RejectPolicy,
-            SweepMiss, LIMIT_CONN_OVERFLOW,
+            default_rejected_code, next_instance_ctx_key, rejection, select_rules, validate_key,
+            validate_rejected_msg, BoundedShardMap, KeyType, Policy, RejectPolicy, SweepMiss,
+            LIMIT_CONN_OVERFLOW,
         },
     },
     utils::request::apisix_key,
@@ -384,25 +384,22 @@ impl ProxyPlugin for PluginLimitConn {
     fn priority(&self) -> i32 {
         PRIORITY
     }
-    fn phases(&self) -> PluginPhases {
-        PluginPhases::REQUEST | PluginPhases::LOGGING
-    }
-
-    async fn request_filter(&self, session: &mut Session, ctx: &mut ProxyContext) -> Result<bool> {
+    async fn request_filter(
+        &self,
+        session: &mut Session,
+        ctx: &mut ProxyContext,
+    ) -> Result<FilterVerdict> {
         let Some(limits) = self.select_limits(session) else {
             // APISIX returns 500 when a rules-branch config matches no rule,
             // unless allow_degradation explicitly permits the request.
             if self.config.allow_degradation {
-                return Ok(false);
+                return Ok(FilterVerdict::Continue);
             }
-            return send_rejection(
-                session,
-                ctx,
+            return Ok(FilterVerdict::Reject(rejection(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Some("failed to get limit conn rules"),
                 &[],
-            )
-            .await;
+            )));
         };
 
         let mut guards = Vec::with_capacity(limits.len());
@@ -436,13 +433,13 @@ impl ProxyPlugin for PluginLimitConn {
                         limit.conn,
                         limit.burst
                     );
-                    return self.reject.reject(session, ctx).await;
+                    return Ok(FilterVerdict::Reject(self.reject.rejection()));
                 }
             }
         }
 
         ctx.set(self.guard_key.clone(), guards);
-        Ok(false)
+        Ok(FilterVerdict::Continue)
     }
 
     async fn logging(
@@ -801,19 +798,25 @@ mod tests {
         // First in-flight request occupies the single slot.
         let (mut first_session, _first_server) = session_with_raw_request(request).await;
         let mut first_ctx = ProxyContext::default();
-        assert!(!plugin
-            .request_filter(&mut first_session, &mut first_ctx)
-            .await
-            .unwrap());
+        assert!(!crate::utils::testing::run_request_filter(
+            &plugin,
+            &mut first_session,
+            &mut first_ctx
+        )
+        .await
+        .unwrap());
 
         // A concurrent request exceeds conn + burst and is rejected with the
         // configured status code.
         let (mut second_session, mut second_server) = session_with_raw_request(request).await;
         let mut second_ctx = ProxyContext::default();
-        assert!(plugin
-            .request_filter(&mut second_session, &mut second_ctx)
-            .await
-            .unwrap());
+        assert!(crate::utils::testing::run_request_filter(
+            &plugin,
+            &mut second_session,
+            &mut second_ctx
+        )
+        .await
+        .unwrap());
         drop(second_session);
         let response = drain_response(&mut second_server).await;
         assert!(
@@ -828,10 +831,13 @@ mod tests {
             .await;
         let (mut third_session, _third_server) = session_with_raw_request(request).await;
         let mut third_ctx = ProxyContext::default();
-        assert!(!plugin
-            .request_filter(&mut third_session, &mut third_ctx)
-            .await
-            .unwrap());
+        assert!(!crate::utils::testing::run_request_filter(
+            &plugin,
+            &mut third_session,
+            &mut third_ctx
+        )
+        .await
+        .unwrap());
     }
 
     #[tokio::test]

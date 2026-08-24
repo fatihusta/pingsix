@@ -15,7 +15,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
 
 use crate::{
-    core::{PluginPhases, ProxyContext, ProxyError, ProxyPlugin, ProxyResult},
+    core::{ProxyContext, ProxyError, ProxyPlugin, ProxyResult},
     plugins::config::HeaderValue,
     plugins::response_rewrite::{
         clear_body_modified_headers, is_informational_response, is_upgraded_session,
@@ -201,10 +201,6 @@ impl ProxyPlugin for PluginEcho {
 
     fn priority(&self) -> i32 {
         PRIORITY
-    }
-
-    fn phases(&self) -> PluginPhases {
-        PluginPhases::RESPONSE | PluginPhases::RESPONSE_BODY
     }
 
     async fn response_filter(

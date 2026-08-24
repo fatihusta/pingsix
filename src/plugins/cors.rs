@@ -11,7 +11,7 @@ use serde_json::Value as JsonValue;
 use validator::{Validate, ValidationError};
 
 use crate::{
-    core::{PluginPhases, ProxyContext, ProxyError, ProxyPlugin, ProxyResult},
+    core::{FilterVerdict, ProxyContext, ProxyError, ProxyPlugin, ProxyResult, Rejection},
     plugins::config::parse_and_validate_plugin_config,
     utils::request,
 };
@@ -495,18 +495,21 @@ impl ProxyPlugin for PluginCors {
     fn priority(&self) -> i32 {
         PRIORITY
     }
-    fn phases(&self) -> PluginPhases {
-        PluginPhases::REQUEST | PluginPhases::RESPONSE
-    }
-
-    async fn request_filter(&self, session: &mut Session, _ctx: &mut ProxyContext) -> Result<bool> {
+    async fn request_filter(
+        &self,
+        session: &mut Session,
+        _ctx: &mut ProxyContext,
+    ) -> Result<FilterVerdict> {
         if session.req_header().method == Method::OPTIONS {
             if let Some(resp) = self.handle_options_request(session)? {
-                session.write_response_header(Box::new(resp), true).await?;
-                return Ok(true);
+                // The preflight answer is bodyless; `headers` carry the full
+                // CORS header set built by the shared helpers.
+                return Ok(FilterVerdict::Reject(Rejection::from_response_header(
+                    &resp,
+                )));
             }
         }
-        Ok(false)
+        Ok(FilterVerdict::Continue)
     }
 
     async fn response_filter(

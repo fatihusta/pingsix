@@ -15,7 +15,7 @@ use uuid::Uuid;
 use validator::{Validate, ValidationError};
 
 use crate::{
-    core::{PluginPhases, ProxyContext, ProxyError, ProxyPlugin, ProxyResult},
+    core::{FilterVerdict, ProxyContext, ProxyError, ProxyPlugin, ProxyResult},
     plugins::config::parse_and_validate_plugin_config,
     utils::request,
 };
@@ -267,11 +267,11 @@ impl ProxyPlugin for PluginRequestID {
         PRIORITY
     }
 
-    fn phases(&self) -> PluginPhases {
-        PluginPhases::REQUEST | PluginPhases::RESPONSE
-    }
-
-    async fn request_filter(&self, session: &mut Session, ctx: &mut ProxyContext) -> Result<bool> {
+    async fn request_filter(
+        &self,
+        session: &mut Session,
+        ctx: &mut ProxyContext,
+    ) -> Result<FilterVerdict> {
         // Retrieve request ID from header, or generate a new one
         let value =
             match request::get_req_header_value(session.req_header(), &self.config.header_name) {
@@ -290,7 +290,7 @@ impl ProxyPlugin for PluginRequestID {
 
         ctx.set_request_id(value);
 
-        Ok(false)
+        Ok(FilterVerdict::Continue)
     }
 
     async fn response_filter(

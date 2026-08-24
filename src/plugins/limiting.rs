@@ -14,10 +14,11 @@
 //!   uses [`Shard`] directly for its simpler fixed-capacity LRU.
 //! - [`resolve_rule_key`] / [`select_rules`]: APISIX `rules`-branch key
 //!   resolution shared by `limit-conn` and `limit-count`.
-//! - [`RejectPolicy`] / [`send_rejection`]: the ONE writer for every limiter
-//!   rejection. Pre-T10 it writes through `send_exit_response` and the plugin
-//!   returns `true` (the current short-circuit contract); T10 flips this
-//!   single function to construct a returned `Rejection` value instead.
+//! - [`RejectPolicy`] / [`rejection`]: the ONE constructor for every limiter
+//!   rejection. Post-T10 it constructs the returned [`Rejection`] value and
+//!   the plugin returns it via `FilterVerdict::Reject`; the pipeline writes
+//!   it through `send_exit_response` (so an `exit-transformer` rule sees
+//!   limiter rejections exactly like every other gateway exit).
 //! - [`instance_ctx_key`]: per-instance context keys so a global and a route
 //!   instance of the same limiter never share state slots.
 
@@ -31,20 +32,16 @@ use std::{
 };
 
 use http::StatusCode;
-use pingora_error::Result;
 use pingora_proxy::Session;
 use serde::{Deserialize, Serialize};
 use validator::ValidationError;
 
 use crate::{
-    core::{ProxyContext, ProxyError, ProxyResult},
+    core::{ProxyError, ProxyResult, Rejection},
     plugins::limiter_shards::{
         shard_idx, TouchOrder, CLEANUP_BUDGET, LIMIT_SHARDS, PER_SHARD_REGULAR_MAX,
     },
-    utils::{
-        request::render_apisix_request_template,
-        response::{content_type, send_exit_response},
-    },
+    utils::{request::render_apisix_request_template, response::content_type},
 };
 
 /// Stable overflow bucket for the `limit-req` plugin's shards.
@@ -171,43 +168,32 @@ impl RejectPolicy {
         StatusCode::from_u16(self.code).unwrap_or(StatusCode::SERVICE_UNAVAILABLE)
     }
 
-    /// Reject the request with the configured code and message.
-    ///
-    /// Pre-T10 contract: writes through the single writer and the plugin
-    /// returns `true`. T10 changes this (and only this) to produce a
-    /// `Rejection` value instead.
-    pub(crate) async fn reject(&self, session: &mut Session, ctx: &ProxyContext) -> Result<bool> {
-        send_rejection(session, ctx, self.status(), self.msg.as_deref(), &[]).await
+    /// Reject the request with the configured code and message (T10: a
+    /// returned value; the pipeline writes it).
+    pub(crate) fn rejection(&self) -> Rejection {
+        rejection(self.status(), self.msg.as_deref(), &[])
     }
 }
 
-/// The single writer every limiter-family rejection goes through.
+/// The single constructor every limiter-family rejection goes through (T10).
 ///
-/// Today it writes the response via [`send_exit_response`] (so an
-/// `exit-transformer` rule sees limiter rejections exactly like every other
-/// gateway exit) and returns `true`, the current plugin short-circuit
-/// contract. T10 flips the body of this function to construct and return a
-/// `Rejection` value, touched in exactly one place. The content type for
-/// bodies matches the historical `ResponseBuilder::send_proxy_error` framing
-/// (`text/plain`).
-pub(crate) async fn send_rejection(
-    session: &mut Session,
-    ctx: &ProxyContext,
+/// The value travels out of the plugin via `FilterVerdict::Reject` and the
+/// pipeline writes it through `send_exit_response`, so an `exit-transformer`
+/// rule sees limiter rejections exactly like every other gateway exit. The
+/// content type for bodies matches the historical
+/// `ResponseBuilder::send_proxy_error` framing (`text/plain`).
+pub(crate) fn rejection(
     status: StatusCode,
     body: Option<&str>,
     extra_headers: &[(String, String)],
-) -> Result<bool> {
-    let content_type = body.map(|_| content_type::TEXT_PLAIN);
-    send_exit_response(
-        session,
-        status.as_u16(),
-        body,
-        content_type,
-        extra_headers,
-        ctx,
-    )
-    .await?;
-    Ok(true)
+) -> Rejection {
+    let mut value = Rejection::new(status).with_headers(extra_headers.iter().cloned());
+    if let Some(body) = body {
+        value = value
+            .with_body(body)
+            .with_content_type(content_type::TEXT_PLAIN);
+    }
+    value
 }
 
 /// Evaluate an APISIX `rules` entry's key template. APISIX skips a rule only
@@ -622,20 +608,31 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn rejection_writer_sends_status_body_content_type_and_headers() {
-        let (mut session, written) =
-            testing::session_for(testing::http_get_wire("/", &[]).as_bytes()).await;
-        let ctx = ProxyContext::default();
-        let rejected = send_rejection(
-            &mut session,
-            &ctx,
+    async fn rejection_value_carries_status_body_content_type_and_headers() {
+        let rejected = rejection(
             StatusCode::TOO_MANY_REQUESTS,
             Some("slow down"),
             &[("X-RateLimit-Scope".to_string(), "local".to_string())],
-        )
-        .await
-        .unwrap();
-        assert!(rejected, "pre-T10 contract: the plugin returns true");
+        );
+        assert_eq!(rejected.status, StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(rejected.body.as_deref(), Some("slow down"));
+        assert_eq!(
+            rejected.content_type.as_deref(),
+            Some(content_type::TEXT_PLAIN)
+        );
+        assert_eq!(
+            rejected.headers,
+            vec![("X-RateLimit-Scope".to_string(), "local".to_string())]
+        );
+        assert!(!rejected.close_connection);
+
+        // The pipeline's single write renders the value on the wire.
+        let (mut session, written) =
+            testing::session_for(testing::http_get_wire("/", &[]).as_bytes()).await;
+        let ctx = crate::core::ProxyContext::default();
+        crate::utils::response::send_rejection(&mut session, &rejected, &ctx)
+            .await
+            .unwrap();
         drop(session);
 
         let out = String::from_utf8(written.lock().unwrap().clone()).unwrap();
@@ -649,16 +646,11 @@ mod tests {
         assert!(out.contains("X-RateLimit-Scope: local"), "got: {out}");
     }
 
-    #[tokio::test]
-    async fn reject_policy_writes_the_configured_code_and_message() {
+    #[test]
+    fn reject_policy_builds_the_configured_code_and_message() {
         let policy = RejectPolicy::new(503, Some("busy".to_string()));
-        let (mut session, written) =
-            testing::session_for(testing::http_get_wire("/", &[]).as_bytes()).await;
-        let ctx = ProxyContext::default();
-        assert!(policy.reject(&mut session, &ctx).await.unwrap());
-        drop(session);
-        let out = String::from_utf8(written.lock().unwrap().clone()).unwrap();
-        assert!(out.starts_with("HTTP/1.1 503"), "got: {out}");
-        assert!(out.contains("busy"), "got: {out}");
+        let rejected = policy.rejection();
+        assert_eq!(rejected.status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(rejected.body.as_deref(), Some("busy"));
     }
 }

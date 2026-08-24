@@ -35,9 +35,8 @@ use serde_json::Value as JsonValue;
 use validator::Validate;
 
 use crate::{
-    core::{PluginPhases, ProxyContext, ProxyError, ProxyPlugin, ProxyResult},
+    core::{FilterVerdict, ProxyContext, ProxyError, ProxyPlugin, ProxyResult, Rejection},
     plugins::config::parse_and_validate_plugin_config,
-    utils::response::send_exit_response,
 };
 
 pub const PLUGIN_NAME: &str = "request-validation";
@@ -259,30 +258,20 @@ impl PluginRequestValidation {
         chunked || content_length > 0
     }
 
-    /// Reject via the shared exit helper with `rejected_msg` (or the schema
-    /// error) as the body.
-    async fn reject(
-        &self,
-        session: &mut Session,
-        ctx: &mut ProxyContext,
-        detail: Option<String>,
-    ) -> Result<bool> {
+    /// The rejection value with `rejected_msg` (or the schema error) as the
+    /// body; the pipeline writes it via the shared exit helper.
+    fn rejection(&self, detail: Option<String>) -> Rejection {
         let body = self
             .compiled
             .rejected_msg
             .clone()
             .or(detail)
             .unwrap_or_default();
-        send_exit_response(
-            session,
-            self.compiled.rejected_code,
-            Some(body.as_str()),
-            None,
-            &[],
-            ctx,
+        Rejection::new(
+            http::StatusCode::from_u16(self.compiled.rejected_code)
+                .unwrap_or(http::StatusCode::BAD_REQUEST),
         )
-        .await?;
-        Ok(true)
+        .with_body(body)
     }
 
     /// Reject a streaming body failure through Pingora's error path. The
@@ -303,11 +292,11 @@ impl ProxyPlugin for PluginRequestValidation {
         PRIORITY
     }
 
-    fn phases(&self) -> PluginPhases {
-        PluginPhases::REQUEST | PluginPhases::REQUEST_BODY
-    }
-
-    async fn request_filter(&self, session: &mut Session, ctx: &mut ProxyContext) -> Result<bool> {
+    async fn request_filter(
+        &self,
+        session: &mut Session,
+        ctx: &mut ProxyContext,
+    ) -> Result<FilterVerdict> {
         let headers = &session.req_header().headers;
 
         // 1. Header schema validation.
@@ -316,7 +305,7 @@ impl ProxyPlugin for PluginRequestValidation {
             if !validator.is_valid(&instance) {
                 log::debug!("request-validation: header schema violation");
                 let detail = first_error(validator, &instance);
-                return self.reject(session, ctx, detail).await;
+                return Ok(FilterVerdict::Reject(self.rejection(detail)));
             }
         }
 
@@ -334,18 +323,18 @@ impl ProxyPlugin for PluginRequestValidation {
             // upstream may parse the body differently, bypassing validation.
             if headers.get_all(http::header::CONTENT_TYPE).iter().count() > 1 {
                 log::debug!("request-validation: duplicated Content-Type header");
-                return self.reject(session, ctx, None).await;
+                return Ok(FilterVerdict::Reject(self.rejection(None)));
             }
 
             // APISIX parity: with body_schema set, a bodyless request is
             // rejected (fail closed).
             if !Self::request_declares_body(headers) {
                 log::debug!("request-validation: body_schema set but request has no body");
-                return self.reject(session, ctx, None).await;
+                return Ok(FilterVerdict::Reject(self.rejection(None)));
             }
         }
 
-        Ok(false)
+        Ok(FilterVerdict::Continue)
     }
 
     async fn request_body_filter(

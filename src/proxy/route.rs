@@ -9,7 +9,7 @@ use pingora_proxy::Session;
 use crate::{
     config::{self, Identifiable},
     core::{
-        sort_plugins_by_priority_desc, ErrorContext, ProxyError, ProxyPlugin, ProxyPluginExecutor,
+        sort_plugins_by_priority_desc, ErrorContext, PluginEntry, ProxyError, ProxyPluginExecutor,
         ProxyResult, RouteContext, RouteLabels, UpstreamSelection, UpstreamSelector,
     },
     plugins::{build_plugin_with_upstreams, cors},
@@ -21,7 +21,7 @@ use super::{
     upstream::{PreparedUpstreams, ProxyUpstream, TrafficSplitOwner, UpstreamOccurrence},
 };
 
-fn build_plugin_name_index(plugins: &[Arc<dyn ProxyPlugin>]) -> Vec<String> {
+fn build_plugin_name_index(plugins: &[PluginEntry]) -> Vec<String> {
     let mut names: Vec<String> = plugins.iter().map(|p| p.name().to_string()).collect();
     names.sort();
     names.dedup();
@@ -41,10 +41,10 @@ fn route_overrides_plugin(route_plugin_names: &[String], plugin_name: &str) -> b
 /// - When a plugin name exists in route, service plugin with same name is skipped.
 /// - On equal priority, prefers route plugins for deterministic results.
 fn merge_route_and_service_plugins(
-    route_plugins: &[Arc<dyn ProxyPlugin>],
-    service_plugins: &[Arc<dyn ProxyPlugin>],
+    route_plugins: &[PluginEntry],
+    service_plugins: &[PluginEntry],
     route_plugin_names: &[String],
-) -> Vec<Arc<dyn ProxyPlugin>> {
+) -> Vec<PluginEntry> {
     let mut merged = Vec::with_capacity(route_plugins.len() + service_plugins.len());
 
     let mut i = 0usize;
@@ -93,7 +93,7 @@ pub type RouteMatchResult = Option<(Vec<(String, String)>, Arc<ProxyRoute>)>;
 /// Proxy route with all service and upstream dependencies bound at build time.
 pub struct ProxyRoute {
     pub inner: config::Route,
-    pub plugins: Vec<Arc<dyn ProxyPlugin>>,
+    pub plugins: Vec<PluginEntry>,
     resolved_upstream: Option<Arc<dyn UpstreamSelector>>,
     effective_hosts: Vec<String>,
     /// Human-readable name of the bound service, when configured.
@@ -190,11 +190,11 @@ impl ProxyRoute {
         let mut plugins = Vec::with_capacity(route.plugins.len());
         let owner = TrafficSplitOwner::Route(route.id.clone());
         for (name, value) in route.plugins.clone() {
-            let plugin = build_plugin_with_upstreams(
+            let entry = build_plugin_with_upstreams(
                 &name, value, upstreams, prepared, &owner, defaults, resolver,
             )
             .map_err(|e| ProxyError::Plugin(format!("Failed to build plugin '{name}': {e}")))?;
-            plugins.push(plugin);
+            plugins.push(entry);
         }
         sort_plugins_by_priority_desc(plugins.as_mut_slice());
 
@@ -602,6 +602,8 @@ mod tests {
     use serde_json::Value as JsonValue;
     use std::collections::HashMap;
 
+    use crate::core::{PluginPhases, ProxyPlugin};
+
     #[test]
     fn test_wildcard_host_processing() {
         // Test wildcard host conversion
@@ -706,24 +708,28 @@ mod tests {
         }
     }
 
+    fn entry(plugin: DummyPlugin) -> PluginEntry {
+        PluginEntry::new(Arc::new(plugin), PluginPhases::empty())
+    }
+
     #[test]
     fn test_merge_route_service_plugins_preserves_priority_order() {
-        let route_plugins: Vec<Arc<dyn ProxyPlugin>> = vec![
-            Arc::new(DummyPlugin {
+        let route_plugins: Vec<PluginEntry> = vec![
+            entry(DummyPlugin {
                 name: "route_mid",
                 priority: 50,
             }),
-            Arc::new(DummyPlugin {
+            entry(DummyPlugin {
                 name: "route_low",
                 priority: 10,
             }),
         ];
-        let service_plugins: Vec<Arc<dyn ProxyPlugin>> = vec![
-            Arc::new(DummyPlugin {
+        let service_plugins: Vec<PluginEntry> = vec![
+            entry(DummyPlugin {
                 name: "service_high",
                 priority: 100,
             }),
-            Arc::new(DummyPlugin {
+            entry(DummyPlugin {
                 name: "service_lowmid",
                 priority: 20,
             }),
@@ -742,15 +748,15 @@ mod tests {
 
     #[test]
     fn test_merge_route_overrides_service_same_name() {
-        let route_dup: Arc<dyn ProxyPlugin> = Arc::new(DummyPlugin {
+        let route_dup = entry(DummyPlugin {
             name: "dup",
             priority: 10,
         });
-        let service_dup: Arc<dyn ProxyPlugin> = Arc::new(DummyPlugin {
+        let service_dup = entry(DummyPlugin {
             name: "dup",
             priority: 10,
         });
-        let service_other: Arc<dyn ProxyPlugin> = Arc::new(DummyPlugin {
+        let service_other = entry(DummyPlugin {
             name: "other",
             priority: 5,
         });
@@ -763,8 +769,8 @@ mod tests {
             merge_route_and_service_plugins(&route_plugins, &service_plugins, &route_names);
 
         assert_eq!(merged.len(), 2);
-        assert!(Arc::ptr_eq(&merged[0], &route_dup)); // route wins
-        assert!(Arc::ptr_eq(&merged[1], &service_other));
+        assert!(Arc::ptr_eq(&merged[0].plugin, &route_dup.plugin)); // route wins
+        assert!(Arc::ptr_eq(&merged[1].plugin, &service_other.plugin));
     }
 
     #[test]

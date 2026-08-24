@@ -3,7 +3,7 @@ use std::{collections::HashMap, sync::Arc};
 use crate::{
     config::{self, Identifiable},
     core::{
-        sort_plugins_by_priority_desc, ErrorContext, ProxyError, ProxyPlugin, ProxyResult,
+        sort_plugins_by_priority_desc, ErrorContext, PluginEntry, ProxyError, ProxyResult,
         UpstreamSelector,
     },
     plugins::build_plugin_with_upstreams,
@@ -15,7 +15,7 @@ use super::upstream::{PreparedUpstreams, ProxyUpstream, TrafficSplitOwner, Upstr
 pub struct ProxyService {
     pub inner: config::Service,
     pub upstream: Option<Arc<dyn UpstreamSelector>>,
-    pub plugins: Vec<Arc<dyn ProxyPlugin>>,
+    pub plugins: Vec<PluginEntry>,
     pub inline_upstream: Option<Arc<ProxyUpstream>>,
 }
 
@@ -84,7 +84,7 @@ impl ProxyService {
         // Load configured plugins
         let owner = TrafficSplitOwner::Service(service.id.clone());
         for (name, value) in service.plugins {
-            let plugin = build_plugin_with_upstreams(
+            let entry = build_plugin_with_upstreams(
                 &name, value, upstreams, prepared, &owner, defaults, resolver,
             )
             .map_err(|e| {
@@ -93,7 +93,7 @@ impl ProxyService {
                     name, service.id, e
                 ))
             })?;
-            proxy_service.plugins.push(plugin);
+            proxy_service.plugins.push(entry);
         }
 
         // Pre-sort plugins once at build-time to avoid per-request sorting in route+service merges.

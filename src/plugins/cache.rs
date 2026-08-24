@@ -13,7 +13,7 @@ use serde_json::Value as JsonValue;
 use validator::{Validate, ValidationError};
 
 use crate::{
-    core::{PluginPhases, ProxyContext, ProxyError, ProxyPlugin, ProxyResult},
+    core::{FilterVerdict, ProxyContext, ProxyError, ProxyPlugin, ProxyResult},
     plugins::config::parse_and_validate_plugin_config,
 };
 
@@ -582,11 +582,11 @@ impl ProxyPlugin for PluginCache {
     fn priority(&self) -> i32 {
         PRIORITY
     }
-    fn phases(&self) -> PluginPhases {
-        PluginPhases::REQUEST
-    }
-
-    async fn request_filter(&self, session: &mut Session, ctx: &mut ProxyContext) -> Result<bool> {
+    async fn request_filter(
+        &self,
+        session: &mut Session,
+        ctx: &mut ProxyContext,
+    ) -> Result<FilterVerdict> {
         let method = &session.req_header().method;
         let path = session.req_header().uri.path();
 
@@ -598,13 +598,13 @@ impl ProxyPlugin for PluginCache {
             ctx.set(self.cache_settings.no_cache_flag_key.clone(), false);
             ctx.set(CTX_KEY_CACHE_SETTINGS, self.cache_settings.clone());
             log::trace!("Cache enabled for PURGE {path}");
-            return Ok(false);
+            return Ok(FilterVerdict::Continue);
         }
 
         // 2. Check if method is cacheable
         if !self.methods.contains(method) {
             log::trace!("Method {method} not cacheable, skipping cache");
-            return Ok(false);
+            return Ok(FilterVerdict::Continue);
         }
 
         // 3. APISIX cache_bypass: any template that renders non-empty and not
@@ -613,7 +613,7 @@ impl ProxyPlugin for PluginCache {
             && http::cache_bypass_requested(&self.cache_settings.cache_bypass, session.req_header())
         {
             log::trace!("Cache bypass requested via cache_bypass template");
-            return Ok(false);
+            return Ok(FilterVerdict::Continue);
         }
 
         // 4. APISIX no_cache: any template that renders non-empty and not
@@ -629,14 +629,14 @@ impl ProxyPlugin for PluginCache {
         // 5. Shared caching of authenticated or cookie-bearing requests is opt-in.
         if should_bypass_authenticated_request(&self.cache_settings, ctx) {
             log::trace!("Request contains credentials, skipping shared cache");
-            return Ok(false);
+            return Ok(FilterVerdict::Continue);
         }
 
         // 6. Check if URI matches a no-cache pattern
         for re in &self.no_cache_regex {
             if re.is_match(path) {
                 log::trace!("Path {path} matches no-cache pattern, skipping cache");
-                return Ok(false);
+                return Ok(FilterVerdict::Continue);
             }
         }
 
@@ -644,7 +644,7 @@ impl ProxyPlugin for PluginCache {
         ctx.set(CTX_KEY_CACHE_SETTINGS, self.cache_settings.clone());
         log::trace!("Cache enabled for {method} {path}");
 
-        Ok(false)
+        Ok(FilterVerdict::Continue)
     }
 }
 

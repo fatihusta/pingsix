@@ -33,7 +33,7 @@ use serde_json::Value as JsonValue;
 use validator::Validate;
 
 use crate::{
-    core::{ExitTransform, ExitTransformRule, PluginPhases, ProxyError, ProxyPlugin, ProxyResult},
+    core::{ExitTransform, ExitTransformRule, ProxyError, ProxyPlugin, ProxyResult},
     plugins::config::parse_and_validate_plugin_config,
 };
 
@@ -139,12 +139,6 @@ impl ProxyPlugin for PluginExitTransformer {
         PRIORITY
     }
 
-    /// Deliberately empty: this plugin runs no per-request hooks. The shared
-    /// exit-response helper reads its rules via [`Self::exit_transform`].
-    fn phases(&self) -> PluginPhases {
-        PluginPhases::empty()
-    }
-
     fn exit_transform(&self) -> Option<&ExitTransform> {
         Some(&self.compiled)
     }
@@ -240,7 +234,7 @@ mod tests {
     }
 
     #[test]
-    fn plugin_exposes_compiled_transform_and_no_phases() {
+    fn plugin_exposes_compiled_transform() {
         let plugin = create_exit_transformer_plugin(
             serde_json::json!({
                 "rules": [{"codes": [429], "headers": {"Retry-After": "30"}}]
@@ -249,7 +243,6 @@ mod tests {
         )
         .expect("plugin builds");
         assert_eq!(plugin.name(), PLUGIN_NAME);
-        assert_eq!(plugin.phases(), PluginPhases::empty());
         let transform = plugin.exit_transform().expect("rules exposed");
         let matched = transform.matching(429).expect("rule matches");
         assert_eq!(

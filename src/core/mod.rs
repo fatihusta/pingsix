@@ -16,8 +16,8 @@ pub mod status;
 pub use error::{ErrorContext, ProxyError, ProxyResult};
 pub use plugin::{
     apply_regex_uri_template, sort_plugins_by_priority_desc, CompiledPluginPipeline, ExitTransform,
-    ExitTransformRule, HealthCheckFingerprint, HealthCheckSpec, PassiveOutcome, PluginCreateFn,
-    PluginPhases, ProxyContext, ProxyPlugin, ProxyPluginExecutor, RouteContext, RouteLabels,
-    SelectedUpstream, UpstreamSelection, UpstreamSelector,
+    ExitTransformRule, FilterVerdict, HealthCheckFingerprint, HealthCheckSpec, PassiveOutcome,
+    PluginCreateFn, PluginEntry, PluginPhases, ProxyContext, ProxyPlugin, ProxyPluginExecutor,
+    Rejection, RouteContext, RouteLabels, SelectedUpstream, UpstreamSelection, UpstreamSelector,
 };
 pub use secret::{constant_time_digest_eq, constant_time_eq, secret_digest};

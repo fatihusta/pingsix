@@ -74,8 +74,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-use crate::core::{PluginPhases, ProxyContext, ProxyError, ProxyPlugin, UpstreamSelector};
-use crate::utils::response::send_exit_response;
+use crate::core::{
+    FilterVerdict, ProxyContext, ProxyError, ProxyPlugin, Rejection, UpstreamSelector,
+};
 
 use crate::proxy::upstream::ProxyUpstream;
 
@@ -233,25 +234,14 @@ impl PluginAiProxy {
             .is_some_and(|state| state.token == self.token)
     }
 
-    /// Reject through the shared exit helper (exit-transformer applies).
-    /// JSON error body, mirroring the gateway's other rejections.
-    async fn reject(
-        session: &mut Session,
-        ctx: &mut ProxyContext,
-        status: u16,
-        message: &str,
-    ) -> Result<bool> {
+    /// Build the rejection value (the pipeline writes it through the shared
+    /// exit helper, so exit-transformer applies). JSON error body, mirroring
+    /// the gateway's other rejections.
+    fn reject(status: u16, message: &str) -> Rejection {
         let body = serde_json::json!({ "error": message }).to_string();
-        send_exit_response(
-            session,
-            status,
-            Some(body.as_str()),
-            Some("application/json"),
-            &[],
-            ctx,
-        )
-        .await?;
-        Ok(true)
+        Rejection::new(http::StatusCode::from_u16(status).unwrap_or(http::StatusCode::BAD_REQUEST))
+            .with_body(body)
+            .with_content_type("application/json")
     }
 }
 
@@ -361,19 +351,16 @@ impl ProxyPlugin for PluginAiProxy {
         PRIORITY
     }
 
-    fn phases(&self) -> PluginPhases {
-        PluginPhases::REQUEST
-            | PluginPhases::UPSTREAM_REQUEST
-            | PluginPhases::REQUEST_BODY
-            | PluginPhases::UPSTREAM_PEER
-    }
-
-    async fn request_filter(&self, session: &mut Session, ctx: &mut ProxyContext) -> Result<bool> {
+    async fn request_filter(
+        &self,
+        session: &mut Session,
+        ctx: &mut ProxyContext,
+    ) -> Result<FilterVerdict> {
         // Single-instance ownership: at most one ai-proxy instance handles a
         // request. An instance that already claimed makes this one a no-op,
         // so credentials, TLS flags, and the body transform never mix.
         if ctx.get::<AiProxyRequestState>(CTX_KEY_STATE).is_some() {
-            return Ok(false);
+            return Ok(FilterVerdict::Continue);
         }
         // APISIX merge semantics: a route-scoped ai-proxy overrides a
         // global-rule one. When the matched route carries its own instance,
@@ -386,15 +373,18 @@ impl ProxyPlugin for PluginAiProxy {
                 .is_some_and(|route| route.build_plugin_executor().has_plugin(PLUGIN_NAME))
         {
             log::debug!("ai-proxy: global instance yields to the route-scoped instance");
-            return Ok(false);
+            return Ok(FilterVerdict::Continue);
         }
 
         if let Some(message) = content_type_error(&session.req_header().headers) {
-            return Self::reject(session, ctx, 400, message).await;
+            return Ok(FilterVerdict::Reject(Self::reject(400, message)));
         }
 
         if !request_declares_body(&session.req_header().headers) {
-            return Self::reject(session, ctx, 400, "request body required").await;
+            return Ok(FilterVerdict::Reject(Self::reject(
+                400,
+                "request body required",
+            )));
         }
 
         // Header-only decisions. The body is intentionally NOT read here:
@@ -413,7 +403,7 @@ impl ProxyPlugin for PluginAiProxy {
 
         // Switch this request onto the provider upstream.
         ctx.upstream_override = Some(self.upstream.clone() as Arc<dyn UpstreamSelector>);
-        Ok(false)
+        Ok(FilterVerdict::Continue)
     }
 
     async fn upstream_request_filter(
@@ -584,7 +574,9 @@ impl ProxyPlugin for PluginAiProxy {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::core::{ProxyPluginExecutor, ProxyResult, RouteContext, UpstreamSelection};
+    use crate::core::{
+        PluginEntry, ProxyPluginExecutor, ProxyResult, RouteContext, UpstreamSelection,
+    };
     use crate::utils::testing::session_from_request as session_for;
     use serde_json::{json, Value as JsonValue};
 
@@ -668,6 +660,12 @@ mod tests {
             .map(|state| state.token)
     }
 
+    /// Whether the plugin lets the request through (T10 verdict form of the
+    /// old `Ok(false)` assertions).
+    fn continues(verdict: FilterVerdict) -> bool {
+        matches!(verdict, FilterVerdict::Continue)
+    }
+
     // ------------------------------------------------------------------
     // Content-Type gate
     // ------------------------------------------------------------------
@@ -704,11 +702,14 @@ mod tests {
             let mut session = session_for(&json_request(content_type, "")).await;
             let mut ctx = ProxyContext::default();
             let plugin = build_with_scope(instance_config(19099, "k", true), PluginScope::Route);
-            let exited = plugin
+            let verdict = plugin
                 .request_filter(&mut session, &mut ctx)
                 .await
                 .expect("no error");
-            assert!(exited, "{content_type:?} must short-circuit");
+            assert!(
+                matches!(verdict, FilterVerdict::Reject(ref r) if r.status == 400),
+                "{content_type:?} must short-circuit with a 400 rejection"
+            );
             assert!(owner_token(&ctx).is_none(), "no claim on rejection");
         }
     }
@@ -734,7 +735,9 @@ mod tests {
         let mut ctx = ProxyContext::default();
 
         // First instance claims.
-        assert!(!first.request_filter(&mut session, &mut ctx).await.unwrap());
+        assert!(continues(
+            first.request_filter(&mut session, &mut ctx).await.unwrap()
+        ));
         let first_token = owner_token(&ctx).expect("first instance claimed");
         assert_eq!(first_token, first.token);
         let first_upstream = ctx
@@ -745,7 +748,9 @@ mod tests {
 
         // A second instance never re-claims: the state, upstream override,
         // and TLS flag all stay derived from the first instance.
-        assert!(!second.request_filter(&mut session, &mut ctx).await.unwrap());
+        assert!(continues(
+            second.request_filter(&mut session, &mut ctx).await.unwrap()
+        ));
         assert_eq!(owner_token(&ctx), Some(first_token));
         assert_eq!(
             ctx.upstream_override
@@ -826,21 +831,26 @@ mod tests {
         let mut session = session_for(&json_request(Some("application/json"), "")).await;
         let mut ctx = ProxyContext {
             route: Some(Arc::new(MockRoute {
-                executor: Arc::new(ProxyPluginExecutor::new(vec![
-                    route.clone() as Arc<dyn ProxyPlugin>
-                ])),
+                executor: Arc::new(ProxyPluginExecutor::new(vec![PluginEntry::new(
+                    route.clone() as Arc<dyn ProxyPlugin>,
+                    crate::plugins::plugin_meta(PLUGIN_NAME).unwrap().phases,
+                )])),
             })),
             ..ProxyContext::default()
         };
 
         // The global instance (even running first) does not claim...
-        assert!(!global.request_filter(&mut session, &mut ctx).await.unwrap());
+        assert!(continues(
+            global.request_filter(&mut session, &mut ctx).await.unwrap()
+        ));
         assert!(owner_token(&ctx).is_none(), "global must yield");
         assert!(ctx.upstream_override.is_none());
 
         // ...so its credentials and ssl_verify:false never reach the request;
         // the route-scoped instance owns it alone.
-        assert!(!route.request_filter(&mut session, &mut ctx).await.unwrap());
+        assert!(continues(
+            route.request_filter(&mut session, &mut ctx).await.unwrap()
+        ));
         assert_eq!(owner_token(&ctx), Some(route.token));
 
         let mut upstream_request = session.req_header().clone();
@@ -882,7 +892,9 @@ mod tests {
             ..ProxyContext::default()
         };
 
-        assert!(!global.request_filter(&mut session, &mut ctx).await.unwrap());
+        assert!(continues(
+            global.request_filter(&mut session, &mut ctx).await.unwrap()
+        ));
         assert_eq!(owner_token(&ctx), Some(global.token));
         assert!(
             ctx.get::<AiProxyRequestState>(CTX_KEY_STATE)
@@ -979,7 +991,9 @@ mod tests {
         )
         .await;
         let mut ctx = ProxyContext::default();
-        assert!(!plugin.request_filter(&mut session, &mut ctx).await.unwrap());
+        assert!(continues(
+            plugin.request_filter(&mut session, &mut ctx).await.unwrap()
+        ));
 
         let body = br#"{"model":"m","messages":[{"role":"user","content":"hi"}],"stream":true}"#;
         let mut chunk = Some(Bytes::from_static(body));

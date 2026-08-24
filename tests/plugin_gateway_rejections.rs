@@ -1,10 +1,21 @@
-//! Behavioral tests for the gateway-rejection plugin family:
-//! `uri-blocker`, `request-validation`, and `exit-transformer`.
+//! Behavioral tests for gateway-generated rejections.
 //!
-//! Each test drives a real `pingora_proxy::Session` with a canned HTTP/1.1
-//! request (parsed through `read_request`) and captures the raw response
-//! bytes the plugin writes, so status lines, headers, and bodies are asserted
-//! exactly as a client would see them.
+//! Since T10 a plugin never writes its own rejection: `request_filter`
+//! returns a `FilterVerdict::Reject(Rejection)` value and the compiled
+//! pipeline writes it through the shared exit-response helper exactly once —
+//! uniformly, for every plugin family (the previously bypassed
+//! `send_proxy_error` family: jwt-auth / key-auth / basic-auth / csrf /
+//! client-control / grpc-web, plus the already compliant family:
+//! uri-blocker / request-validation / limiters / ip-restriction / ai-proxy).
+//!
+//! Wire format is pinned here:
+//! - the untransformed default shape (status, plain-text body, `Content-Type`),
+//! - the `exit-transformer`-transformed shape, asserted now also for the
+//!   previously bypassed auth family (the observable T10 win).
+//!
+//! Sessions are real `pingora_proxy::Session`s over the shared `MockStream`
+//! (`crate::utils::testing`, re-exported via `tests/common`), so status lines,
+//! headers, and bodies are asserted exactly as a client would see them.
 
 mod common;
 
@@ -16,12 +27,38 @@ use pingora_error::ErrorType;
 use pingora_proxy::Session;
 
 use common::{header_value, session_for, status_and_body};
-use pingsix::core::{PluginPhases, ProxyContext, ProxyPlugin, ProxyPluginExecutor};
-
-// The mock stream and session helpers live in `tests/common/mod.rs`.
+use pingsix::core::{
+    CompiledPluginPipeline, FilterVerdict, PluginEntry, ProxyContext, ProxyPlugin,
+    ProxyPluginExecutor,
+};
+use pingsix::utils::testing::run_request_filter;
 
 async fn build_plugin(name: &str, config: serde_json::Value) -> Arc<dyn ProxyPlugin> {
     pingsix::plugins::build_plugin_by_name(name, config).expect("plugin builds")
+}
+
+/// Build the plugin as a `PluginEntry` (instance + PLUGIN_META phases), the
+/// same shape executor construction uses in production.
+fn build_entry(name: &str, config: serde_json::Value) -> PluginEntry {
+    pingsix::plugins::build_plugin_entry_by_name(name, config).expect("plugin builds")
+}
+
+/// Run one plugin's request phase exactly like the pipeline: the returned
+/// verdict is written through the shared exit helper (which reads
+/// `ctx.pipeline`'s exit-transformer rules).
+async fn filter(plugin: &dyn ProxyPlugin, session: &mut Session, ctx: &mut ProxyContext) -> bool {
+    run_request_filter(plugin, session, ctx)
+        .await
+        .expect("no error")
+}
+
+/// Compose entries into a route-level pipeline (no global layer), mirroring
+/// `HttpService::request_filter`.
+fn route_pipeline(entries: Vec<PluginEntry>) -> CompiledPluginPipeline {
+    CompiledPluginPipeline::new(
+        ProxyPluginExecutor::default_shared(),
+        Arc::new(ProxyPluginExecutor::new(entries)),
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -39,10 +76,7 @@ async fn uri_blocker_blocks_matching_uri_with_default_403() {
         session_for(b"GET /admin/console HTTP/1.1\r\nHost: example.com\r\n\r\n").await;
     let mut ctx = ProxyContext::default();
 
-    let short_circuited = plugin
-        .request_filter(&mut session, &mut ctx)
-        .await
-        .expect("no error");
+    let short_circuited = filter(plugin.as_ref(), &mut session, &mut ctx).await;
     assert!(short_circuited);
 
     let (status, body) = {
@@ -68,10 +102,7 @@ async fn uri_blocker_matches_query_string_and_message_is_json() {
         session_for(b"GET /search?q=1&token=12345 HTTP/1.1\r\nHost: example.com\r\n\r\n").await;
     let mut ctx = ProxyContext::default();
 
-    assert!(plugin
-        .request_filter(&mut session, &mut ctx)
-        .await
-        .expect("no error"));
+    assert!(filter(plugin.as_ref(), &mut session, &mut ctx).await);
 
     let raw = written.lock().unwrap().clone();
     let (status, body) = status_and_body(&raw);
@@ -94,10 +125,7 @@ async fn uri_blocker_allows_non_matching_uri() {
         session_for(b"GET /public/data HTTP/1.1\r\nHost: example.com\r\n\r\n").await;
     let mut ctx = ProxyContext::default();
 
-    assert!(!plugin
-        .request_filter(&mut session, &mut ctx)
-        .await
-        .expect("no error"));
+    assert!(!filter(plugin.as_ref(), &mut session, &mut ctx).await);
 }
 
 // ---------------------------------------------------------------------------
@@ -124,10 +152,7 @@ async fn request_validation_accepts_conforming_headers() {
             .await;
     let mut ctx = ProxyContext::default();
 
-    assert!(!plugin
-        .request_filter(&mut session, &mut ctx)
-        .await
-        .expect("no error"));
+    assert!(!filter(plugin.as_ref(), &mut session, &mut ctx).await);
 }
 
 #[tokio::test]
@@ -152,10 +177,7 @@ async fn request_validation_rejects_bad_header_value_with_message() {
             .await;
     let mut ctx = ProxyContext::default();
 
-    assert!(plugin
-        .request_filter(&mut session, &mut ctx)
-        .await
-        .expect("no error"));
+    assert!(filter(plugin.as_ref(), &mut session, &mut ctx).await);
 
     let raw = written.lock().unwrap().clone();
     let (status, body) = status_and_body(&raw);
@@ -179,10 +201,7 @@ async fn request_validation_defaults_body_to_first_schema_error() {
         session_for(b"GET /anything HTTP/1.1\r\nHost: example.com\r\n\r\n").await;
     let mut ctx = ProxyContext::default();
 
-    assert!(plugin
-        .request_filter(&mut session, &mut ctx)
-        .await
-        .expect("no error"));
+    assert!(filter(plugin.as_ref(), &mut session, &mut ctx).await);
 
     let raw = written.lock().unwrap().clone();
     let (status, body) = status_and_body(&raw);
@@ -219,10 +238,7 @@ async fn request_validation_passes_valid_json_body_through_whole() {
     let mut ctx = ProxyContext::default();
 
     assert!(
-        !plugin
-            .request_filter(&mut session, &mut ctx)
-            .await
-            .expect("no error"),
+        !filter(plugin.as_ref(), &mut session, &mut ctx).await,
         "headers conform and a body is declared"
     );
 
@@ -268,10 +284,7 @@ async fn request_validation_rejects_invalid_json_body_with_rejected_code() {
     .await;
     let mut ctx = ProxyContext::default();
 
-    assert!(!plugin
-        .request_filter(&mut session, &mut ctx)
-        .await
-        .expect("no error"));
+    assert!(!filter(plugin.as_ref(), &mut session, &mut ctx).await);
 
     let mut chunk = Some(Bytes::from_static(b"{\"quantity\": 0}"));
     let err = plugin
@@ -295,10 +308,7 @@ async fn request_validation_rejects_bodyless_request_when_body_schema_set() {
     let mut ctx = ProxyContext::default();
 
     assert!(
-        plugin
-            .request_filter(&mut session, &mut ctx)
-            .await
-            .expect("no error"),
+        filter(plugin.as_ref(), &mut session, &mut ctx).await,
         "GET without a body is rejected (APISIX fail-closed parity)"
     );
 
@@ -320,10 +330,7 @@ async fn request_validation_validates_form_urlencoded_bodies() {
     )
     .await;
     let mut ctx = ProxyContext::default();
-    assert!(!plugin
-        .request_filter(&mut session, &mut ctx)
-        .await
-        .expect("no error"));
+    assert!(!filter(plugin.as_ref(), &mut session, &mut ctx).await);
 
     let mut chunk = Some(Bytes::from_static(
         b"grant_type=client_credentials&scope=read",
@@ -346,10 +353,7 @@ async fn request_validation_oversized_body_is_rejected() {
     )
     .await;
     let mut ctx = ProxyContext::default();
-    assert!(!plugin
-        .request_filter(&mut session, &mut ctx)
-        .await
-        .expect("no error"));
+    assert!(!filter(plugin.as_ref(), &mut session, &mut ctx).await);
 
     let mut chunk = Some(Bytes::from_static(b"{\"a\":\"0123456789ABCDEF\"}"));
     let err = plugin
@@ -365,53 +369,40 @@ async fn request_validation_oversized_body_is_rejected() {
 
 #[tokio::test]
 async fn exit_transformer_rewrites_plugin_rejection() {
-    let transformer = build_plugin(
-        "exit-transformer",
-        serde_json::json!({
-            "rules": [
-                {
-                    "codes": [400],
-                    "status_code": 422,
-                    "body": "{\"error\":true,\"origin_status\":$status,\"detail\":\"$message\"}",
-                    "headers": {
-                        "Content-Type": "application/json",
-                        "X-Blocked": "yes"
+    let pipeline = route_pipeline(vec![
+        build_entry(
+            "request-validation",
+            serde_json::json!({
+                "header_schema": {"type": "object", "required": ["X-Mandatory"]},
+                "rejected_msg": "mandatory header missing"
+            }),
+        ),
+        build_entry(
+            "exit-transformer",
+            serde_json::json!({
+                "rules": [
+                    {
+                        "codes": [400],
+                        "status_code": 422,
+                        "body": "{\"error\":true,\"origin_status\":$status,\"detail\":\"$message\"}",
+                        "headers": {
+                            "Content-Type": "application/json",
+                            "X-Blocked": "yes"
+                        }
                     }
-                }
-            ]
-        }),
-    )
-    .await;
-    let validation = build_plugin(
-        "request-validation",
-        serde_json::json!({
-            "header_schema": {"type": "object", "required": ["X-Mandatory"]},
-            "rejected_msg": "mandatory header missing"
-        }),
-    )
-    .await;
-
-    // Compose both in one route executor so the shared helper can find the
-    // transform through the pipeline, exactly like production.
-    let route = Arc::new(ProxyPluginExecutor::new(vec![
-        validation.clone(),
-        transformer.clone(),
-    ]));
-    let pipeline = pingsix::core::CompiledPluginPipeline::new(
-        pingsix::core::ProxyPluginExecutor::default_shared(),
-        route,
-    );
+                ]
+            }),
+        ),
+    ]);
 
     let (mut session, written) =
         session_for(b"GET /anything HTTP/1.1\r\nHost: example.com\r\n\r\n").await;
     let mut ctx = ProxyContext {
-        pipeline,
+        pipeline: pipeline.clone(),
         ..ProxyContext::default()
     };
 
-    assert!(ctx
-        .pipeline
-        .clone()
+    assert!(pipeline
         .request_filter(&mut session, &mut ctx)
         .await
         .expect("no error"));
@@ -437,45 +428,36 @@ async fn exit_transformer_rewrites_plugin_rejection() {
 
 #[tokio::test]
 async fn exit_transformer_route_level_overrides_global_level() {
-    let blocker = build_plugin(
-        "uri-blocker",
-        serde_json::json!({ "block_rules": ["/forbidden"] }),
-    )
-    .await;
-    let global_transformer = build_plugin(
-        "exit-transformer",
-        serde_json::json!({
-            "rules": [{"codes": [403], "body": "global"}]
-        }),
-    )
-    .await;
-    let route_transformer = build_plugin(
+    let global = Arc::new(ProxyPluginExecutor::new(vec![
+        build_entry(
+            "uri-blocker",
+            serde_json::json!({ "block_rules": ["/forbidden"] }),
+        ),
+        build_entry(
+            "exit-transformer",
+            serde_json::json!({
+                "rules": [{"codes": [403], "body": "global"}]
+            }),
+        ),
+    ]));
+    let route = Arc::new(ProxyPluginExecutor::new(vec![build_entry(
         "exit-transformer",
         serde_json::json!({
             "rules": [{"codes": [403], "body": "route"}]
         }),
-    )
-    .await;
-
-    let global = Arc::new(ProxyPluginExecutor::new(vec![
-        blocker.clone(),
-        global_transformer,
-    ]));
-    let route = Arc::new(ProxyPluginExecutor::new(vec![route_transformer]));
-    let pipeline = pingsix::core::CompiledPluginPipeline::new(global, route);
+    )]));
+    let pipeline = CompiledPluginPipeline::new(global, route);
 
     let (mut session, written) =
         session_for(b"GET /forbidden HTTP/1.1\r\nHost: example.com\r\n\r\n").await;
     let mut ctx = ProxyContext {
-        pipeline,
+        pipeline: pipeline.clone(),
         ..ProxyContext::default()
     };
 
     // Drive the global layer (where the blocker lives) through the pipeline's
     // request phase, mirroring HttpService::request_filter.
-    assert!(ctx
-        .pipeline
-        .clone()
+    assert!(pipeline
         .request_filter(&mut session, &mut ctx)
         .await
         .expect("no error"));
@@ -487,31 +469,160 @@ async fn exit_transformer_route_level_overrides_global_level() {
 }
 
 // ---------------------------------------------------------------------------
+// Auth family: previously bypassed `exit-transformer` (the T10 win)
+// ---------------------------------------------------------------------------
+
+/// The three auth plugins whose 401s previously bypassed `exit-transformer`
+/// (direct `send_proxy_error` writes): name, minimal config, expected
+/// default body. CSRF is excluded here because a rejecting request needs a
+/// cookie/header setup; its rejection value is pinned by its own unit tests.
+fn auth_family() -> Vec<(&'static str, serde_json::Value, &'static str, Vec<u8>)> {
+    vec![
+        (
+            "jwt-auth",
+            serde_json::json!({"secret": "test-secret"}),
+            "Token not found",
+            b"GET /x HTTP/1.1\r\nHost: e.com\r\n\r\n".to_vec(),
+        ),
+        (
+            "key-auth",
+            serde_json::json!({"key": "test-key"}),
+            "Invalid user authorization",
+            b"GET /x HTTP/1.1\r\nHost: e.com\r\n\r\n".to_vec(),
+        ),
+        (
+            "basic-auth",
+            serde_json::json!({"username": "user", "password": "pass"}),
+            "Invalid user authorization",
+            b"GET /x HTTP/1.1\r\nHost: e.com\r\n\r\n".to_vec(),
+        ),
+    ]
+}
+
+#[tokio::test]
+async fn auth_family_401_uses_default_format_without_transformer() {
+    for (name, config, expected_body, request) in auth_family() {
+        let pipeline = route_pipeline(vec![build_entry(name, config)]);
+
+        let (mut session, written) = session_for(&request).await;
+        let mut ctx = ProxyContext {
+            pipeline: pipeline.clone(),
+            ..ProxyContext::default()
+        };
+
+        assert!(
+            pipeline
+                .request_filter(&mut session, &mut ctx)
+                .await
+                .expect("no error"),
+            "{name} must reject an unauthenticated request"
+        );
+
+        let raw = written.lock().unwrap().clone();
+        let (status, body) = status_and_body(&raw);
+        assert_eq!(status, 401, "{name}");
+        assert_eq!(body, expected_body, "{name}: untransformed default body");
+        assert_eq!(
+            header_value(&raw, "Content-Type").as_deref(),
+            Some("text/plain"),
+            "{name}: untransformed default content type"
+        );
+        assert_eq!(
+            header_value(&raw, "WWW-Authenticate").map(|_| true),
+            Some(true),
+            "{name}: auth challenge header preserved"
+        );
+    }
+}
+
+#[tokio::test]
+async fn auth_family_401_is_transformed_by_an_exit_transformer_rule() {
+    for (name, config, expected_body, request) in auth_family() {
+        let pipeline = route_pipeline(vec![
+            build_entry(name, config),
+            build_entry(
+                "exit-transformer",
+                serde_json::json!({
+                    "rules": [
+                        {
+                            "codes": [401],
+                            "status_code": 403,
+                            "body": "{\"error\":true,\"status\":$status,\"message\":\"$message\"}",
+                            "headers": {"Content-Type": "application/json"}
+                        }
+                    ]
+                }),
+            ),
+        ]);
+
+        let (mut session, written) = session_for(&request).await;
+        let mut ctx = ProxyContext {
+            pipeline: pipeline.clone(),
+            ..ProxyContext::default()
+        };
+
+        assert!(
+            pipeline
+                .request_filter(&mut session, &mut ctx)
+                .await
+                .expect("no error"),
+            "{name} must reject an unauthenticated request"
+        );
+
+        let raw = written.lock().unwrap().clone();
+        let (status, body) = status_and_body(&raw);
+        assert_eq!(
+            status, 403,
+            "{name}: the rule remaps the auth 401 (previously untransformable)"
+        );
+        assert_eq!(
+            body,
+            format!("{{\"error\":true,\"status\":403,\"message\":\"{expected_body}\"}}"),
+            "{name}: body carries the remapped status and original message"
+        );
+        assert_eq!(
+            header_value(&raw, "Content-Type").as_deref(),
+            Some("application/json"),
+            "{name}"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Phase gating
 // ---------------------------------------------------------------------------
 
 #[test]
-fn new_plugins_declare_their_phases() {
-    let blocker = futures::executor::block_on(build_plugin(
-        "uri-blocker",
-        serde_json::json!({ "block_rules": ["x"] }),
-    ));
-    assert_eq!(blocker.phases(), PluginPhases::REQUEST);
+fn new_plugins_carry_meta_phases_in_their_entries() {
+    // Phase declarations live in PLUGIN_META, surfaced on the PluginEntry at
+    // construction (T10: the wiring, not a mirror of trait methods).
+    use pingsix::core::PluginPhases;
 
-    let validation = futures::executor::block_on(build_plugin(
+    let blocker = build_entry("uri-blocker", serde_json::json!({ "block_rules": ["x"] }));
+    assert_eq!(blocker.phases, PluginPhases::REQUEST);
+
+    let validation = build_entry(
         "request-validation",
         serde_json::json!({ "header_schema": {"type": "object"} }),
-    ));
+    );
     assert_eq!(
-        validation.phases(),
-        PluginPhases::REQUEST | PluginPhases::REQUEST_BODY
+        validation.phases,
+        PluginPhases::REQUEST.union(PluginPhases::REQUEST_BODY)
     );
 
-    let transformer = futures::executor::block_on(build_plugin(
+    let transformer = build_entry(
         "exit-transformer",
         serde_json::json!({ "rules": [{"codes": [404]}] }),
-    ));
-    assert_eq!(transformer.phases(), PluginPhases::empty());
+    );
+    assert_eq!(transformer.phases, PluginPhases::empty());
+
+    // The executor partition derives from the entry phases.
+    let executor = ProxyPluginExecutor::new(vec![blocker, validation, transformer]);
+    assert!(executor.has_plugin("uri-blocker"));
+    assert!(executor.has_plugin_in_phase("uri-blocker", PluginPhases::REQUEST));
+    assert!(!executor.has_plugin_in_phase("uri-blocker", PluginPhases::REQUEST_BODY));
+    assert!(executor.has_plugin_in_phase("request-validation", PluginPhases::REQUEST_BODY));
+    assert!(!executor.has_plugin_in_phase("exit-transformer", PluginPhases::REQUEST));
 }
 
 #[tokio::test]
@@ -526,7 +637,7 @@ async fn rejection_framing_content_length_matches_body() {
     .await;
     let (mut session, written) = session_for(b"GET /x HTTP/1.1\r\nHost: e.com\r\n\r\n").await;
     let mut ctx = ProxyContext::default();
-    assert!(plugin.request_filter(&mut session, &mut ctx).await.unwrap());
+    assert!(filter(plugin.as_ref(), &mut session, &mut ctx).await);
     let raw = written.lock().unwrap().clone();
     let text = String::from_utf8_lossy(&raw);
     println!("--- with body ---\n{text}");
@@ -543,7 +654,7 @@ async fn empty_rejection_framing_is_documented() {
     let plugin = build_plugin("uri-blocker", serde_json::json!({"block_rules": ["/x"]})).await;
     let (mut session, written) = session_for(b"GET /x HTTP/1.1\r\nHost: e.com\r\n\r\n").await;
     let mut ctx = ProxyContext::default();
-    assert!(plugin.request_filter(&mut session, &mut ctx).await.unwrap());
+    assert!(filter(plugin.as_ref(), &mut session, &mut ctx).await);
     let raw = written.lock().unwrap().clone();
     println!("--- empty body ---\n{}", String::from_utf8_lossy(&raw));
 }
@@ -553,7 +664,7 @@ async fn empty_rejection_sets_content_length_zero_for_safe_framing() {
     let plugin = build_plugin("uri-blocker", serde_json::json!({"block_rules": ["/x"]})).await;
     let (mut session, written) = session_for(b"GET /x HTTP/1.1\r\nHost: e.com\r\n\r\n").await;
     let mut ctx = ProxyContext::default();
-    assert!(plugin.request_filter(&mut session, &mut ctx).await.unwrap());
+    assert!(filter(plugin.as_ref(), &mut session, &mut ctx).await);
     let raw = written.lock().unwrap().clone();
     assert_eq!(
         header_value(&raw, "Content-Length").as_deref(),
@@ -567,31 +678,24 @@ async fn empty_rejection_sets_content_length_zero_for_safe_framing() {
 
 #[tokio::test]
 async fn exit_transformer_body_replacement_recomputes_content_length() {
-    let transformer = build_plugin(
-        "exit-transformer",
-        serde_json::json!({
-            "rules": [{"codes": [403], "body": "{\"error\":true}", "headers": {"Content-Type": "application/json"}}]
-        }),
-    )
-    .await;
-    let blocker = build_plugin(
-        "uri-blocker",
-        serde_json::json!({"block_rules": ["/x"], "rejected_msg": "a-much-longer-original-rejection-message"}),
-    )
-    .await;
-    let route = Arc::new(ProxyPluginExecutor::new(vec![blocker, transformer]));
-    let pipeline = pingsix::core::CompiledPluginPipeline::new(
-        pingsix::core::ProxyPluginExecutor::default_shared(),
-        route,
-    );
+    let pipeline = route_pipeline(vec![
+        build_entry(
+            "uri-blocker",
+            serde_json::json!({"block_rules": ["/x"], "rejected_msg": "a-much-longer-original-rejection-message"}),
+        ),
+        build_entry(
+            "exit-transformer",
+            serde_json::json!({
+                "rules": [{"codes": [403], "body": "{\"error\":true}", "headers": {"Content-Type": "application/json"}}]
+            }),
+        ),
+    ]);
     let (mut session, written) = session_for(b"GET /x HTTP/1.1\r\nHost: e.com\r\n\r\n").await;
     let mut ctx = ProxyContext {
-        pipeline,
+        pipeline: pipeline.clone(),
         ..ProxyContext::default()
     };
-    assert!(ctx
-        .pipeline
-        .clone()
+    assert!(pipeline
         .request_filter(&mut session, &mut ctx)
         .await
         .unwrap());
@@ -693,11 +797,12 @@ impl ProxyPlugin for BodyRewriteProbe {
     fn priority(&self) -> i32 {
         100
     }
-    fn phases(&self) -> PluginPhases {
-        PluginPhases::REQUEST | PluginPhases::UPSTREAM_REQUEST | PluginPhases::REQUEST_BODY
-    }
 
-    async fn request_filter(&self, session: &mut Session, ctx: &mut ProxyContext) -> PResult<bool> {
+    async fn request_filter(
+        &self,
+        session: &mut Session,
+        ctx: &mut ProxyContext,
+    ) -> PResult<FilterVerdict> {
         // 提前把整个请求体从下游读空(APISIX ngx.req.read_body 等价物)
         let mut buf = bytes::BytesMut::new();
         while let Some(chunk) = session.downstream_session.read_request_body().await? {
@@ -705,7 +810,7 @@ impl ProxyPlugin for BodyRewriteProbe {
         }
         *self.seen_original.lock().unwrap() = Some(buf.freeze());
         ctx.set("probe::replacement", self.replaced.clone());
-        Ok(false)
+        Ok(FilterVerdict::Continue)
     }
 
     async fn upstream_request_filter(
@@ -774,7 +879,10 @@ async fn early_read_rewrite_inject_replaces_request_body_whole() {
     };
 
     let mut ctx = ProxyContext::default();
-    assert!(!probe.request_filter(&mut session, &mut ctx).await.unwrap());
+    assert!(matches!(
+        probe.request_filter(&mut session, &mut ctx).await.unwrap(),
+        FilterVerdict::Continue
+    ));
 
     // 1. 提前读到了完整原始 body
     assert_eq!(

@@ -13,9 +13,9 @@ use serde_json::Value as JsonValue;
 use validator::{Validate, ValidationError};
 
 use crate::{
-    core::{PluginPhases, ProxyContext, ProxyError, ProxyPlugin, ProxyResult},
+    core::{FilterVerdict, ProxyContext, ProxyError, ProxyPlugin, ProxyResult, Rejection},
     plugins::config::{parse_and_validate_plugin_config, validate_apisix_realm},
-    utils::{request, response::ResponseBuilder},
+    utils::{request, response::content_type},
 };
 
 pub const PLUGIN_NAME: &str = "jwt-auth";
@@ -312,11 +312,11 @@ impl ProxyPlugin for PluginJWTAuth {
     fn priority(&self) -> i32 {
         PRIORITY
     }
-    fn phases(&self) -> PluginPhases {
-        PluginPhases::REQUEST | PluginPhases::RESPONSE
-    }
-
-    async fn request_filter(&self, session: &mut Session, ctx: &mut ProxyContext) -> Result<bool> {
+    async fn request_filter(
+        &self,
+        session: &mut Session,
+        ctx: &mut ProxyContext,
+    ) -> Result<FilterVerdict> {
         let token = self.extract_token(session, ctx)?;
         if token.is_some() {
             ctx.mark_request_has_credentials();
@@ -324,15 +324,15 @@ impl ProxyPlugin for PluginJWTAuth {
         let token = match token {
             Some(t) => t,
             None => {
-                let challenge = self.config.challenge_for("Token not found");
-                ResponseBuilder::send_proxy_error(
-                    session,
-                    StatusCode::UNAUTHORIZED,
-                    Some("Token not found"),
-                    Some(&[("WWW-Authenticate", challenge.as_str())]),
-                )
-                .await?;
-                return Ok(true);
+                return Ok(FilterVerdict::Reject(
+                    Rejection::new(StatusCode::UNAUTHORIZED)
+                        .with_body("Token not found")
+                        .with_content_type(content_type::TEXT_PLAIN)
+                        .with_header(
+                            "WWW-Authenticate",
+                            self.config.challenge_for("Token not found"),
+                        ),
+                ));
             }
         };
 
@@ -350,15 +350,12 @@ impl ProxyPlugin for PluginJWTAuth {
                     jsonwebtoken::errors::ErrorKind::ImmatureSignature => "Token not yet valid",
                     _ => "Invalid token",
                 };
-                let challenge = self.config.challenge_for(error_msg);
-                ResponseBuilder::send_proxy_error(
-                    session,
-                    StatusCode::UNAUTHORIZED,
-                    Some(error_msg),
-                    Some(&[("WWW-Authenticate", challenge.as_str())]),
-                )
-                .await?;
-                return Ok(true);
+                return Ok(FilterVerdict::Reject(
+                    Rejection::new(StatusCode::UNAUTHORIZED)
+                        .with_body(error_msg)
+                        .with_content_type(content_type::TEXT_PLAIN)
+                        .with_header("WWW-Authenticate", self.config.challenge_for(error_msg)),
+                ));
             }
         };
 
@@ -372,7 +369,7 @@ impl ProxyPlugin for PluginJWTAuth {
         // (extraction may already have removed the header/query carrier).
         ctx.note_request_credential(&token);
 
-        Ok(false)
+        Ok(FilterVerdict::Continue)
     }
 
     async fn response_filter(

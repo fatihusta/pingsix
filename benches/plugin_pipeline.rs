@@ -12,7 +12,9 @@ use criterion::{black_box, criterion_group, criterion_main, BatchSize, Criterion
 use futures::executor::block_on;
 use pingora_error::Result;
 use pingora_proxy::Session;
-use pingsix::core::{PluginPhases, ProxyContext, ProxyPlugin, ProxyPluginExecutor};
+use pingsix::core::{
+    FilterVerdict, PluginEntry, PluginPhases, ProxyContext, ProxyPlugin, ProxyPluginExecutor,
+};
 use pingsix::utils::testing::noop_session;
 
 struct HotPhasePlugin {
@@ -30,16 +32,12 @@ impl ProxyPlugin for HotPhasePlugin {
         self.priority
     }
 
-    fn phases(&self) -> PluginPhases {
-        PluginPhases::REQUEST
-    }
-
     async fn request_filter(
         &self,
         _session: &mut Session,
         _ctx: &mut ProxyContext,
-    ) -> Result<bool> {
-        Ok(false)
+    ) -> Result<FilterVerdict> {
+        Ok(FilterVerdict::Continue)
     }
 }
 
@@ -51,20 +49,27 @@ enum BenchmarkBuiltin {
 }
 
 impl BenchmarkBuiltin {
-    async fn request_filter(&self, session: &mut Session, ctx: &mut ProxyContext) -> Result<bool> {
+    async fn request_filter(
+        &self,
+        session: &mut Session,
+        ctx: &mut ProxyContext,
+    ) -> Result<FilterVerdict> {
         match self {
             Self::Hot(plugin) => plugin.request_filter(session, ctx).await,
         }
     }
 }
 
-fn dynamic_plugins(count: usize) -> Vec<Arc<dyn ProxyPlugin>> {
+fn dynamic_plugins(count: usize) -> Vec<PluginEntry> {
     (0..count)
         .map(|index| {
-            Arc::new(HotPhasePlugin {
-                name: if index % 2 == 0 { "request-id" } else { "cors" },
-                priority: 10_000 - index as i32,
-            }) as Arc<dyn ProxyPlugin>
+            PluginEntry::new(
+                Arc::new(HotPhasePlugin {
+                    name: if index % 2 == 0 { "request-id" } else { "cors" },
+                    priority: 10_000 - index as i32,
+                }),
+                PluginPhases::REQUEST,
+            )
         })
         .collect()
 }
@@ -107,7 +112,10 @@ fn bench_hot_request_phase(c: &mut Criterion, plugin_count: usize) {
                 let mut ctx = ProxyContext::default();
                 black_box(block_on(async {
                     for plugin in &static_plugins {
-                        if plugin.request_filter(&mut session, &mut ctx).await.unwrap() {
+                        if matches!(
+                            plugin.request_filter(&mut session, &mut ctx).await.unwrap(),
+                            FilterVerdict::Reject(_)
+                        ) {
                             return true;
                         }
                     }

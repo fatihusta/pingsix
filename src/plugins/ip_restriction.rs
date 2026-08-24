@@ -1,16 +1,17 @@
 use std::{net::IpAddr, sync::Arc};
 
 use async_trait::async_trait;
+use http::StatusCode;
 use ipnetwork::IpNetwork;
 use pingora_error::Result;
 use pingora_proxy::Session;
 use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
 
-use crate::core::{PluginPhases, ProxyContext, ProxyError, ProxyPlugin, ProxyResult};
+use crate::core::{FilterVerdict, ProxyContext, ProxyError, ProxyPlugin, ProxyResult, Rejection};
 use crate::utils::{
     request::{get_direct_client_ip, get_req_header_value},
-    response::{content_type, send_exit_response},
+    response::content_type,
 };
 
 pub const PLUGIN_NAME: &str = "ip-restriction";
@@ -211,15 +212,15 @@ impl ProxyPlugin for PluginIPRestriction {
     fn priority(&self) -> i32 {
         PRIORITY
     }
-    fn phases(&self) -> PluginPhases {
-        PluginPhases::REQUEST
-    }
-
-    async fn request_filter(&self, session: &mut Session, ctx: &mut ProxyContext) -> Result<bool> {
+    async fn request_filter(
+        &self,
+        session: &mut Session,
+        _ctx: &mut ProxyContext,
+    ) -> Result<FilterVerdict> {
         let client_ip = match self.get_real_client_ip(session) {
             Ok(ip) => ip,
             Err(ClientIpError::InvalidForwardedHeader) => {
-                return self.reject_request(session, ctx).await;
+                return Ok(FilterVerdict::Reject(self.rejection()));
             }
             Err(ClientIpError::Other(err)) => return Err(err),
         };
@@ -232,7 +233,7 @@ impl ProxyPlugin for PluginIPRestriction {
                 .iter()
                 .any(|network| network.contains(client_ip))
         {
-            return self.reject_request(session, ctx).await;
+            return Ok(FilterVerdict::Reject(self.rejection()));
         }
 
         // Check blacklist
@@ -242,10 +243,10 @@ impl ProxyPlugin for PluginIPRestriction {
             .iter()
             .any(|network| network.contains(client_ip))
         {
-            return self.reject_request(session, ctx).await;
+            return Ok(FilterVerdict::Reject(self.rejection()));
         }
 
-        Ok(false)
+        Ok(FilterVerdict::Continue)
     }
 }
 
@@ -336,21 +337,14 @@ impl PluginIPRestriction {
             .or_else(|| hops.first().copied())
     }
 
-    /// Rejects the request with the configured response code and an
-    /// APISIX-style JSON body (`{"message":"..."}`).
-    async fn reject_request(&self, session: &mut Session, ctx: &ProxyContext) -> Result<bool> {
-        let body = build_rejection_body(&self.config.message);
-        send_exit_response(
-            session,
-            self.config.response_code,
-            Some(&body),
-            Some(content_type::APPLICATION_JSON),
-            &[],
-            ctx,
+    /// The rejection value for a blocked request: the configured response
+    /// code and an APISIX-style JSON body (`{"message":"..."}`).
+    fn rejection(&self) -> Rejection {
+        Rejection::new(
+            StatusCode::from_u16(self.config.response_code).unwrap_or(StatusCode::FORBIDDEN),
         )
-        .await?;
-
-        Ok(true)
+        .with_body(build_rejection_body(&self.config.message))
+        .with_content_type(content_type::APPLICATION_JSON)
     }
 }
 

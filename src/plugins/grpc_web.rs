@@ -13,9 +13,9 @@ use serde_json::Value as JsonValue;
 use validator::Validate;
 
 use crate::{
-    core::{PluginPhases, ProxyContext, ProxyError, ProxyPlugin, ProxyResult},
+    core::{FilterVerdict, ProxyContext, ProxyError, ProxyPlugin, ProxyResult, Rejection},
     plugins::config::parse_and_validate_plugin_config,
-    utils::response::ResponseBuilder,
+    utils::response::content_type,
 };
 
 pub const PLUGIN_NAME: &str = "grpc-web";
@@ -147,13 +147,6 @@ impl ProxyPlugin for PluginGrpcWeb {
         PRIORITY
     }
 
-    fn phases(&self) -> PluginPhases {
-        PluginPhases::EARLY_REQUEST
-            | PluginPhases::REQUEST
-            | PluginPhases::REQUEST_BODY
-            | PluginPhases::RESPONSE
-    }
-
     async fn early_request_filter(
         &self,
         session: &mut Session,
@@ -176,38 +169,37 @@ impl ProxyPlugin for PluginGrpcWeb {
         Ok(())
     }
 
-    async fn request_filter(&self, session: &mut Session, ctx: &mut ProxyContext) -> Result<bool> {
+    async fn request_filter(
+        &self,
+        session: &mut Session,
+        ctx: &mut ProxyContext,
+    ) -> Result<FilterVerdict> {
+        // CORS/expose headers are attached to every local grpc-web answer.
+        let cors_headers = |r: Rejection| {
+            r.with_header("Access-Control-Allow-Origin", "*")
+                .with_header("Access-Control-Expose-Headers", GRPC_WEB_EXPOSE_HEADERS)
+        };
+
         // APISIX grpc-web is strict: OPTIONS is answered locally as a CORS
         // preflight, POST is the only proxied method, and every proxied
         // request must carry a gRPC-Web content type.
         if session.req_header().method == http::Method::OPTIONS {
-            let mut resp = ResponseHeader::build(http::StatusCode::NO_CONTENT, None)?;
-            resp.insert_header(header::ACCESS_CONTROL_ALLOW_METHODS, GRPC_WEB_ALLOW_METHODS)?;
-            resp.insert_header(
-                header::ACCESS_CONTROL_ALLOW_HEADERS,
-                &self.config.cors_allow_headers,
-            )?;
-            resp.insert_header(header::ACCESS_CONTROL_ALLOW_ORIGIN, "*")?;
-            resp.insert_header(
-                header::ACCESS_CONTROL_EXPOSE_HEADERS,
-                GRPC_WEB_EXPOSE_HEADERS,
-            )?;
-            session.write_response_header(Box::new(resp), true).await?;
-            return Ok(true);
+            return Ok(FilterVerdict::Reject(
+                Rejection::new(http::StatusCode::NO_CONTENT)
+                    .with_header("Access-Control-Allow-Methods", GRPC_WEB_ALLOW_METHODS)
+                    .with_header(
+                        "Access-Control-Allow-Headers",
+                        self.config.cors_allow_headers.clone(),
+                    )
+                    .with_header("Access-Control-Allow-Origin", "*")
+                    .with_header("Access-Control-Expose-Headers", GRPC_WEB_EXPOSE_HEADERS),
+            ));
         }
 
         if session.req_header().method != http::Method::POST {
-            ResponseBuilder::send_proxy_error(
-                session,
+            return Ok(FilterVerdict::Reject(cors_headers(Rejection::new(
                 http::StatusCode::METHOD_NOT_ALLOWED,
-                None,
-                Some(&[
-                    ("Access-Control-Allow-Origin", "*"),
-                    ("Access-Control-Expose-Headers", GRPC_WEB_EXPOSE_HEADERS),
-                ]),
-            )
-            .await?;
-            return Ok(true);
+            ))));
         }
 
         // `application/grpc-web-text*` carries base64-framed bodies. APISIX
@@ -219,17 +211,11 @@ impl ProxyPlugin for PluginGrpcWeb {
             .copied()
             .unwrap_or(false)
         {
-            ResponseBuilder::send_proxy_error(
-                session,
-                http::StatusCode::BAD_REQUEST,
-                Some("grpc-web-text (base64) content type is not supported"),
-                Some(&[
-                    ("Access-Control-Allow-Origin", "*"),
-                    ("Access-Control-Expose-Headers", GRPC_WEB_EXPOSE_HEADERS),
-                ]),
-            )
-            .await?;
-            return Ok(true);
+            return Ok(FilterVerdict::Reject(cors_headers(
+                Rejection::new(http::StatusCode::BAD_REQUEST)
+                    .with_body("grpc-web-text (base64) content type is not supported")
+                    .with_content_type(content_type::TEXT_PLAIN),
+            )));
         }
 
         if !ctx
@@ -237,20 +223,12 @@ impl ProxyPlugin for PluginGrpcWeb {
             .copied()
             .unwrap_or(false)
         {
-            ResponseBuilder::send_proxy_error(
-                session,
+            return Ok(FilterVerdict::Reject(cors_headers(Rejection::new(
                 http::StatusCode::BAD_REQUEST,
-                None,
-                Some(&[
-                    ("Access-Control-Allow-Origin", "*"),
-                    ("Access-Control-Expose-Headers", GRPC_WEB_EXPOSE_HEADERS),
-                ]),
-            )
-            .await?;
-            return Ok(true);
+            ))));
         }
 
-        Ok(false)
+        Ok(FilterVerdict::Continue)
     }
 
     async fn request_body_filter(

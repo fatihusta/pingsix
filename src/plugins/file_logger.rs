@@ -22,7 +22,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
 
 use crate::{
-    core::{PluginPhases, ProxyContext, ProxyError, ProxyPlugin, ProxyResult},
+    core::{ProxyContext, ProxyError, ProxyPlugin, ProxyResult},
     utils::request,
 };
 
@@ -420,10 +420,6 @@ impl ProxyPlugin for PluginFileLogger {
 
     fn priority(&self) -> i32 {
         PRIORITY
-    }
-
-    fn phases(&self) -> PluginPhases {
-        PluginPhases::LOGGING | PluginPhases::REQUEST_BODY | PluginPhases::RESPONSE_BODY
     }
 
     async fn request_body_filter(
@@ -981,10 +977,6 @@ mod tests {
             ..PluginConfig::default()
         })
         .unwrap();
-        assert_eq!(
-            plugin.phases(),
-            PluginPhases::LOGGING | PluginPhases::REQUEST_BODY | PluginPhases::RESPONSE_BODY
-        );
 
         let mut session = session_for("GET /logged HTTP/1.1\r\nHost: t\r\n\r\n").await;
         let mut ctx = ProxyContext::default();
@@ -1091,10 +1083,6 @@ mod tests {
         })
         .unwrap();
         assert!(plugin.writer.is_none());
-        assert_eq!(
-            plugin.phases(),
-            PluginPhases::LOGGING | PluginPhases::REQUEST_BODY | PluginPhases::RESPONSE_BODY
-        );
 
         let mut session = session_for("GET /legacy?token=secret HTTP/1.1\r\nHost: t\r\n\r\n").await;
         write_ok_response(&mut session).await;

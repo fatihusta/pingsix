@@ -6,7 +6,7 @@
 //! 1. Global-rule plugins run *before* route/service plugins.
 //! 2. Within each layer, plugins run in priority-descending order.
 //! 3. A global plugin that short-circuits the request (`request_filter`
-//!    returns `Ok(true)`) prevents any route plugin — including
+//!    returns `FilterVerdict::Reject`) prevents any route plugin — including
 //!    authentication plugins — from running. This is intentional: it lets
 //!    global redirect/echo rules respond early, but it also means a global
 //!    short-circuit can bypass route-level auth. Do not mix the two.
@@ -27,12 +27,13 @@ use pingora_http::RequestHeader;
 use pingora_proxy::Session;
 
 use pingsix::core::{
-    CompiledPluginPipeline, PluginPhases, ProxyContext, ProxyPlugin, ProxyPluginExecutor,
+    CompiledPluginPipeline, FilterVerdict, PluginEntry, PluginPhases, ProxyContext, ProxyPlugin,
+    ProxyPluginExecutor, Rejection,
 };
 
 // ---------------------------------------------------------------------------
 // Session shell over the shared mock stream (pingora `IO` with immediate EOF);
-// the stub plugins below never read from or write to the session.
+// the stub plugins below never read from the session.
 // ---------------------------------------------------------------------------
 
 fn make_session() -> Session {
@@ -57,16 +58,14 @@ impl ProxyPlugin for GlobalShortCircuit {
         1000
     }
 
-    fn phases(&self) -> PluginPhases {
-        PluginPhases::REQUEST
-    }
-
     async fn request_filter(
         &self,
         _session: &mut Session,
         _ctx: &mut ProxyContext,
-    ) -> Result<bool> {
-        Ok(true)
+    ) -> Result<FilterVerdict> {
+        Ok(FilterVerdict::Reject(Rejection::new(
+            http::StatusCode::FORBIDDEN,
+        )))
     }
 }
 
@@ -89,8 +88,9 @@ struct RouteAuthRecorder {
     called: Arc<AtomicBool>,
 }
 
-/// Deliberately implements a hook without declaring its phase. Phase metadata
-/// is an explicit, fail-closed plugin contract: this hook must not run.
+/// Implements a hook whose phase is deliberately NOT declared at construction:
+/// phase metadata is an explicit, fail-closed construction contract (T10), so
+/// this hook must not run when the entry carries no REQUEST bit.
 struct UndeclaredRequestHook {
     called: Arc<AtomicBool>,
 }
@@ -109,9 +109,9 @@ impl ProxyPlugin for UndeclaredRequestHook {
         &self,
         _session: &mut Session,
         _ctx: &mut ProxyContext,
-    ) -> Result<bool> {
+    ) -> Result<FilterVerdict> {
         self.called.store(true, Ordering::SeqCst);
-        Ok(false)
+        Ok(FilterVerdict::Continue)
     }
 }
 
@@ -125,17 +125,13 @@ impl ProxyPlugin for RouteAuthRecorder {
         100
     }
 
-    fn phases(&self) -> PluginPhases {
-        PluginPhases::REQUEST
-    }
-
     async fn request_filter(
         &self,
         _session: &mut Session,
         _ctx: &mut ProxyContext,
-    ) -> Result<bool> {
+    ) -> Result<FilterVerdict> {
         self.called.store(true, Ordering::SeqCst);
-        Ok(false)
+        Ok(FilterVerdict::Continue)
     }
 }
 
@@ -143,8 +139,8 @@ impl ProxyPlugin for RouteAuthRecorder {
 struct RecordingPlugin {
     layer: &'static str,
     log: Arc<Mutex<Vec<String>>>,
-    /// If set, `request_filter` returns this value instead of `false`.
-    short_circuit: Option<bool>,
+    /// If set, `request_filter` returns a rejection (short-circuit).
+    short_circuit: bool,
     /// If set, `early_request_filter` fails with this message.
     fail_early: Option<&'static str>,
 }
@@ -168,10 +164,6 @@ impl ProxyPlugin for RecordingPlugin {
         500
     }
 
-    fn phases(&self) -> PluginPhases {
-        PluginPhases::ALL
-    }
-
     async fn early_request_filter(
         &self,
         _session: &mut Session,
@@ -188,9 +180,14 @@ impl ProxyPlugin for RecordingPlugin {
         &self,
         _session: &mut Session,
         _ctx: &mut ProxyContext,
-    ) -> Result<bool> {
+    ) -> Result<FilterVerdict> {
         self.record("request");
-        Ok(self.short_circuit.unwrap_or(false))
+        if self.short_circuit {
+            return Ok(FilterVerdict::Reject(Rejection::new(
+                http::StatusCode::FORBIDDEN,
+            )));
+        }
+        Ok(FilterVerdict::Continue)
     }
 
     async fn upstream_request_filter(
@@ -234,6 +231,11 @@ impl ProxyPlugin for RecordingPlugin {
     }
 }
 
+/// Wrap a stub plugin with its phase declaration (the T10 construction datum).
+fn declared(plugin: Arc<dyn ProxyPlugin>, phases: PluginPhases) -> PluginEntry {
+    PluginEntry::new(plugin, phases)
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -242,11 +244,15 @@ impl ProxyPlugin for RecordingPlugin {
 async fn global_short_circuit_skips_route_plugins() {
     let auth_called = Arc::new(AtomicBool::new(false));
 
-    let global = Arc::new(ProxyPluginExecutor::new(vec![Arc::new(GlobalShortCircuit)]));
-    let route = Arc::new(ProxyPluginExecutor::new(vec![Arc::new(
-        RouteAuthRecorder {
+    let global = Arc::new(ProxyPluginExecutor::new(vec![declared(
+        Arc::new(GlobalShortCircuit),
+        PluginPhases::REQUEST,
+    )]));
+    let route = Arc::new(ProxyPluginExecutor::new(vec![declared(
+        Arc::new(RouteAuthRecorder {
             called: auth_called.clone(),
-        },
+        }),
+        PluginPhases::REQUEST,
     )]));
     let pipeline = CompiledPluginPipeline::new(global, route);
 
@@ -273,10 +279,12 @@ async fn undeclared_phase_hook_is_not_executed() {
     let called = Arc::new(AtomicBool::new(false));
     let pipeline = CompiledPluginPipeline::new(
         Arc::new(ProxyPluginExecutor::default()),
-        Arc::new(ProxyPluginExecutor::new(vec![Arc::new(
-            UndeclaredRequestHook {
+        Arc::new(ProxyPluginExecutor::new(vec![declared(
+            Arc::new(UndeclaredRequestHook {
                 called: called.clone(),
-            },
+            }),
+            // The hook exists but its phase is not declared (fail-closed).
+            PluginPhases::empty(),
         )])),
     );
     let mut session = make_session();
@@ -296,11 +304,15 @@ async fn undeclared_phase_hook_is_not_executed() {
 async fn route_plugins_run_when_global_does_not_short_circuit() {
     let auth_called = Arc::new(AtomicBool::new(false));
 
-    let global = Arc::new(ProxyPluginExecutor::new(vec![Arc::new(GlobalNoop)]));
-    let route = Arc::new(ProxyPluginExecutor::new(vec![Arc::new(
-        RouteAuthRecorder {
+    let global = Arc::new(ProxyPluginExecutor::new(vec![declared(
+        Arc::new(GlobalNoop),
+        PluginPhases::REQUEST,
+    )]));
+    let route = Arc::new(ProxyPluginExecutor::new(vec![declared(
+        Arc::new(RouteAuthRecorder {
             called: auth_called.clone(),
-        },
+        }),
+        PluginPhases::REQUEST,
     )]));
     let pipeline = CompiledPluginPipeline::new(global, route);
 
@@ -326,18 +338,24 @@ async fn route_plugins_run_when_global_does_not_short_circuit() {
 #[tokio::test]
 async fn every_phase_traverses_global_then_route() {
     let log = Arc::new(Mutex::new(Vec::new()));
-    let global = Arc::new(ProxyPluginExecutor::new(vec![Arc::new(RecordingPlugin {
-        layer: "global",
-        log: log.clone(),
-        short_circuit: None,
-        fail_early: None,
-    })]));
-    let route = Arc::new(ProxyPluginExecutor::new(vec![Arc::new(RecordingPlugin {
-        layer: "route",
-        log: log.clone(),
-        short_circuit: None,
-        fail_early: None,
-    })]));
+    let global = Arc::new(ProxyPluginExecutor::new(vec![declared(
+        Arc::new(RecordingPlugin {
+            layer: "global",
+            log: log.clone(),
+            short_circuit: false,
+            fail_early: None,
+        }),
+        PluginPhases::ALL,
+    )]));
+    let route = Arc::new(ProxyPluginExecutor::new(vec![declared(
+        Arc::new(RecordingPlugin {
+            layer: "route",
+            log: log.clone(),
+            short_circuit: false,
+            fail_early: None,
+        }),
+        PluginPhases::ALL,
+    )]));
     let pipeline = CompiledPluginPipeline::new(global, route);
 
     let mut session = make_session();
@@ -393,18 +411,24 @@ async fn every_phase_traverses_global_then_route() {
 #[tokio::test]
 async fn global_phase_error_aborts_phase_and_propagates() {
     let log = Arc::new(Mutex::new(Vec::new()));
-    let global = Arc::new(ProxyPluginExecutor::new(vec![Arc::new(RecordingPlugin {
-        layer: "global",
-        log: log.clone(),
-        short_circuit: None,
-        fail_early: Some("global early failure"),
-    })]));
-    let route = Arc::new(ProxyPluginExecutor::new(vec![Arc::new(RecordingPlugin {
-        layer: "route",
-        log: log.clone(),
-        short_circuit: None,
-        fail_early: None,
-    })]));
+    let global = Arc::new(ProxyPluginExecutor::new(vec![declared(
+        Arc::new(RecordingPlugin {
+            layer: "global",
+            log: log.clone(),
+            short_circuit: false,
+            fail_early: Some("global early failure"),
+        }),
+        PluginPhases::ALL,
+    )]));
+    let route = Arc::new(ProxyPluginExecutor::new(vec![declared(
+        Arc::new(RecordingPlugin {
+            layer: "route",
+            log: log.clone(),
+            short_circuit: false,
+            fail_early: None,
+        }),
+        PluginPhases::ALL,
+    )]));
     let pipeline = CompiledPluginPipeline::new(global, route);
 
     let mut session = make_session();
@@ -432,28 +456,31 @@ async fn global_phase_error_aborts_phase_and_propagates() {
 #[tokio::test]
 async fn route_layer_short_circuit_runs_after_global_and_stops_route_chain() {
     let log = Arc::new(Mutex::new(Vec::new()));
-    let global = Arc::new(ProxyPluginExecutor::new(vec![Arc::new(RecordingPlugin {
-        layer: "global",
-        log: log.clone(),
-        short_circuit: None,
-        fail_early: None,
-    })]));
+    let global = Arc::new(ProxyPluginExecutor::new(vec![declared(
+        Arc::new(RecordingPlugin {
+            layer: "global",
+            log: log.clone(),
+            short_circuit: false,
+            fail_early: None,
+        }),
+        PluginPhases::ALL,
+    )]));
     // First route plugin short-circuits; the second must never run.
     let short_route = RecordingPlugin {
         layer: "route-a",
         log: log.clone(),
-        short_circuit: Some(true),
+        short_circuit: true,
         fail_early: None,
     };
     let late_route = RecordingPlugin {
         layer: "route-b",
         log: log.clone(),
-        short_circuit: None,
+        short_circuit: false,
         fail_early: None,
     };
     let route = Arc::new(ProxyPluginExecutor::from_sorted(vec![
-        Arc::new(short_route),
-        Arc::new(late_route),
+        declared(Arc::new(short_route), PluginPhases::ALL),
+        declared(Arc::new(late_route), PluginPhases::ALL),
     ]));
     let pipeline = CompiledPluginPipeline::new(global, route);
 
@@ -477,24 +504,27 @@ async fn route_layer_short_circuit_runs_after_global_and_stops_route_chain() {
 /// Executors built from mixed input orders are always sorted by priority.
 #[test]
 fn executor_sorts_unsorted_input_deterministically() {
-    let low = Arc::new(RecordingPlugin {
+    let low: Arc<dyn ProxyPlugin> = Arc::new(RecordingPlugin {
         layer: "low",
         log: Arc::new(Mutex::new(Vec::new())),
-        short_circuit: None,
+        short_circuit: false,
         fail_early: None,
-    }) as Arc<dyn ProxyPlugin>;
-    let high = Arc::new(RecordingPlugin {
+    });
+    let high: Arc<dyn ProxyPlugin> = Arc::new(RecordingPlugin {
         layer: "high",
         log: Arc::new(Mutex::new(Vec::new())),
-        short_circuit: None,
+        short_circuit: false,
         fail_early: None,
-    }) as Arc<dyn ProxyPlugin>;
-    let executor = ProxyPluginExecutor::new(vec![low, high]);
-    let names: Vec<&str> = executor.plugins().iter().map(|p| p.name()).collect();
+    });
+    let executor = ProxyPluginExecutor::new(vec![
+        declared(low, PluginPhases::REQUEST),
+        declared(high, PluginPhases::REQUEST),
+    ]);
+    let names: Vec<&str> = executor.plugins().iter().map(|e| e.name()).collect();
     assert_eq!(names, vec!["recorder", "recorder"]);
     // Both plugins share priority 500; deterministic name tie-break keeps a
     // stable order regardless of insertion order.
-    let priorities: Vec<i32> = executor.plugins().iter().map(|p| p.priority()).collect();
+    let priorities: Vec<i32> = executor.plugins().iter().map(|e| e.priority()).collect();
     assert!(priorities.windows(2).all(|w| w[0] >= w[1]));
 }
 

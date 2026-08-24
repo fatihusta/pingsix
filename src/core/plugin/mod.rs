@@ -10,6 +10,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use bytes::Bytes;
+use http::StatusCode;
 use pingora_core::upstreams::peer::HttpPeer;
 use pingora_error::{Error, Result};
 use pingora_http::{RequestHeader, ResponseHeader};
@@ -21,6 +22,152 @@ use crate::core::error::ProxyResult;
 pub use pipeline::{
     CompiledPluginPipeline, ProxyContext, ProxyPluginExecutor, RouteContext, RouteLabels,
 };
+
+// ---------------------------------------------------------------------------
+// T10 frozen contract — the plugin request-phase rejection contract.
+//
+// These definitions are the single sanctioned shape plugin rejections take.
+// Reshaping them requires a coordinated update of every plugin (T11 groups)
+// and the docs (T12); do not change them casually. The wire behavior they
+// induce (one write through `utils::response::send_exit_response`, so
+// `exit-transformer` rules apply uniformly) is pinned by
+// `tests/plugin_gateway_rejections.rs`.
+// ---------------------------------------------------------------------------
+
+/// Verdict returned by [`ProxyPlugin::request_filter`] (T10 frozen contract).
+///
+/// A plugin NEVER writes a rejection response to the session itself: it
+/// returns a value, and the compiled pipeline writes it through the shared
+/// exit-response helper exactly once. "The plugin remembered the transform" is
+/// therefore unrepresentable — `exit-transformer` rules apply uniformly to
+/// every gateway-generated rejection.
+#[derive(Debug)]
+pub enum FilterVerdict {
+    /// The request proceeds: remaining plugins in the layer run, then routing/
+    /// proxying continues.
+    Continue,
+    /// The request is short-circuited with a gateway-generated response. The
+    /// pipeline writes it; remaining plugins in the layer do not run.
+    Reject(Rejection),
+}
+
+/// A gateway-generated rejection response, as a plain value (T10 frozen
+/// contract).
+///
+/// Carries everything the two historical write helpers
+/// (`send_exit_response` / the deleted `ResponseBuilder::send_proxy_error`)
+/// accepted at their call sites. The pipeline renders it through
+/// `send_exit_response`, so the uniform behaviors (1xx/204/304 body strip,
+/// close-delimited keep-alive fix, `$status`/`$message`/`$request_id`
+/// templating, `exit-transformer` rules) apply to every plugin equally.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Rejection {
+    /// HTTP status of the rejection (`exit-transformer` matches on this code).
+    pub status: StatusCode,
+    /// Optional response body. `exit-transformer` templates it as `$message`.
+    pub body: Option<String>,
+    /// Content-Type for the body. Only emitted when a non-empty body is sent.
+    pub content_type: Option<String>,
+    /// Extra response headers (appended verbatim, in order).
+    pub headers: Vec<(String, String)>,
+    /// `true` drops downstream keep-alive after the response (Pingora closes
+    /// the connection). Mirrors limit-count's historical
+    /// `session.set_keepalive(None)` on 429s; the pipeline applies it because
+    /// it owns the session at write time, not the plugin.
+    pub close_connection: bool,
+}
+
+impl Rejection {
+    /// A bodyless rejection with the given status.
+    pub fn new(status: StatusCode) -> Self {
+        Self {
+            status,
+            body: None,
+            content_type: None,
+            headers: Vec::new(),
+            close_connection: false,
+        }
+    }
+
+    /// Attach a response body.
+    pub fn with_body(mut self, body: impl Into<String>) -> Self {
+        self.body = Some(body.into());
+        self
+    }
+
+    /// Set the body's content type (only emitted when a body is sent).
+    pub fn with_content_type(mut self, content_type: impl Into<String>) -> Self {
+        self.content_type = Some(content_type.into());
+        self
+    }
+
+    /// Append one response header.
+    pub fn with_header(mut self, name: impl Into<String>, value: impl Into<String>) -> Self {
+        self.headers.push((name.into(), value.into()));
+        self
+    }
+
+    /// Append response headers, preserving order.
+    pub fn with_headers(mut self, headers: impl IntoIterator<Item = (String, String)>) -> Self {
+        self.headers.extend(headers);
+        self
+    }
+
+    /// Mark the downstream connection for closure after the response.
+    pub fn with_close_connection(mut self) -> Self {
+        self.close_connection = true;
+        self
+    }
+
+    /// Adapt an already-assembled, bodyless [`ResponseHeader`] into a
+    /// rejection. Bridge for plugins whose rejection header sets are built by
+    /// shared helpers operating on a `ResponseHeader` (e.g. CORS preflight);
+    /// new code should construct `Rejection` values directly.
+    pub fn from_response_header(resp: &ResponseHeader) -> Self {
+        let mut rejection = Self::new(resp.status);
+        for (name, value) in resp.headers.iter() {
+            rejection.headers.push((
+                name.as_str().to_string(),
+                String::from_utf8_lossy(value.as_bytes()).into_owned(),
+            ));
+        }
+        rejection
+    }
+}
+
+/// A plugin instance paired with the lifecycle phases it declares (T10 frozen
+/// contract).
+///
+/// This is the external-plugin escape hatch for phases: [`ProxyPlugin`] is a
+/// public trait implementable outside the crate, so hook-phase declarations
+/// are construction data rather than a trait method (which would let the
+/// declaration silently disagree with the implemented hooks). Builtin plugins
+/// get their phases from `PLUGIN_META`; embedders constructing a
+/// [`ProxyPluginExecutor`] with their own plugins pass
+/// `PluginEntry::new(plugin, PHASES)` per plugin.
+#[derive(Clone)]
+pub struct PluginEntry {
+    /// The plugin instance.
+    pub plugin: Arc<dyn ProxyPlugin>,
+    /// The lifecycle phases the executor must partition this plugin into.
+    pub phases: PluginPhases,
+}
+
+impl PluginEntry {
+    pub fn new(plugin: Arc<dyn ProxyPlugin>, phases: PluginPhases) -> Self {
+        Self { plugin, phases }
+    }
+
+    /// Plugin name (forwarded for ordering and lookup).
+    pub fn name(&self) -> &str {
+        self.plugin.name()
+    }
+
+    /// Plugin priority (forwarded for ordering).
+    pub fn priority(&self) -> i32 {
+        self.plugin.priority()
+    }
+}
 pub use rewrite::apply_regex_uri_template;
 pub use upstream::{
     HealthCheckFingerprint, HealthCheckSpec, PassiveOutcome, SelectedUpstream, UpstreamSelection,
@@ -125,6 +272,24 @@ pub type PluginCreateFn =
 /// The core plugin trait that defines the lifecycle hooks for proxy plugins.
 ///
 /// Plugin execution follows APISIX's phase model for consistency with existing ecosystems.
+///
+/// # Phase declaration (T10)
+///
+/// The executor invokes a plugin's hook only if the phase was declared at
+/// construction time, so a plugin whose declaration disagrees with its hooks
+/// cannot be wired accidentally: builtin plugins declare phases once in
+/// `PLUGIN_META` (`src/plugins/mod.rs`); embedders implementing this trait
+/// outside the crate declare phases per plugin when building a
+/// [`ProxyPluginExecutor`], via [`PluginEntry::new`]. There is deliberately no
+/// `phases()` method on this trait.
+///
+/// # Request-phase rejection (T10)
+///
+/// `request_filter` returns a [`FilterVerdict`]: [`FilterVerdict::Continue`]
+/// to proceed, [`FilterVerdict::Reject`] to short-circuit with a
+/// gateway-generated response the pipeline writes on the plugin's behalf.
+/// Plugins must never write rejection responses to the session from
+/// `request_filter` themselves.
 #[async_trait]
 pub trait ProxyPlugin: Send + Sync {
     /// Return the name of this plugin.
@@ -132,13 +297,6 @@ pub trait ProxyPlugin: Send + Sync {
 
     /// Return the priority of this plugin.
     fn priority(&self) -> i32;
-
-    /// Phases this plugin implements. The executor only invokes hooks listed
-    /// here. Default is empty so a plugin that forgets to declare phases is a
-    /// silent no-op — built-ins and tests must override this.
-    fn phases(&self) -> PluginPhases {
-        PluginPhases::empty()
-    }
 
     /// Typed health-check specs with stable fingerprints for incremental
     /// reconcile. Only plugins that own background maintenance register here;
@@ -162,12 +320,17 @@ pub trait ProxyPlugin: Send + Sync {
     /// Use this phase for: request validation, authentication, rate limiting,
     /// access control, and early response generation.
     /// Corresponds to APISIX's rewrite/access phase.
+    ///
+    /// Return [`FilterVerdict::Reject`] to short-circuit the request with a
+    /// gateway-generated response; the pipeline writes it through the shared
+    /// exit-response helper exactly once (so `exit-transformer` applies
+    /// uniformly) and skips the remaining plugins in the layer.
     async fn request_filter(
         &self,
         _session: &mut Session,
         _ctx: &mut ProxyContext,
-    ) -> Result<bool> {
-        Ok(false)
+    ) -> Result<FilterVerdict> {
+        Ok(FilterVerdict::Continue)
     }
 
     /// Handle the incoming request before any downstream processing.
@@ -264,11 +427,11 @@ pub trait ProxyPlugin: Send + Sync {
     async fn logging(&self, _session: &mut Session, _e: Option<&Error>, _ctx: &mut ProxyContext) {}
 }
 
-/// Sort proxy plugins deterministically by:
+/// Sort plugin entries deterministically by:
 /// - higher priority first
 /// - for ties, sort by plugin name
-pub fn sort_plugins_by_priority_desc(plugins: &mut [Arc<dyn ProxyPlugin>]) {
-    plugins.sort_by(|a, b| {
+pub fn sort_plugins_by_priority_desc(entries: &mut [PluginEntry]) {
+    entries.sort_by(|a, b| {
         b.priority()
             .cmp(&a.priority())
             .then_with(|| a.name().cmp(b.name()))

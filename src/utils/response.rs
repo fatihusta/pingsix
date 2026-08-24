@@ -10,7 +10,7 @@ use pingora_http::ResponseHeader;
 use pingora_proxy::Session;
 use serde::Serialize;
 
-use crate::core::{ExitTransform, ProxyContext};
+use crate::core::{ExitTransform, ProxyContext, Rejection};
 
 /// Standard content types
 pub mod content_type {
@@ -69,49 +69,6 @@ impl ResponseBuilder {
                 )
             }
         }
-    }
-
-    /// Build a proxy ResponseHeader for plugins
-    pub fn build_proxy_response(
-        status: StatusCode,
-        message: Option<&str>,
-        headers: Option<&[(&str, &str)]>,
-    ) -> Result<ResponseHeader> {
-        let mut resp = ResponseHeader::build(status, None)?;
-
-        if let Some(msg) = message {
-            resp.insert_header(header::CONTENT_LENGTH, msg.len().to_string())?;
-            resp.insert_header(header::CONTENT_TYPE, content_type::TEXT_PLAIN)?;
-        }
-
-        if let Some(hdrs) = headers {
-            for (name, value) in hdrs {
-                resp.insert_header(name.to_string(), value.to_string())?;
-            }
-        }
-
-        Ok(resp)
-    }
-
-    /// Send a proxy error response for plugins
-    pub async fn send_proxy_error(
-        session: &mut Session,
-        status: StatusCode,
-        message: Option<&str>,
-        headers: Option<&[(&str, &str)]>,
-    ) -> Result<()> {
-        let resp = Self::build_proxy_response(status, message, headers)?;
-        session
-            .write_response_header(Box::new(resp), message.is_none())
-            .await?;
-
-        if let Some(msg) = message {
-            session
-                .write_response_body(Some(Bytes::copy_from_slice(msg.as_bytes())), true)
-                .await?;
-        }
-
-        Ok(())
     }
 }
 
@@ -270,6 +227,31 @@ pub(crate) async fn send_exit_response(
     }
 
     Ok(())
+}
+
+/// Write a plugin-returned [`Rejection`] through the unified exit path (T10).
+///
+/// The single rendering site for plugin-request-phase rejections: called by
+/// [`crate::core::CompiledPluginPipeline::request_filter`] when a plugin
+/// returns `FilterVerdict::Reject`. Plugins never call this — they return
+/// values; the pipeline owns the session.
+pub(crate) async fn send_rejection(
+    session: &mut Session,
+    rejection: &Rejection,
+    ctx: &ProxyContext,
+) -> Result<()> {
+    if rejection.close_connection {
+        session.set_keepalive(None);
+    }
+    send_exit_response(
+        session,
+        rejection.status.as_u16(),
+        rejection.body.as_deref(),
+        rejection.content_type.as_deref(),
+        &rejection.headers,
+        ctx,
+    )
+    .await
 }
 
 /// Common error response helpers

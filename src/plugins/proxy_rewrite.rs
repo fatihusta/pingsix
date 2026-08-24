@@ -11,9 +11,7 @@ use serde_json::Value as JsonValue;
 use validator::{Validate, ValidationError};
 
 use crate::{
-    core::{
-        apply_regex_uri_template, PluginPhases, ProxyContext, ProxyError, ProxyPlugin, ProxyResult,
-    },
+    core::{apply_regex_uri_template, ProxyContext, ProxyError, ProxyPlugin, ProxyResult},
     plugins::config::parse_and_validate_plugin_config,
 };
 
@@ -330,10 +328,6 @@ impl ProxyPlugin for PluginProxyRewrite {
     fn priority(&self) -> i32 {
         PRIORITY
     }
-    fn phases(&self) -> PluginPhases {
-        PluginPhases::UPSTREAM_REQUEST
-    }
-
     async fn upstream_request_filter(
         &self,
         session: &mut Session,

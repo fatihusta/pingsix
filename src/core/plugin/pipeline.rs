@@ -17,7 +17,7 @@ use pingora_proxy::Session;
 use crate::core::error::ProxyResult;
 
 use super::upstream::{SelectedUpstream, UpstreamSelection, UpstreamSelector};
-use super::{sort_plugins_by_priority_desc, PluginPhases, ProxyPlugin};
+use super::{sort_plugins_by_priority_desc, FilterVerdict, PluginEntry, PluginPhases, ProxyPlugin};
 
 /// Context key for the generic "request body was replaced by a plugin" marker
 /// (see [`ProxyContext::mark_request_body_replaced`]).
@@ -288,8 +288,9 @@ static DEFAULT_PLUGIN_EXECUTOR: Lazy<Arc<ProxyPluginExecutor>> =
 /// accident.
 #[derive(Default)]
 pub struct ProxyPluginExecutor {
-    /// Plugins in deterministic execution order (priority descending).
-    plugins: Vec<Arc<dyn ProxyPlugin>>,
+    /// Plugin entries (instance + declared phases) in deterministic execution
+    /// order (priority descending).
+    plugins: Vec<PluginEntry>,
     early_request: Vec<Arc<dyn ProxyPlugin>>,
     request: Vec<Arc<dyn ProxyPlugin>>,
     upstream_request: Vec<Arc<dyn ProxyPlugin>>,
@@ -328,19 +329,19 @@ macro_rules! for_each_plugin_async_unit {
 }
 
 impl ProxyPluginExecutor {
-    /// Sort plugins deterministically (priority desc, then name asc) and build.
-    pub fn new(plugins: Vec<Arc<dyn ProxyPlugin>>) -> Self {
+    /// Sort plugin entries deterministically (priority desc, then name asc) and build.
+    pub fn new(plugins: Vec<PluginEntry>) -> Self {
         let mut plugins = plugins;
         sort_plugins_by_priority_desc(&mut plugins);
         Self::from_sorted(plugins)
     }
 
-    /// Build from an already-ordered plugin list.
+    /// Build from an already-ordered entry list.
     ///
     /// The precondition is a non-increasing priority sequence; tie order is
     /// whatever the caller produced (e.g. the route-over-service merge prefers
     /// the route side on equal priority). In debug builds this is asserted.
-    pub fn from_sorted(plugins: Vec<Arc<dyn ProxyPlugin>>) -> Self {
+    pub fn from_sorted(plugins: Vec<PluginEntry>) -> Self {
         debug_assert!(
             plugins
                 .windows(2)
@@ -355,8 +356,9 @@ impl ProxyPluginExecutor {
         let mut response_body = Vec::new();
         let mut logging = Vec::new();
         let mut upstream_peer = Vec::new();
-        for plugin in &plugins {
-            let phases = plugin.phases();
+        for entry in &plugins {
+            let phases = entry.phases;
+            let plugin = &entry.plugin;
             if phases.contains(PluginPhases::EARLY_REQUEST) {
                 early_request.push(plugin.clone());
             }
@@ -396,18 +398,47 @@ impl ProxyPluginExecutor {
     }
 
     pub fn has_plugin(&self, name: &str) -> bool {
-        self.plugins.iter().any(|plugin| plugin.name() == name)
+        self.plugins.iter().any(|entry| entry.name() == name)
+    }
+
+    /// Whether the plugin named `name` was partitioned into `phase` at
+    /// construction. A single-bit `PluginPhases` identifies one partition.
+    ///
+    /// Exposed so construction wiring (builtin `PLUGIN_META` phases, embedder
+    /// declarations) can be asserted through the public API instead of
+    /// mirroring data; also useful for diagnostics.
+    pub fn has_plugin_in_phase(&self, name: &str, phase: PluginPhases) -> bool {
+        let partition: &[Arc<dyn ProxyPlugin>] = if phase == PluginPhases::EARLY_REQUEST {
+            &self.early_request
+        } else if phase == PluginPhases::REQUEST {
+            &self.request
+        } else if phase == PluginPhases::UPSTREAM_REQUEST {
+            &self.upstream_request
+        } else if phase == PluginPhases::REQUEST_BODY {
+            &self.request_body
+        } else if phase == PluginPhases::RESPONSE {
+            &self.response
+        } else if phase == PluginPhases::RESPONSE_BODY {
+            &self.response_body
+        } else if phase == PluginPhases::LOGGING {
+            &self.logging
+        } else if phase == PluginPhases::UPSTREAM_PEER {
+            &self.upstream_peer
+        } else {
+            panic!("has_plugin_in_phase expects a single-phase constant")
+        };
+        partition.iter().any(|plugin| plugin.name() == name)
     }
 
     /// Gateway-exit transformation rules contributed by a plugin in this layer.
     pub fn exit_transform(&self) -> Option<&crate::core::ExitTransform> {
         self.plugins
             .iter()
-            .find_map(|plugin| plugin.exit_transform())
+            .find_map(|entry| entry.plugin.exit_transform())
     }
 
-    /// Read-only access to the ordered plugin list.
-    pub fn plugins(&self) -> &[Arc<dyn ProxyPlugin>] {
+    /// Read-only access to the ordered plugin entries.
+    pub fn plugins(&self) -> &[PluginEntry] {
         &self.plugins
     }
 
@@ -427,17 +458,21 @@ impl ProxyPlugin for ProxyPluginExecutor {
         0
     }
 
-    fn phases(&self) -> PluginPhases {
-        PluginPhases::ALL
-    }
-
-    async fn request_filter(&self, session: &mut Session, ctx: &mut ProxyContext) -> Result<bool> {
+    /// Aggregate this layer's request-phase plugins into one verdict: the
+    /// first non-`Continue` verdict wins; the pipeline (not this layer) owns
+    /// writing the rejection to the session.
+    async fn request_filter(
+        &self,
+        session: &mut Session,
+        ctx: &mut ProxyContext,
+    ) -> Result<FilterVerdict> {
         for plugin in self.request.iter() {
-            if plugin.request_filter(session, ctx).await? {
-                return Ok(true);
+            match plugin.request_filter(session, ctx).await? {
+                FilterVerdict::Continue => {}
+                verdict => return Ok(verdict),
             }
         }
-        Ok(false)
+        Ok(FilterVerdict::Continue)
     }
 
     async fn early_request_filter(
@@ -599,16 +634,28 @@ impl CompiledPluginPipeline {
     /// Run global-rule plugins then route/service plugins for `request_filter`.
     ///
     /// Returns `true` when a plugin short-circuits the request. Global plugins
-    /// run first; a global short-circuit skips the route layer entirely.
+    /// run first; a global rejection skips the route layer entirely.
+    ///
+    /// The single write choke point for plugin short-circuits: a returned
+    /// [`FilterVerdict::Reject`] is written through the shared exit-response
+    /// helper exactly once, so `exit-transformer` rules apply to every plugin
+    /// rejection (T10 contract).
     pub async fn request_filter(
         &self,
         session: &mut Session,
         ctx: &mut ProxyContext,
     ) -> Result<bool> {
-        if self.global.request_filter(session, ctx).await? {
-            return Ok(true);
+        let verdict = match self.global.request_filter(session, ctx).await? {
+            FilterVerdict::Continue => self.route.request_filter(session, ctx).await?,
+            verdict => verdict,
+        };
+        match verdict {
+            FilterVerdict::Continue => Ok(false),
+            FilterVerdict::Reject(rejection) => {
+                crate::utils::response::send_rejection(session, &rejection, ctx).await?;
+                Ok(true)
+            }
         }
-        self.route.request_filter(session, ctx).await
     }
 
     /// Run global-rule plugins then route/service plugins for `upstream_request_filter`.
@@ -707,10 +754,6 @@ mod tests {
         fn priority(&self) -> i32 {
             0
         }
-
-        fn phases(&self) -> PluginPhases {
-            PluginPhases::RESPONSE_BODY
-        }
     }
 
     struct LoggingOnlyPlugin;
@@ -724,15 +767,14 @@ mod tests {
         fn priority(&self) -> i32 {
             0
         }
-
-        fn phases(&self) -> PluginPhases {
-            PluginPhases::LOGGING
-        }
     }
 
     #[test]
     fn test_executor_partitions_response_body_phase() {
-        let executor = ProxyPluginExecutor::new(vec![Arc::new(BodyFilterPlugin)]);
+        let executor = ProxyPluginExecutor::new(vec![PluginEntry::new(
+            Arc::new(BodyFilterPlugin),
+            PluginPhases::RESPONSE_BODY,
+        )]);
         assert!(executor.request.is_empty());
         assert_eq!(executor.response_body.len(), 1);
     }
@@ -788,10 +830,6 @@ mod tests {
                 0
             }
 
-            fn phases(&self) -> PluginPhases {
-                PluginPhases::UPSTREAM_PEER
-            }
-
             fn upstream_peer_filter(
                 &self,
                 _session: &mut Session,
@@ -805,20 +843,26 @@ mod tests {
             }
         }
 
-        let executor = ProxyPluginExecutor::new(vec![Arc::new(PeerPlugin {
-            name: "route-peer",
-            marker: "r",
-        })]);
+        let executor = ProxyPluginExecutor::new(vec![PluginEntry::new(
+            Arc::new(PeerPlugin {
+                name: "route-peer",
+                marker: "r",
+            }),
+            PluginPhases::UPSTREAM_PEER,
+        )]);
         assert!(executor.request.is_empty());
         assert_eq!(executor.upstream_peer.len(), 1);
 
         // Pipeline traversal: global layer runs before the route layer and
         // both partitions are consulted for the new phase.
         let mut peer = HttpPeer::new("127.0.0.1:9443", true, "provider.internal".to_string());
-        let global = Arc::new(ProxyPluginExecutor::new(vec![Arc::new(PeerPlugin {
-            name: "global-peer",
-            marker: "g",
-        })]));
+        let global = Arc::new(ProxyPluginExecutor::new(vec![PluginEntry::new(
+            Arc::new(PeerPlugin {
+                name: "global-peer",
+                marker: "g",
+            }),
+            PluginPhases::UPSTREAM_PEER,
+        )]));
         let pipeline = CompiledPluginPipeline::new(global, Arc::new(executor));
         let mut ctx = ProxyContext::default();
         let mut session = noop_session();
@@ -831,7 +875,10 @@ mod tests {
 
     #[test]
     fn logging_only_plugin_is_skipped_on_request_phase() {
-        let executor = ProxyPluginExecutor::new(vec![Arc::new(LoggingOnlyPlugin)]);
+        let executor = ProxyPluginExecutor::new(vec![PluginEntry::new(
+            Arc::new(LoggingOnlyPlugin),
+            PluginPhases::LOGGING,
+        )]);
         assert!(executor.request.is_empty());
         assert!(executor.early_request.is_empty());
         assert_eq!(executor.logging.len(), 1);
@@ -841,29 +888,42 @@ mod tests {
 
     #[test]
     fn new_sorts_plugins_by_priority_desc() {
-        let low: Arc<dyn ProxyPlugin> = Arc::new(DummyPlugin {
-            name: "low",
-            priority: 10,
-        });
-        let high: Arc<dyn ProxyPlugin> = Arc::new(DummyPlugin {
-            name: "high",
-            priority: 100,
-        });
-        let executor = ProxyPluginExecutor::new(vec![low.clone(), high.clone()]);
+        let no_hook = PluginPhases::empty();
+        let low = PluginEntry::new(
+            Arc::new(DummyPlugin {
+                name: "low",
+                priority: 10,
+            }),
+            no_hook,
+        );
+        let high = PluginEntry::new(
+            Arc::new(DummyPlugin {
+                name: "high",
+                priority: 100,
+            }),
+            no_hook,
+        );
+        let executor = ProxyPluginExecutor::new(vec![low, high]);
         let names: Vec<&str> = executor.plugins().iter().map(|p| p.name()).collect();
         assert_eq!(names, vec!["high", "low"]);
     }
 
     #[test]
     fn new_breaks_ties_by_name() {
-        let zebra: Arc<dyn ProxyPlugin> = Arc::new(DummyPlugin {
-            name: "zebra",
-            priority: 50,
-        });
-        let alpha: Arc<dyn ProxyPlugin> = Arc::new(DummyPlugin {
-            name: "alpha",
-            priority: 50,
-        });
+        let zebra = PluginEntry::new(
+            Arc::new(DummyPlugin {
+                name: "zebra",
+                priority: 50,
+            }),
+            PluginPhases::empty(),
+        );
+        let alpha = PluginEntry::new(
+            Arc::new(DummyPlugin {
+                name: "alpha",
+                priority: 50,
+            }),
+            PluginPhases::empty(),
+        );
         let executor = ProxyPluginExecutor::new(vec![zebra, alpha]);
         let names: Vec<&str> = executor.plugins().iter().map(|p| p.name()).collect();
         assert_eq!(names, vec!["alpha", "zebra"]);
@@ -883,5 +943,91 @@ mod tests {
         fn priority(&self) -> i32 {
             self.priority
         }
+    }
+
+    struct RejectingPlugin;
+
+    #[async_trait]
+    impl ProxyPlugin for RejectingPlugin {
+        fn name(&self) -> &str {
+            "rejecting"
+        }
+
+        fn priority(&self) -> i32 {
+            100
+        }
+
+        async fn request_filter(
+            &self,
+            _session: &mut Session,
+            _ctx: &mut ProxyContext,
+        ) -> Result<FilterVerdict> {
+            Ok(FilterVerdict::Reject(
+                super::super::Rejection::new(http::StatusCode::IM_A_TEAPOT)
+                    .with_body("short and stout")
+                    .with_content_type("text/plain")
+                    .with_header("X-Reject", "yes"),
+            ))
+        }
+    }
+
+    #[tokio::test]
+    async fn pipeline_writes_a_rejection_exactly_once_and_returns_true() {
+        let after_ran = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        struct Probe(std::sync::Arc<std::sync::atomic::AtomicBool>);
+        #[async_trait]
+        impl ProxyPlugin for Probe {
+            fn name(&self) -> &str {
+                "probe"
+            }
+            fn priority(&self) -> i32 {
+                1
+            }
+            async fn request_filter(
+                &self,
+                _session: &mut Session,
+                _ctx: &mut ProxyContext,
+            ) -> Result<FilterVerdict> {
+                self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+                Ok(FilterVerdict::Continue)
+            }
+        }
+
+        let route = Arc::new(ProxyPluginExecutor::new(vec![
+            PluginEntry::new(Arc::new(RejectingPlugin), PluginPhases::REQUEST),
+            PluginEntry::new(Arc::new(Probe(after_ran.clone())), PluginPhases::REQUEST),
+        ]));
+        let pipeline = CompiledPluginPipeline::new(ProxyPluginExecutor::default_shared(), route);
+        let (mut session, written) = crate::utils::testing::session_for(
+            crate::utils::testing::http_get_wire("/", &[]).as_bytes(),
+        )
+        .await;
+        let mut ctx = ProxyContext {
+            pipeline: pipeline.clone(),
+            ..ProxyContext::default()
+        };
+
+        let short_circuited = pipeline
+            .request_filter(&mut session, &mut ctx)
+            .await
+            .expect("no error");
+        assert!(short_circuited);
+        assert!(
+            !after_ran.load(std::sync::atomic::Ordering::SeqCst),
+            "a rejection stops the rest of the layer"
+        );
+        drop(session);
+        let out = String::from_utf8(written.lock().unwrap().clone()).unwrap();
+        assert!(out.starts_with("HTTP/1.1 418 "), "got: {out}");
+        assert!(
+            out.matches("418").count() >= 1 && out.contains("short and stout"),
+            "one response written: {out}"
+        );
+        assert!(out.contains("X-Reject: yes"), "got: {out}");
+        assert!(
+            !out.contains("405"),
+            "exactly one status line, one write: {out}"
+        );
+        assert_eq!(out.matches("HTTP/1.1").count(), 1, "got: {out}");
     }
 }

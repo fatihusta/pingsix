@@ -19,7 +19,7 @@ use validator::Validate;
 
 use crate::{
     config::UpstreamHashOn,
-    core::{PluginPhases, ProxyContext, ProxyError, ProxyPlugin, ProxyResult},
+    core::{ProxyContext, ProxyError, ProxyPlugin, ProxyResult},
     plugins::config::{parse_and_validate_plugin_config, HeaderValue},
     utils::{apisix_vars::match_apisix_vars, request::request_selector_key},
 };
@@ -610,10 +610,6 @@ impl ProxyPlugin for PluginResponseRewrite {
     fn priority(&self) -> i32 {
         PRIORITY
     }
-    fn phases(&self) -> PluginPhases {
-        PluginPhases::RESPONSE | PluginPhases::RESPONSE_BODY
-    }
-
     async fn response_filter(
         &self,
         session: &mut Session,

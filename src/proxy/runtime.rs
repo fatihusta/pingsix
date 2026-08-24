@@ -112,10 +112,10 @@ fn collect_health_checks(snapshot: &RuntimeSnapshot) -> Vec<HealthCheckSpec> {
                 service: upstream.health_check_service(),
             });
         }
-        for plugin in &service.plugins {
+        for entry in &service.plugins {
             targets.extend(plugin_health_checks(
                 &format!("service/{id}/plugin"),
-                plugin,
+                &entry.plugin,
             ));
         }
     }
@@ -127,15 +127,18 @@ fn collect_health_checks(snapshot: &RuntimeSnapshot) -> Vec<HealthCheckSpec> {
                 service: upstream.health_check_service(),
             });
         }
-        for plugin in &route.plugins {
-            targets.extend(plugin_health_checks(&format!("route/{id}/plugin"), plugin));
+        for entry in &route.plugins {
+            targets.extend(plugin_health_checks(
+                &format!("route/{id}/plugin"),
+                &entry.plugin,
+            ));
         }
     }
     for (id, rule) in snapshot.global_rules.iter() {
-        for plugin in &rule.plugins {
+        for entry in &rule.plugins {
             targets.extend(plugin_health_checks(
                 &format!("global-rule/{id}/plugin"),
-                plugin,
+                &entry.plugin,
             ));
         }
     }

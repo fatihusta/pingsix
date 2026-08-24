@@ -15,9 +15,12 @@ use serde_json::Value as JsonValue;
 use sha2::Sha256;
 use validator::Validate;
 
-use crate::utils::{request, response::ResponseBuilder};
+use crate::utils::{request, response::content_type};
 use crate::{
-    core::{constant_time_eq, PluginPhases, ProxyContext, ProxyError, ProxyPlugin, ProxyResult},
+    core::{
+        constant_time_eq, FilterVerdict, ProxyContext, ProxyError, ProxyPlugin, ProxyResult,
+        Rejection,
+    },
     plugins::config::parse_and_validate_plugin_config,
 };
 
@@ -207,69 +210,49 @@ impl ProxyPlugin for PluginCsrf {
     fn priority(&self) -> i32 {
         PRIORITY
     }
-    fn phases(&self) -> PluginPhases {
-        PluginPhases::REQUEST | PluginPhases::RESPONSE
-    }
-
-    async fn request_filter(&self, session: &mut Session, _ctx: &mut ProxyContext) -> Result<bool> {
+    async fn request_filter(
+        &self,
+        session: &mut Session,
+        _ctx: &mut ProxyContext,
+    ) -> Result<FilterVerdict> {
         let method = &session.req_header().method;
 
         // 1. Allow safe methods to bypass CSRF validation
         if SAFE_METHODS.contains(method) {
-            return Ok(false);
+            return Ok(FilterVerdict::Continue);
         }
+
+        let reject = |message: &'static str| {
+            FilterVerdict::Reject(
+                Rejection::new(StatusCode::UNAUTHORIZED)
+                    .with_body(message)
+                    .with_content_type(content_type::TEXT_PLAIN),
+            )
+        };
 
         // 2. Read token from headers
         let header_token = request::get_req_header_value(session.req_header(), &self.config.name);
         let Some(h_token) = header_token.filter(|t| !t.is_empty()) else {
-            ResponseBuilder::send_proxy_error(
-                session,
-                StatusCode::UNAUTHORIZED,
-                Some("no csrf token in headers"),
-                None,
-            )
-            .await?;
-            return Ok(true);
+            return Ok(reject("no csrf token in headers"));
         };
 
         // 3. Read token from cookies
         let cookie_token = request::get_cookie_value(session.req_header(), &self.config.name);
         let Some(c_token) = cookie_token else {
-            ResponseBuilder::send_proxy_error(
-                session,
-                StatusCode::UNAUTHORIZED,
-                Some("no csrf cookie"),
-                None,
-            )
-            .await?;
-            return Ok(true);
+            return Ok(reject("no csrf cookie"));
         };
 
         // 4. Double-submit consistency check
         if h_token != c_token {
-            ResponseBuilder::send_proxy_error(
-                session,
-                StatusCode::UNAUTHORIZED,
-                Some("csrf token mismatch"),
-                None,
-            )
-            .await?;
-            return Ok(true);
+            return Ok(reject("csrf token mismatch"));
         }
 
         // 5. Verify token signature and expiration
         if !self.check_token(c_token) {
-            ResponseBuilder::send_proxy_error(
-                session,
-                StatusCode::UNAUTHORIZED,
-                Some("Failed to verify the csrf token signature"),
-                None,
-            )
-            .await?;
-            return Ok(true);
+            return Ok(reject("Failed to verify the csrf token signature"));
         }
 
-        Ok(false)
+        Ok(FilterVerdict::Continue)
     }
 
     async fn response_filter(

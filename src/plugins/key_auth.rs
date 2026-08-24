@@ -11,11 +11,11 @@ use validator::Validate;
 
 use crate::{
     core::{
-        constant_time_digest_eq, secret_digest, PluginPhases, ProxyContext, ProxyError,
-        ProxyPlugin, ProxyResult,
+        constant_time_digest_eq, secret_digest, FilterVerdict, ProxyContext, ProxyError,
+        ProxyPlugin, ProxyResult, Rejection,
     },
     plugins::config::{parse_and_validate_plugin_config, validate_apisix_realm},
-    utils::{request, response::ResponseBuilder},
+    utils::{request, response::content_type},
 };
 
 pub const PLUGIN_NAME: &str = "key-auth";
@@ -155,11 +155,11 @@ impl ProxyPlugin for PluginKeyAuth {
     fn priority(&self) -> i32 {
         PRIORITY
     }
-    fn phases(&self) -> PluginPhases {
-        PluginPhases::REQUEST
-    }
-
-    async fn request_filter(&self, session: &mut Session, ctx: &mut ProxyContext) -> Result<bool> {
+    async fn request_filter(
+        &self,
+        session: &mut Session,
+        ctx: &mut ProxyContext,
+    ) -> Result<FilterVerdict> {
         // Try to extract key from header or query
         let (value, source) =
             request::get_req_header_value(session.req_header(), &self.config.header)
@@ -178,15 +178,12 @@ impl ProxyPlugin for PluginKeyAuth {
 
         // Validate key using constant-time comparison
         if value.is_empty() || !self.is_valid_key(value) {
-            let challenge = self.build_challenge();
-            ResponseBuilder::send_proxy_error(
-                session,
-                StatusCode::UNAUTHORIZED,
-                Some("Invalid user authorization"),
-                Some(&[("WWW-Authenticate", challenge.as_str())]),
-            )
-            .await?;
-            return Ok(true);
+            return Ok(FilterVerdict::Reject(
+                Rejection::new(StatusCode::UNAUTHORIZED)
+                    .with_body("Invalid user authorization")
+                    .with_content_type(content_type::TEXT_PLAIN)
+                    .with_header("WWW-Authenticate", self.build_challenge()),
+            ));
         }
 
         // Record the verified credential for shared-cache consumer
@@ -211,7 +208,7 @@ impl ProxyPlugin for PluginKeyAuth {
             }
         }
 
-        Ok(false)
+        Ok(FilterVerdict::Continue)
     }
 }
 

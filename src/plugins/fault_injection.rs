@@ -1,10 +1,8 @@
 use std::{collections::HashMap, sync::Arc, time::Duration};
 
 use async_trait::async_trait;
-use bytes::Bytes;
-use http::{header, StatusCode};
+use http::StatusCode;
 use pingora_error::Result;
-use pingora_http::ResponseHeader;
 use pingora_proxy::Session;
 use rand::Rng;
 use serde::{Deserialize, Serialize};
@@ -12,7 +10,7 @@ use serde_json::Value as JsonValue;
 use validator::Validate;
 
 use crate::{
-    core::{PluginPhases, ProxyContext, ProxyError, ProxyPlugin, ProxyResult},
+    core::{FilterVerdict, ProxyContext, ProxyError, ProxyPlugin, ProxyResult, Rejection},
     plugins::config::parse_and_validate_plugin_config,
 };
 
@@ -194,32 +192,25 @@ impl PluginFaultInjection {
         }
     }
 
-    /// Check if request should be aborted and send abort response if needed
-    async fn check_and_abort(&self, session: &mut Session) -> Result<bool> {
+    /// Check if request should be aborted and build the abort response if so
+    fn check_and_abort(&self) -> Option<FilterVerdict> {
         if let Some(ref abort_config) = self.config.abort {
             if Self::sample_hit(abort_config.percentage) {
-                return self.send_abort_response(session, abort_config).await;
+                return Some(FilterVerdict::Reject(Self::abort_rejection(abort_config)));
             }
         }
-        Ok(false)
+        None
     }
 
-    /// Send an abort response with configured status, body, and headers
-    async fn send_abort_response(
-        &self,
-        session: &mut Session,
-        abort_config: &AbortConfig,
-    ) -> Result<bool> {
+    /// Build the abort rejection value with configured status, body, and
+    /// headers (the pipeline writes it through the shared exit helper).
+    fn abort_rejection(abort_config: &AbortConfig) -> Rejection {
         let status = StatusCode::from_u16(abort_config.http_status)
             .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
 
-        let body = abort_config.body.as_deref().unwrap_or("");
-        let body_len = body.len();
-
-        // Build response header
-        let mut resp = ResponseHeader::build(status, None)?;
-        resp.insert_header(header::CONTENT_LENGTH, body_len.to_string())?;
-        resp.insert_header(header::CONTENT_TYPE, "text/plain")?;
+        let mut rejection = Rejection::new(status)
+            .with_body(abort_config.body.clone().unwrap_or_default())
+            .with_content_type(crate::utils::response::content_type::TEXT_PLAIN);
 
         // Add custom headers if configured
         if let Some(ref headers) = abort_config.headers {
@@ -230,22 +221,11 @@ impl PluginFaultInjection {
                     serde_json::Value::Bool(b) => b.to_string(),
                     _ => continue, // Skip complex types
                 };
-                resp.insert_header(name.clone(), value_str)?;
+                rejection.headers.push((name.clone(), value_str));
             }
         }
 
-        // Send response
-        session
-            .write_response_header(Box::new(resp), body_len == 0)
-            .await?;
-
-        if body_len > 0 {
-            session
-                .write_response_body(Some(Bytes::copy_from_slice(body.as_bytes())), true)
-                .await?;
-        }
-
-        Ok(true)
+        rejection
     }
 }
 
@@ -258,16 +238,16 @@ impl ProxyPlugin for PluginFaultInjection {
     fn priority(&self) -> i32 {
         PRIORITY
     }
-    fn phases(&self) -> PluginPhases {
-        PluginPhases::REQUEST
-    }
-
-    async fn request_filter(&self, session: &mut Session, _ctx: &mut ProxyContext) -> Result<bool> {
+    async fn request_filter(
+        &self,
+        _session: &mut Session,
+        _ctx: &mut ProxyContext,
+    ) -> Result<FilterVerdict> {
         // Apply delay first (if configured)
         self.apply_delay().await;
 
         // Then check if request should be aborted (if configured)
-        self.check_and_abort(session).await
+        Ok(self.check_and_abort().unwrap_or(FilterVerdict::Continue))
     }
 }
 

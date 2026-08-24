@@ -20,9 +20,8 @@ use serde_json::Value as JsonValue;
 use validator::Validate;
 
 use crate::{
-    core::{PluginPhases, ProxyContext, ProxyError, ProxyPlugin, ProxyResult},
+    core::{FilterVerdict, ProxyContext, ProxyError, ProxyPlugin, ProxyResult, Rejection},
     plugins::config::parse_and_validate_plugin_config,
-    utils::response::ResponseBuilder,
 };
 
 pub const PLUGIN_NAME: &str = "client-control";
@@ -73,14 +72,14 @@ impl ProxyPlugin for PluginClientControl {
     fn priority(&self) -> i32 {
         PRIORITY
     }
-    fn phases(&self) -> PluginPhases {
-        PluginPhases::REQUEST | PluginPhases::REQUEST_BODY
-    }
-
-    async fn request_filter(&self, session: &mut Session, _ctx: &mut ProxyContext) -> Result<bool> {
+    async fn request_filter(
+        &self,
+        session: &mut Session,
+        _ctx: &mut ProxyContext,
+    ) -> Result<FilterVerdict> {
         let limit = self.config.max_body_size;
         if limit == 0 {
-            return Ok(false);
+            return Ok(FilterVerdict::Continue);
         }
 
         // Fast path: trust a declared Content-Length and reject immediately.
@@ -93,20 +92,15 @@ impl ProxyPlugin for PluginClientControl {
                 if let Ok(len) = len_str.parse::<u64>() {
                     if len > limit {
                         log::debug!("client-control: Content-Length {len} exceeds limit {limit}");
-                        ResponseBuilder::send_proxy_error(
-                            session,
+                        return Ok(FilterVerdict::Reject(Rejection::new(
                             StatusCode::PAYLOAD_TOO_LARGE,
-                            None,
-                            None,
-                        )
-                        .await?;
-                        return Ok(true);
+                        )));
                     }
                 }
             }
         }
 
-        Ok(false)
+        Ok(FilterVerdict::Continue)
     }
 
     async fn request_body_filter(

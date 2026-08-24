@@ -3,7 +3,7 @@ use std::{collections::HashMap, sync::Arc};
 use crate::{
     config::{self, Identifiable},
     core::{
-        sort_plugins_by_priority_desc, ProxyError, ProxyPlugin, ProxyPluginExecutor, ProxyResult,
+        sort_plugins_by_priority_desc, PluginEntry, ProxyError, ProxyPluginExecutor, ProxyResult,
     },
     plugins::build_plugin_with_upstreams,
     proxy::upstream::{PreparedUpstreams, ProxyUpstream, TrafficSplitOwner},
@@ -12,7 +12,7 @@ use crate::{
 /// Represents a proxy service that manages upstreams.
 pub struct ProxyGlobalRule {
     pub inner: config::GlobalRule,
-    pub plugins: Vec<Arc<dyn ProxyPlugin>>,
+    pub plugins: Vec<PluginEntry>,
 }
 
 impl Identifiable for ProxyGlobalRule {
@@ -41,7 +41,7 @@ impl ProxyGlobalRule {
         // Load plugins and log each one
         for (name, value) in rule.plugins {
             log::info!("Loading plugin: {name}");
-            let plugin = build_plugin_with_upstreams(
+            let entry = build_plugin_with_upstreams(
                 &name,
                 value,
                 upstreams,
@@ -56,7 +56,7 @@ impl ProxyGlobalRule {
                     name, rule.id, e
                 ))
             })?;
-            proxy_global_rule.plugins.push(plugin);
+            proxy_global_rule.plugins.push(entry);
         }
 
         // Ensure deterministic order for plugins inside a single global rule.
@@ -72,19 +72,19 @@ pub(crate) fn build_global_plugin_executor(
     let mut rules: Vec<Arc<ProxyGlobalRule>> = rules.values().cloned().collect();
     rules.sort_by(|a, b| a.inner.id.cmp(&b.inner.id));
 
-    let mut plugins_with_rule: Vec<(String, Arc<dyn ProxyPlugin>)> = Vec::new();
+    let mut plugins_with_rule: Vec<(String, PluginEntry)> = Vec::new();
     for rule in rules {
         let rule_id = rule.inner.id.clone();
-        for plugin in &rule.plugins {
-            plugins_with_rule.push((rule_id.clone(), plugin.clone()));
+        for entry in &rule.plugins {
+            plugins_with_rule.push((rule_id.clone(), entry.clone()));
         }
     }
 
-    plugins_with_rule.sort_by(|(rule_a, plugin_a), (rule_b, plugin_b)| {
-        plugin_b
+    plugins_with_rule.sort_by(|(rule_a, entry_a), (rule_b, entry_b)| {
+        entry_b
             .priority()
-            .cmp(&plugin_a.priority())
-            .then_with(|| plugin_a.name().cmp(plugin_b.name()))
+            .cmp(&entry_a.priority())
+            .then_with(|| entry_a.name().cmp(entry_b.name()))
             .then_with(|| rule_a.cmp(rule_b))
     });
 

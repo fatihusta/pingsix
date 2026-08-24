@@ -12,7 +12,7 @@ use prometheus::{
 use regex::Regex;
 use serde_json::Value as JsonValue;
 
-use crate::core::{PluginPhases, ProxyContext, ProxyError, ProxyPlugin, ProxyResult};
+use crate::core::{ProxyContext, ProxyError, ProxyPlugin, ProxyResult};
 
 const DEFAULT_BUCKETS: &[f64] = &[
     1.0, 2.0, 5.0, 10.0, 20.0, 50.0, 100.0, 200.0, 500.0, 1000.0, 2000.0, 5000.0, 10000.0, 30000.0,
@@ -197,10 +197,6 @@ impl ProxyPlugin for PluginPrometheus {
     fn priority(&self) -> i32 {
         PRIORITY
     }
-    fn phases(&self) -> PluginPhases {
-        PluginPhases::LOGGING
-    }
-
     async fn logging(&self, session: &mut Session, _e: Option<&Error>, ctx: &mut ProxyContext) {
         REQUESTS.inc();
 

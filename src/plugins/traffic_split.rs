@@ -9,7 +9,7 @@ use validator::Validate;
 
 use crate::config::{self, Upstream};
 use crate::core::{
-    HealthCheckFingerprint, HealthCheckSpec, PluginPhases, ProxyContext, ProxyError, ProxyPlugin,
+    FilterVerdict, HealthCheckFingerprint, HealthCheckSpec, ProxyContext, ProxyError, ProxyPlugin,
     ProxyResult, UpstreamSelector,
 };
 use crate::proxy::upstream::{
@@ -68,10 +68,6 @@ impl ProxyPlugin for PluginTrafficSplit {
     fn priority(&self) -> i32 {
         PRIORITY
     }
-    fn phases(&self) -> PluginPhases {
-        PluginPhases::REQUEST
-    }
-
     fn health_check_specs(&self) -> Vec<HealthCheckSpec> {
         self.health_check_specs
             .iter()
@@ -83,7 +79,11 @@ impl ProxyPlugin for PluginTrafficSplit {
             .collect()
     }
 
-    async fn request_filter(&self, session: &mut Session, ctx: &mut ProxyContext) -> Result<bool> {
+    async fn request_filter(
+        &self,
+        session: &mut Session,
+        ctx: &mut ProxyContext,
+    ) -> Result<FilterVerdict> {
         for (rule_idx, rule) in self.config.rules.iter().enumerate() {
             if match_apisix_vars(session, &rule.vars) {
                 match self.pick_upstream(rule_idx) {
@@ -95,10 +95,10 @@ impl ProxyPlugin for PluginTrafficSplit {
                     }
                     None => {}
                 }
-                return Ok(false);
+                return Ok(FilterVerdict::Continue);
             }
         }
-        Ok(false)
+        Ok(FilterVerdict::Continue)
     }
 }
 

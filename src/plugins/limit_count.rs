@@ -19,13 +19,13 @@ use validator::{Validate, ValidationError};
 
 use crate::{
     config::UpstreamHashOn,
-    core::{PluginPhases, ProxyContext, ProxyError, ProxyPlugin, ProxyResult},
+    core::{FilterVerdict, ProxyContext, ProxyError, ProxyPlugin, ProxyResult},
     plugins::{
         config::parse_and_validate_plugin_config,
         limiting::{
-            default_rejected_code, next_instance_ctx_key, select_rules, send_rejection,
-            validate_key, validate_rejected_msg, BoundedShardMap, CountKeyType as KeyType,
-            CountPolicy as Policy, RejectPolicy, Shard, SweepMiss, LIMIT_COUNT_OVERFLOW,
+            default_rejected_code, next_instance_ctx_key, rejection, select_rules, validate_key,
+            validate_rejected_msg, BoundedShardMap, CountKeyType as KeyType, CountPolicy as Policy,
+            RejectPolicy, Shard, SweepMiss, LIMIT_COUNT_OVERFLOW,
         },
     },
     utils::request::{apisix_key, request_selector_key},
@@ -559,11 +559,11 @@ impl ProxyPlugin for PluginRateLimit {
     fn priority(&self) -> i32 {
         PRIORITY
     }
-    fn phases(&self) -> PluginPhases {
-        PluginPhases::REQUEST | PluginPhases::RESPONSE
-    }
-
-    async fn request_filter(&self, session: &mut Session, ctx: &mut ProxyContext) -> Result<bool> {
+    async fn request_filter(
+        &self,
+        session: &mut Session,
+        ctx: &mut ProxyContext,
+    ) -> Result<FilterVerdict> {
         let Some(limits) = self.select_limits(session) else {
             // APISIX returns 500 when a rules-branch config matches no rule,
             // unless allow_degradation explicitly permits the request.
@@ -571,19 +571,16 @@ impl ProxyPlugin for PluginRateLimit {
                 RATE_LIMIT_REQUESTS
                     .with_label_values(&["allowed", "local"])
                     .inc();
-                return Ok(false);
+                return Ok(FilterVerdict::Continue);
             }
             RATE_LIMIT_REQUESTS
                 .with_label_values(&["rejected", "local"])
                 .inc();
-            return send_rejection(
-                session,
-                ctx,
+            return Ok(FilterVerdict::Reject(rejection(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Some("failed to get rate limit rules"),
                 &[],
-            )
-            .await;
+            )));
         };
 
         let mut quotas = Vec::new();
@@ -592,7 +589,7 @@ impl ProxyPlugin for PluginRateLimit {
             // empty rule keys are limited under the empty-key bucket like
             // APISIX).
             if key.is_empty() && !selection.from_rule {
-                return self.handle_missing_key(session, ctx).await;
+                return Ok(self.handle_missing_key(session, ctx));
             }
 
             // Check rate limit without forcing borrowed selector keys to allocate.
@@ -602,15 +599,7 @@ impl ProxyPlugin for PluginRateLimit {
                 RATE_LIMIT_REQUESTS
                     .with_label_values(&["rejected", "local"])
                     .inc();
-                return self
-                    .handle_rate_limit(
-                        session,
-                        ctx,
-                        &selection,
-                        outcome.current_count,
-                        outcome.remaining,
-                    )
-                    .await;
+                return Ok(self.handle_rate_limit(&selection, outcome.current_count));
             }
             RATE_LIMIT_REQUESTS
                 .with_label_values(&["allowed", "local"])
@@ -632,7 +621,7 @@ impl ProxyPlugin for PluginRateLimit {
             ctx.set(self.quota_key.clone(), quotas);
         }
 
-        Ok(false)
+        Ok(FilterVerdict::Continue)
     }
 
     async fn response_filter(
@@ -750,35 +739,28 @@ impl PluginRateLimit {
     }
 
     /// Handle requests with missing keys based on configured policy
-    async fn handle_missing_key(
-        &self,
-        session: &mut Session,
-        ctx: &mut ProxyContext,
-    ) -> Result<bool> {
+    fn handle_missing_key(&self, _session: &mut Session, ctx: &mut ProxyContext) -> FilterVerdict {
         match self.config.key_missing_policy {
             KeyMissingPolicy::Allow => {
                 RATE_LIMIT_REQUESTS
                     .with_label_values(&["allowed", "local"])
                     .inc();
-                Ok(false)
+                FilterVerdict::Continue
             }
             KeyMissingPolicy::Deny => {
                 RATE_LIMIT_REQUESTS
                     .with_label_values(&["rejected", "local"])
                     .inc();
-                send_rejection(
-                    session,
-                    ctx,
+                FilterVerdict::Reject(rejection(
                     StatusCode::BAD_REQUEST,
                     Some("Missing required key for rate limiting"),
                     &[],
-                )
-                .await
+                ))
             }
             KeyMissingPolicy::Default => {
                 // Use a default key for all requests with missing keys
                 let Some(selection) = self.main_selection() else {
-                    return Ok(false);
+                    return FilterVerdict::Continue;
                 };
                 let outcome = self.check_rate_limit(&selection, "_default_rate_limit_key");
 
@@ -786,14 +768,7 @@ impl PluginRateLimit {
                     RATE_LIMIT_REQUESTS
                         .with_label_values(&["rejected", "local"])
                         .inc();
-                    self.handle_rate_limit(
-                        session,
-                        ctx,
-                        &selection,
-                        outcome.current_count,
-                        outcome.remaining,
-                    )
-                    .await
+                    self.handle_rate_limit(&selection, outcome.current_count)
                 } else {
                     RATE_LIMIT_REQUESTS
                         .with_label_values(&["allowed", "local"])
@@ -810,7 +785,7 @@ impl PluginRateLimit {
                             }],
                         );
                     }
-                    Ok(false)
+                    FilterVerdict::Continue
                 }
             }
         }
@@ -856,18 +831,14 @@ impl PluginRateLimit {
         }
     }
 
-    /// Handle rate-limited requests by sending a rejection response with detailed headers
-    async fn handle_rate_limit(
-        &self,
-        session: &mut Session,
-        ctx: &ProxyContext,
-        selection: &LimitSelection,
-        current_count: isize,
-        remaining: isize,
-    ) -> Result<bool> {
+    /// Build the rejection for a rate-limited request, including detailed
+    /// quota headers. The downstream connection is marked for closure
+    /// (`close_connection`, applied by the pipeline's single write — the
+    /// historical `session.set_keepalive(None)` on 429s).
+    fn handle_rate_limit(&self, selection: &LimitSelection, current_count: isize) -> FilterVerdict {
         let headers = build_rate_limit_headers(
             selection.count,
-            remaining,
+            (selection.count as isize - current_count).max(0),
             selection.time_window,
             current_count,
             self.config.show_limit_quota_header,
@@ -875,16 +846,14 @@ impl PluginRateLimit {
             HeaderPath::Rejection,
         );
 
-        session.set_keepalive(None);
-
-        send_rejection(
-            session,
-            ctx,
-            self.reject.status(),
-            self.config.rejected_msg.as_deref(),
-            &headers,
+        FilterVerdict::Reject(
+            rejection(
+                self.reject.status(),
+                self.config.rejected_msg.as_deref(),
+                &headers,
+            )
+            .with_close_connection(),
         )
-        .await
     }
 }
 
@@ -1570,19 +1539,25 @@ mod tests {
         // One request through instance A ...
         let (mut first_session, _first_server) = session_with_raw_request(KEYED_REQUEST).await;
         let mut first_ctx = ProxyContext::default();
-        assert!(!first
-            .request_filter(&mut first_session, &mut first_ctx)
-            .await
-            .unwrap());
+        assert!(!crate::utils::testing::run_request_filter(
+            first.as_ref(),
+            &mut first_session,
+            &mut first_ctx
+        )
+        .await
+        .unwrap());
 
         // ... and the next request through instance B is limited: the group
         // shares one counter across instances.
         let (mut second_session, mut second_server) = session_with_raw_request(KEYED_REQUEST).await;
         let mut second_ctx = ProxyContext::default();
-        assert!(second
-            .request_filter(&mut second_session, &mut second_ctx)
-            .await
-            .unwrap());
+        assert!(crate::utils::testing::run_request_filter(
+            second.as_ref(),
+            &mut second_session,
+            &mut second_ctx
+        )
+        .await
+        .unwrap());
         drop(second_session);
         let response = drain_response(&mut second_server).await;
         assert!(
@@ -1600,7 +1575,11 @@ mod tests {
         }));
         let (mut session, mut server) = session_with_raw_request(CANNED_REQUEST).await;
         let mut ctx = ProxyContext::default();
-        assert!(strict.request_filter(&mut session, &mut ctx).await.unwrap());
+        assert!(
+            crate::utils::testing::run_request_filter(&strict, &mut session, &mut ctx)
+                .await
+                .unwrap()
+        );
         drop(session);
         let response = drain_response(&mut server).await;
         assert!(
@@ -1616,10 +1595,11 @@ mod tests {
         }));
         let (mut session, _server) = session_with_raw_request(CANNED_REQUEST).await;
         let mut ctx = ProxyContext::default();
-        assert!(!tolerant
-            .request_filter(&mut session, &mut ctx)
-            .await
-            .unwrap());
+        assert!(
+            !crate::utils::testing::run_request_filter(&tolerant, &mut session, &mut ctx)
+                .await
+                .unwrap()
+        );
     }
 
     #[tokio::test]
@@ -1635,19 +1615,21 @@ mod tests {
         // First request passes and consumes the single allowed request.
         let (mut first, _first_server) = session_with_raw_request(KEYED_REQUEST).await;
         let mut first_ctx = ProxyContext::default();
-        assert!(!plugin
-            .request_filter(&mut first, &mut first_ctx)
-            .await
-            .unwrap());
+        assert!(
+            !crate::utils::testing::run_request_filter(&plugin, &mut first, &mut first_ctx)
+                .await
+                .unwrap()
+        );
 
         // The second is limited with the configured code and the prefixed
         // rate-limit headers on the rejection.
         let (mut second, mut second_server) = session_with_raw_request(KEYED_REQUEST).await;
         let mut second_ctx = ProxyContext::default();
-        assert!(plugin
-            .request_filter(&mut second, &mut second_ctx)
-            .await
-            .unwrap());
+        assert!(
+            crate::utils::testing::run_request_filter(&plugin, &mut second, &mut second_ctx)
+                .await
+                .unwrap()
+        );
         drop(second);
         let response = drain_response(&mut second_server).await;
         assert!(
@@ -1679,7 +1661,11 @@ mod tests {
         }));
         let (mut session, _server) = session_with_raw_request(KEYED_REQUEST).await;
         let mut ctx = ProxyContext::default();
-        assert!(!plugin.request_filter(&mut session, &mut ctx).await.unwrap());
+        assert!(
+            !crate::utils::testing::run_request_filter(&plugin, &mut session, &mut ctx)
+                .await
+                .unwrap()
+        );
 
         let mut upstream_response =
             pingora_http::ResponseHeader::build(StatusCode::OK, None).unwrap();
