@@ -12,7 +12,7 @@
 //! APISIX, which only observes `upstream_status`.
 
 use std::{
-    collections::{BTreeMap, HashMap, HashSet},
+    collections::HashSet,
     sync::{Arc, Mutex},
     time::Instant,
 };
@@ -28,8 +28,11 @@ use validator::{Validate, ValidationError};
 
 use crate::{
     core::{PluginPhases, ProxyContext, ProxyError, ProxyPlugin, ProxyResult},
-    plugins::config::parse_and_validate_plugin_config,
-    utils::{request::render_apisix_request_template, response::ResponseBuilder},
+    plugins::{
+        config::parse_and_validate_plugin_config,
+        limiting::{send_rejection, Shard},
+    },
+    utils::request::render_apisix_request_template,
 };
 
 pub const PLUGIN_NAME: &str = "api-breaker";
@@ -83,36 +86,26 @@ pub fn create_api_breaker_plugin(
 /// high-cardinality inputs cannot bypass the breaker or evict hot state.
 const MAX_BREAKER_KEYS: usize = 1024;
 
+/// Fixed-capacity LRU over the shared [`Shard`] recency machinery: a new key
+/// at capacity evicts the least recently used state (no predicate — breaker
+/// state has no notion of "idle"), while an existing key only refreshes its
+/// recency. Eviction is O(log n), never a request-time map scan.
 #[derive(Default)]
 struct BreakerStates {
-    entries: HashMap<String, BreakerState>,
-    /// Exactly one ordered record per entry, so eviction is O(log n), not a
-    /// request-time map scan.
-    oldest: BTreeMap<u64, String>,
-    next_touch: u64,
+    shard: Shard<BreakerState>,
 }
 
 impl BreakerStates {
     fn entry(&mut self, key: String) -> &mut BreakerState {
-        if let Some(state) = self.entries.get(&key) {
-            self.oldest.remove(&state.touch);
-        } else if self.entries.len() >= MAX_BREAKER_KEYS {
-            let (_, oldest) = self.oldest.pop_first().expect("non-empty index");
-            self.entries.remove(&oldest);
+        if !self.shard.contains_key(&key) && self.shard.len() >= MAX_BREAKER_KEYS {
+            self.shard.evict_oldest();
         }
-        self.next_touch = self.next_touch.wrapping_add(1);
-        if self.next_touch == 0 {
-            self.next_touch = 1;
-        }
-        let touch = self.next_touch;
-        let state = self.entries.entry(key.clone()).or_default();
-        state.last_touch = Instant::now();
-        state.touch = touch;
-        self.oldest.insert(touch, key);
-        state
+        self.shard.touch(&key);
+        self.shard.entry(key).or_default()
     }
 }
 
+#[derive(Default)]
 struct BreakerState {
     /// Cumulative unhealthy responses since the last reset.
     unhealthy_count: u32,
@@ -120,20 +113,6 @@ struct BreakerState {
     healthy_count: u32,
     /// When the current trip started (None when closed).
     lasttime: Option<Instant>,
-    last_touch: Instant,
-    touch: u64,
-}
-
-impl Default for BreakerState {
-    fn default() -> Self {
-        Self {
-            unhealthy_count: 0,
-            healthy_count: 0,
-            lasttime: None,
-            last_touch: Instant::now(),
-            touch: 0,
-        }
-    }
 }
 
 /// Breaker window duration in seconds: `2^failure_times` capped at
@@ -347,27 +326,21 @@ impl PluginApiBreaker {
         }
     }
 
-    async fn reject(&self, session: &mut Session) -> Result<bool> {
-        let mut headers: Vec<(&str, String)> = Vec::new();
+    async fn reject(&self, session: &mut Session, ctx: &ProxyContext) -> Result<bool> {
+        let mut headers: Vec<(String, String)> = Vec::new();
         for h in &self.config.break_response_headers {
             let value = render_apisix_request_template(session, &h.value);
-            headers.push((h.key.as_str(), value));
+            headers.push((h.key.clone(), value));
         }
-        let headers_ref: Vec<(&str, &str)> =
-            headers.iter().map(|(k, v)| (*k, v.as_str())).collect();
-        ResponseBuilder::send_proxy_error(
+        send_rejection(
             session,
+            ctx,
             StatusCode::from_u16(self.config.break_response_code)
                 .unwrap_or(StatusCode::SERVICE_UNAVAILABLE),
             self.config.break_response_body.as_deref(),
-            if headers_ref.is_empty() {
-                None
-            } else {
-                Some(&headers_ref)
-            },
+            &headers,
         )
-        .await?;
-        Ok(true)
+        .await
     }
 }
 
@@ -387,7 +360,7 @@ impl ProxyPlugin for PluginApiBreaker {
     async fn request_filter(&self, session: &mut Session, ctx: &mut ProxyContext) -> Result<bool> {
         if self.is_open(Self::state_key(session, ctx), Instant::now()) {
             log::debug!("api-breaker: circuit open, rejecting request");
-            return self.reject(session).await;
+            return self.reject(session, ctx).await;
         }
         Ok(false)
     }
@@ -446,9 +419,9 @@ mod tests {
             states.entry(i.to_string());
         }
         states.entry("new".to_string());
-        assert_eq!(states.entries.len(), MAX_BREAKER_KEYS);
-        assert!(!states.entries.contains_key("0"));
-        assert!(states.entries.contains_key("new"));
+        assert_eq!(states.shard.len(), MAX_BREAKER_KEYS);
+        assert!(!states.shard.contains_key("0"));
+        assert!(states.shard.contains_key("new"));
     }
 
     #[test]

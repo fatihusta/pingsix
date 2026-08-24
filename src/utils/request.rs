@@ -197,14 +197,40 @@ pub fn render_apisix_template<F>(template: &str, resolve: F) -> String
 where
     F: FnMut(&str) -> String,
 {
-    render_apisix_template_with_count(template, resolve).0
+    render_template(template, TemplateOptions::default(), resolve)
 }
 
-/// Like [`render_apisix_template`], additionally reporting how many
-/// placeholders resolved to a non-empty value. APISIX `var_combination`
-/// limiter keys treat a fully unresolved template (count 0) as key-missing,
-/// even when the rendered string still contains literal separator text.
-fn render_apisix_template_with_count<F>(template: &str, mut resolve: F) -> (String, usize)
+/// Parser options for [`render_template`].
+#[derive(Debug, Clone, Copy, Default)]
+pub struct TemplateOptions {
+    /// When true, `\$` renders a literal `$` instead of starting a
+    /// placeholder; a `\` followed by any other character (or at end of
+    /// input) is passed through unchanged. Redirect URI templates enable
+    /// escaping so a path containing a literal `$` stays configurable.
+    pub escape_dollar: bool,
+}
+
+/// The single `$name` / `${name}` template parser shared by request-phase
+/// plugins (upstream hashing, APISIX limiter keys, redirect URI templates)
+/// and log-phase rendering (file-logger formats). Unknown or empty names
+/// resolve through `resolve` like any other; a bare `$` (not followed by a
+/// name or `{`) is emitted literally.
+pub fn render_template<F>(template: &str, options: TemplateOptions, resolve: F) -> String
+where
+    F: FnMut(&str) -> String,
+{
+    render_template_with_count(template, options, resolve).0
+}
+
+/// Like [`render_template`], additionally reporting how many placeholders
+/// resolved to a non-empty value. APISIX `var_combination` limiter keys
+/// treat a fully unresolved template (count 0) as key-missing, even when
+/// the rendered string still contains literal separator text.
+fn render_template_with_count<F>(
+    template: &str,
+    options: TemplateOptions,
+    mut resolve: F,
+) -> (String, usize)
 where
     F: FnMut(&str) -> String,
 {
@@ -212,6 +238,15 @@ where
     let mut resolved = 0;
     let mut chars = template.chars().peekable();
     while let Some(ch) = chars.next() {
+        if options.escape_dollar && ch == '\\' {
+            if chars.peek() == Some(&'$') {
+                chars.next();
+                rendered.push('$');
+            } else {
+                rendered.push('\\');
+            }
+            continue;
+        }
         if ch != '$' {
             rendered.push(ch);
             continue;
@@ -246,6 +281,15 @@ where
     (rendered, resolved)
 }
 
+/// Alias for [`render_template_with_count`] with the default (no-escape)
+/// options, kept for existing APISIX-template callers.
+fn render_apisix_template_with_count<F>(template: &str, resolve: F) -> (String, usize)
+where
+    F: FnMut(&str) -> String,
+{
+    render_template_with_count(template, TemplateOptions::default(), resolve)
+}
+
 /// Render an APISIX nginx-variable template against the live request.
 ///
 /// Variable names use the same resolution as [`apisix_key`]: `arg_*`, `http_*`,
@@ -255,37 +299,73 @@ pub fn render_apisix_request_template(session: &mut Session, template: &str) -> 
     render_apisix_template(template, |name| resolve_var(session, name).into_owned())
 }
 
-/// Resolve a single nginx-style variable name to a request-derived value.
+/// Resolve a request-header-scoped nginx-style variable without a live
+/// `Session`. Shared by every request-phase resolver so the lookup rules —
+/// host precedence via [`get_request_host`], nginx `http_*` header naming,
+/// `arg_*` query lookup, uri shapes — live in exactly one place.
 ///
-/// Backs both upstream hashing (`UpstreamHashOn::VARS`) and APISIX-style
-/// limiter keys. Supports `arg_*` query arguments, `http_*` headers (nginx
-/// naming: `X-Custom-Id` -> `http_x_custom_id`), and the predefined names
-/// `uri`, `request_uri`, `query_string`, `remote_addr`, `remote_port`,
-/// `server_addr`, `host`.
+/// Returns `None` for connection-scoped variables (`remote_addr`,
+/// `remote_port`, `server_addr`) and for unknown names; callers choose the
+/// fallback. Header-derived variables return `Some` even when the
+/// underlying value is absent (empty string), matching nginx semantics.
 ///
-/// Unknown variables resolve to an empty string so a missing value never
-/// panics; callers decide whether an empty key means "no limit" or "deny".
-fn resolve_var<'a>(session: &'a mut Session, name: &str) -> Cow<'a, str> {
+/// `is_tls` only affects the `scheme` fallback for origin-form URIs, mirroring
+/// nginx `$scheme`.
+pub fn resolve_request_var<'a>(
+    req: &'a RequestHeader,
+    is_tls: bool,
+    name: &str,
+) -> Option<Cow<'a, str>> {
     if let Some(arg) = name.strip_prefix("arg_") {
-        return Cow::Borrowed(get_query_value(session.req_header(), arg).unwrap_or_default());
+        return Some(Cow::Borrowed(get_query_value(req, arg).unwrap_or_default()));
     }
     if let Some(header) = name.strip_prefix("http_") {
         // nginx normalizes header names: `X-Custom-Id` -> `http_x_custom_id`
         let header_name = header.replace('_', "-");
-        return Cow::Borrowed(
-            get_req_header_value(session.req_header(), &header_name).unwrap_or_default(),
-        );
+        return Some(Cow::Borrowed(
+            get_req_header_value(req, &header_name).unwrap_or_default(),
+        ));
     }
-    match name {
-        "uri" => Cow::Borrowed(session.req_header().uri.path()),
+    Some(match name {
+        "uri" => Cow::Borrowed(req.uri.path()),
         "request_uri" => Cow::Borrowed(
-            session
-                .req_header()
-                .uri
+            req.uri
                 .path_and_query()
-                .map_or_else(|| session.req_header().uri.path(), |pq| pq.as_str()),
+                .map_or_else(|| req.uri.path(), |pq| pq.as_str()),
         ),
-        "query_string" => Cow::Borrowed(session.req_header().uri.query().unwrap_or_default()),
+        "query_string" => Cow::Borrowed(req.uri.query().unwrap_or_default()),
+        "host" => Cow::Borrowed(get_request_host(req).unwrap_or_default()),
+        "scheme" => {
+            Cow::Borrowed(
+                req.uri
+                    .scheme_str()
+                    .unwrap_or(if is_tls { "https" } else { "http" }),
+            )
+        }
+        "request_method" => Cow::Borrowed(req.method.as_str()),
+        _ => return None,
+    })
+}
+
+/// Whether the downstream connection of `session` is TLS (the redirect
+/// plugin's `$scheme` fallback and http-to-https decision both key off this).
+pub fn session_is_tls(session: &Session) -> bool {
+    session.digest().is_some_and(|d| d.ssl_digest.is_some())
+}
+
+/// Resolve a single nginx-style variable name to a request-derived value.
+///
+/// Backs upstream hashing (`UpstreamHashOn::VARS`), APISIX-style limiter
+/// keys, and redirect URI templates. Supports `arg_*` query arguments,
+/// `http_*` headers (nginx naming: `X-Custom-Id` -> `http_x_custom_id`),
+/// and the predefined names `uri`, `request_uri`, `query_string`,
+/// `remote_addr`, `remote_port`, `server_addr`, `host`, `scheme`,
+/// `request_method`.
+///
+/// Unknown variables resolve to an empty string so a missing value never
+/// panics; callers decide whether an empty key means "no limit" or "deny".
+pub fn resolve_var<'a>(session: &'a Session, name: &str) -> Cow<'a, str> {
+    match name {
         "remote_addr" => get_direct_client_ip(session)
             .map_or_else(|| Cow::Borrowed(""), |ip| Cow::Owned(ip.to_string())),
         "remote_port" => session
@@ -295,11 +375,11 @@ fn resolve_var<'a>(session: &'a mut Session, name: &str) -> Cow<'a, str> {
         "server_addr" => session
             .server_addr()
             .map_or_else(|| Cow::Borrowed(""), |addr| Cow::Owned(addr.to_string())),
-        "host" => Cow::Borrowed(get_request_host(session.req_header()).unwrap_or_default()),
-        _ => {
-            log::debug!("Unsupported variable key: {name}");
-            Cow::Borrowed("")
-        }
+        _ => resolve_request_var(session.req_header(), session_is_tls(session), name)
+            .unwrap_or_else(|| {
+                log::debug!("Unsupported variable key: {name}");
+                Cow::Borrowed("")
+            }),
     }
 }
 
@@ -392,7 +472,7 @@ mod tests {
         // "-", but APISIX treats the combination as key-missing and buckets
         // the request by remote_addr instead.
         let mut session = request_session("GET / HTTP/1.1\r\nHost: example.com\r\n\r\n").await;
-        let remote_addr = resolve_var(&mut session, "remote_addr").into_owned();
+        let remote_addr = resolve_var(&session, "remote_addr").into_owned();
         let key = apisix_key(&mut session, "$http_a-$http_b", true).into_owned();
         assert_eq!(key, remote_addr);
         assert_ne!(key, "-");
@@ -416,11 +496,142 @@ mod tests {
             apisix_key(&mut session, "http_a", false).into_owned(),
             "left"
         );
-        let remote_addr = resolve_var(&mut session, "remote_addr").into_owned();
+        let remote_addr = resolve_var(&session, "remote_addr").into_owned();
         assert_eq!(
             apisix_key(&mut session, "http_b", false).into_owned(),
             remote_addr
         );
+    }
+
+    #[test]
+    fn render_template_escape_dollar_keeps_literal_dollar() {
+        // `\$` emits a literal `$` and swallows the backslash; any other
+        // backslash sequence (including `\\` and a trailing `\`) passes
+        // through byte-for-byte.
+        let resolve = |name: &str| match name {
+            "host" => "example.com".to_string(),
+            _ => String::new(),
+        };
+        assert_eq!(
+            render_template(
+                "\\$host-$host-\\x-\\$$-end\\",
+                TemplateOptions {
+                    escape_dollar: true
+                },
+                resolve,
+            ),
+            "$host-example.com-\\x-$$-end\\"
+        );
+
+        // Without escaping, backslashes are ordinary characters: `\$host`
+        // keeps the backslash and still expands `$host`.
+        assert_eq!(
+            render_template("\\$host", TemplateOptions::default(), resolve),
+            "\\example.com"
+        );
+    }
+
+    #[test]
+    fn render_template_braced_and_plain_forms_are_equivalent() {
+        let resolve = |name: &str| match name {
+            "name" => "alice".to_string(),
+            _ => String::new(),
+        };
+        assert_eq!(
+            render_template("$name-$missing", TemplateOptions::default(), resolve),
+            render_template("${name}-${missing}", TemplateOptions::default(), resolve),
+        );
+        assert_eq!(
+            render_template("${name}x", TemplateOptions::default(), resolve),
+            "alicex"
+        );
+    }
+
+    #[tokio::test]
+    async fn resolve_request_var_covers_header_scoped_registry() {
+        let mut req = RequestHeader::build("POST", b"/x?a=1&q=2", Some(2)).unwrap();
+        req.insert_header("host", "header.example:8080").unwrap();
+        req.insert_header("x-custom-id", "7").unwrap();
+
+        assert_eq!(
+            resolve_request_var(&req, false, "arg_a").as_deref(),
+            Some("1")
+        );
+        assert_eq!(
+            resolve_request_var(&req, false, "arg_missing").as_deref(),
+            Some("")
+        );
+        assert_eq!(
+            resolve_request_var(&req, false, "http_x_custom_id").as_deref(),
+            Some("7")
+        );
+        assert_eq!(
+            resolve_request_var(&req, false, "http_host").as_deref(),
+            Some("header.example:8080")
+        );
+        assert_eq!(
+            resolve_request_var(&req, false, "uri").as_deref(),
+            Some("/x")
+        );
+        assert_eq!(
+            resolve_request_var(&req, false, "request_uri").as_deref(),
+            Some("/x?a=1&q=2")
+        );
+        assert_eq!(
+            resolve_request_var(&req, false, "query_string").as_deref(),
+            Some("a=1&q=2")
+        );
+        assert_eq!(
+            resolve_request_var(&req, false, "request_method").as_deref(),
+            Some("POST")
+        );
+        // Origin-form URI: scheme falls back to the connection's TLS state.
+        assert_eq!(
+            resolve_request_var(&req, false, "scheme").as_deref(),
+            Some("http")
+        );
+        assert_eq!(
+            resolve_request_var(&req, true, "scheme").as_deref(),
+            Some("https")
+        );
+
+        // Connection-scoped and unknown names are out of header scope.
+        assert!(resolve_request_var(&req, false, "remote_addr").is_none());
+        assert!(resolve_request_var(&req, false, "remote_port").is_none());
+        assert!(resolve_request_var(&req, false, "server_addr").is_none());
+        assert!(resolve_request_var(&req, false, "unknown").is_none());
+    }
+
+    #[test]
+    fn resolve_request_var_host_prefers_uri_authority_over_host_header() {
+        // The precedence rule lives here, not in any plugin: URI authority
+        // wins over the Host header, and the Host header's port is stripped.
+        let mut req = RequestHeader::build("GET", b"/", Some(1)).unwrap();
+        req.uri = "http://uri.example:8080/p".parse().unwrap();
+        req.insert_header("host", "header.example:9090").unwrap();
+        assert_eq!(
+            resolve_request_var(&req, false, "host").as_deref(),
+            Some("uri.example")
+        );
+
+        let mut req = RequestHeader::build("GET", b"/p", Some(1)).unwrap();
+        req.insert_header("host", "header.example:9090").unwrap();
+        assert_eq!(
+            resolve_request_var(&req, false, "host").as_deref(),
+            Some("header.example")
+        );
+    }
+
+    #[tokio::test]
+    async fn resolve_var_still_owns_connection_scoped_vars() {
+        let session = request_session("GET /x HTTP/1.1\r\nHost: t\r\n\r\n").await;
+        // Mock streams carry no socket digest: unknown at this scope means
+        // the empty string, never a panic.
+        assert_eq!(resolve_var(&session, "remote_addr"), "");
+        assert_eq!(resolve_var(&session, "remote_port"), "");
+        assert_eq!(resolve_var(&session, "server_addr"), "");
+        assert_eq!(resolve_var(&session, "unknown"), "");
+        assert_eq!(resolve_var(&session, "http_host"), "t");
     }
 
     #[test]

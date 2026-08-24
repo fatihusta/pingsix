@@ -3,7 +3,7 @@
 use crate::{
     config::{self, GlobalRule, Identifiable, Route, Service, Upstream, SSL},
     core::{ProxyError, ProxyResult},
-    proxy::control_plane::{validate_config_set, ResourceConfigSet},
+    proxy::control_plane::{validate_stored_form, ResourceConfigSet},
     utils::encryption::{KeyringService, SecretOp},
 };
 
@@ -126,7 +126,8 @@ pub(crate) fn plan_put_mutation(
     );
     let set = decode_graph(&candidate, SecretMode::PreserveStored, keyring)
         .map_err(|e| GraphError::InvalidCandidate { source: e })?;
-    validate_config_set(&set).map_err(|e| GraphError::InvalidCandidate { source: e })?;
+    // Stored form: secrets may still be ciphertext at this gate.
+    validate_stored_form(&set).map_err(|e| GraphError::InvalidCandidate { source: e })?;
     let expected_target_mod_revision = snapshot.resources.get(key).map(|r| r.mod_revision);
     Ok(GraphCommit {
         mutation: StoredMutation::Put {
@@ -152,7 +153,8 @@ pub(crate) fn plan_delete_mutation(
     candidate.resources.remove(key);
     let set = decode_graph(&candidate, SecretMode::PreserveStored, keyring)
         .map_err(|e| GraphError::ReferentialConflict { source: e })?;
-    validate_config_set(&set).map_err(|e| GraphError::ReferentialConflict { source: e })?;
+    // Stored form: secrets may still be ciphertext at this gate.
+    validate_stored_form(&set).map_err(|e| GraphError::ReferentialConflict { source: e })?;
     Ok(GraphCommit {
         mutation: StoredMutation::Delete { key: key.clone() },
         expected_target_mod_revision: Some(existing.mod_revision),

@@ -325,32 +325,9 @@ impl RuntimeStore {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{
-        Nodes, SelectionType, Upstream, UpstreamHashOn, UpstreamPassHost, UpstreamScheme,
+    use crate::proxy::control_plane::test_fixtures::{
+        route_with_upstream_id, upstream, upstream_weighted,
     };
-
-    fn sample_upstream(id: &str, nodes: &[(&str, u32)]) -> Upstream {
-        let mut map = HashMap::new();
-        for (addr, weight) in nodes {
-            map.insert((*addr).to_string(), *weight);
-        }
-        Upstream {
-            id: id.to_string(),
-            retries: None,
-            retry_timeout: None,
-            timeout: None,
-            nodes: Nodes::from_map(map),
-            r#type: SelectionType::RoundRobin,
-            checks: None,
-            hash_on: UpstreamHashOn::VARS,
-            key: "uri".into(),
-            scheme: UpstreamScheme::HTTP,
-            pass_host: UpstreamPassHost::PASS,
-            upstream_host: None,
-            tls: None,
-            keepalive_pool: None,
-        }
-    }
 
     #[test]
     fn per_instance_health_check_registries_are_isolated() {
@@ -365,7 +342,7 @@ mod tests {
 
         let mut set = ResourceConfigSet::default();
         set.upstreams
-            .insert("u1".into(), sample_upstream("u1", &[("127.0.0.1:80", 1)]));
+            .insert("u1".into(), upstream("u1", "127.0.0.1:80"));
         let snap = RuntimeSnapshot::compile(CandidateSnapshot::build(set).unwrap(), 1).unwrap();
         store_a.publish(snap).unwrap();
 
@@ -391,8 +368,8 @@ mod tests {
 
     #[test]
     fn health_check_fingerprint_is_stable_across_hashmap_insertion_order() {
-        let a = sample_upstream("u", &[("10.0.0.2:80", 1), ("10.0.0.1:80", 2)]);
-        let b = sample_upstream("u", &[("10.0.0.1:80", 2), ("10.0.0.2:80", 1)]);
+        let a = upstream_weighted("u", &[("10.0.0.2:80", 1), ("10.0.0.1:80", 2)]);
+        let b = upstream_weighted("u", &[("10.0.0.1:80", 2), ("10.0.0.2:80", 1)]);
         assert_eq!(
             a.fingerprint(config::UpstreamFingerprintProfile::HealthCheck),
             b.fingerprint(config::UpstreamFingerprintProfile::HealthCheck)
@@ -401,8 +378,8 @@ mod tests {
 
     #[test]
     fn health_check_fingerprint_ignores_node_weight_changes() {
-        let a = sample_upstream("u", &[("10.0.0.1:80", 1)]);
-        let b = sample_upstream("u", &[("10.0.0.1:80", 99)]);
+        let a = upstream_weighted("u", &[("10.0.0.1:80", 1)]);
+        let b = upstream_weighted("u", &[("10.0.0.1:80", 99)]);
         assert_eq!(
             a.fingerprint(config::UpstreamFingerprintProfile::HealthCheck),
             b.fingerprint(config::UpstreamFingerprintProfile::HealthCheck)
@@ -431,31 +408,14 @@ mod tests {
         let store = RuntimeStore::new();
         let mut set = ResourceConfigSet::default();
         set.upstreams
-            .insert("u1".into(), sample_upstream("u1", &[("10.0.0.1:80", 1)]));
+            .insert("u1".into(), upstream("u1", "10.0.0.1:80"));
         publish_set(&store, &set, 1);
         let gen1 = store
             .health_check_generation("upstream/u1")
             .expect("hc registered");
 
-        set.routes.insert(
-            "r1".into(),
-            crate::config::Route {
-                id: "r1".into(),
-                name: None,
-                uri: Some("/".into()),
-                uris: vec![],
-                methods: vec![],
-                host: None,
-                hosts: vec![],
-                priority: 0,
-                plugins: Default::default(),
-                upstream: None,
-                upstream_id: Some("u1".into()),
-                service_id: None,
-                timeout: None,
-                enable_websocket: false,
-            },
-        );
+        set.routes
+            .insert("r1".into(), route_with_upstream_id("r1", "/", "u1"));
         publish_set(&store, &set, 2);
         let gen2 = store
             .health_check_generation("upstream/u1")
@@ -470,7 +430,7 @@ mod tests {
         let store = RuntimeStore::new();
         let mut set = ResourceConfigSet::default();
         set.upstreams
-            .insert("u1".into(), sample_upstream("u1", &[("10.0.0.1:80", 1)]));
+            .insert("u1".into(), upstream("u1", "10.0.0.1:80"));
         publish_set(&store, &set, 1);
         let before = store.load().upstreams.get("u1").cloned().unwrap();
         assert!(
@@ -478,25 +438,8 @@ mod tests {
             "eager discovery must populate backends before publish"
         );
 
-        set.routes.insert(
-            "r1".into(),
-            crate::config::Route {
-                id: "r1".into(),
-                name: None,
-                uri: Some("/".into()),
-                uris: vec![],
-                methods: vec![],
-                host: None,
-                hosts: vec![],
-                priority: 0,
-                plugins: Default::default(),
-                upstream: None,
-                upstream_id: Some("u1".into()),
-                service_id: None,
-                timeout: None,
-                enable_websocket: false,
-            },
-        );
+        set.routes
+            .insert("r1".into(), route_with_upstream_id("r1", "/", "u1"));
         publish_set(&store, &set, 2);
         let after = store.load().upstreams.get("u1").cloned().unwrap();
         assert!(
@@ -516,13 +459,13 @@ mod tests {
         let store = RuntimeStore::new();
         let mut set = ResourceConfigSet::default();
         set.upstreams
-            .insert("u1".into(), sample_upstream("u1", &[("10.0.0.1:80", 1)]));
+            .insert("u1".into(), upstream("u1", "10.0.0.1:80"));
         publish_set(&store, &set, 1);
         let gen1 = store.health_check_generation("upstream/u1").unwrap();
         let before = store.load().upstreams.get("u1").cloned().unwrap();
 
         set.upstreams
-            .insert("u1".into(), sample_upstream("u1", &[("10.0.0.1:80", 99)]));
+            .insert("u1".into(), upstream_weighted("u1", &[("10.0.0.1:80", 99)]));
         publish_set(&store, &set, 2);
         let after = store.load().upstreams.get("u1").cloned().unwrap();
         let gen2 = store.health_check_generation("upstream/u1").unwrap();
@@ -549,12 +492,12 @@ mod tests {
         let store = RuntimeStore::new();
         let mut set = ResourceConfigSet::default();
         set.upstreams
-            .insert("u1".into(), sample_upstream("u1", &[("10.0.0.1:80", 1)]));
+            .insert("u1".into(), upstream("u1", "10.0.0.1:80"));
         publish_set(&store, &set, 1);
         let gen1 = store.health_check_generation("upstream/u1").unwrap();
 
         set.upstreams
-            .insert("u1".into(), sample_upstream("u1", &[("10.0.0.2:80", 1)]));
+            .insert("u1".into(), upstream("u1", "10.0.0.2:80"));
         publish_set(&store, &set, 2);
         let gen2 = store.health_check_generation("upstream/u1").unwrap();
         assert_ne!(gen1, gen2);

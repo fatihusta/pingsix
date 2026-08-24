@@ -1,7 +1,4 @@
-use std::{
-    collections::{HashMap, HashSet},
-    sync::Arc,
-};
+use std::collections::{HashMap, HashSet};
 
 use validator::Validate;
 
@@ -9,8 +6,6 @@ use crate::{
     config::{self, GlobalRule, Route, Service, Upstream, SSL},
     core::{ProxyError, ProxyResult},
 };
-
-use crate::proxy::upstream::ProxyUpstream;
 
 /// Deserialized raw configuration graph used by the control plane.
 #[derive(Clone, Debug, Default)]
@@ -44,6 +39,33 @@ impl ResourceConfigSet {
     }
 }
 
+/// Validation gate named after the *runtime form* of a candidate graph:
+/// decoded with `SecretMode::DecryptForRuntime` (secrets decrypted, fail-closed
+/// on undecryptable values). This is the gate the graph authority
+/// (`replace_all`/`apply_watch`/`load_static`) runs on every candidate before
+/// submission, and the defense-in-depth gate candidate compilation runs on
+/// the decoded set it is handed.
+///
+/// Today the checks are form-independent — validators never look inside
+/// secret values — so both named gates enforce the identical body; the name
+/// states which form the caller holds so future secret-shape checks attach
+/// to the right boundary.
+pub fn validate_runtime_form(set: &ResourceConfigSet) -> ProxyResult<()> {
+    validate_config_set(set)
+}
+
+/// Validation gate named after the *stored form*: decoded with
+/// `SecretMode::PreserveStored`, so secret fields may still be ciphertext.
+/// Used by the etcd CAS planner (`graph_mutation::decode`) when validating a
+/// planned PUT/DELETE before it is committed.
+pub fn validate_stored_form(set: &ResourceConfigSet) -> ProxyResult<()> {
+    validate_config_set(set)
+}
+
+/// Whole-graph validation without a form name: structural validation of
+/// every resource plus cross-resource reference checks. Retained for
+/// existing authority call sites (which validate the runtime form); new call
+/// sites must use [`validate_runtime_form`] or [`validate_stored_form`].
 pub fn validate_config_set(set: &ResourceConfigSet) -> ProxyResult<()> {
     for upstream in set.upstreams.values() {
         upstream.validate().map_err(|e| {
@@ -181,153 +203,50 @@ pub(crate) fn scope_upstream_deps_rule(route: &Route) -> ProxyResult<HashSet<Str
     Ok(deps)
 }
 
-/// True when `dep` compiled to the same `Arc` in both runtimes, i.e. the
-/// dependency was actually reused rather than rebuilt by this candidate.
-pub(crate) fn upstream_arc_reused(
-    dep: &str,
-    upstreams: &HashMap<String, Arc<ProxyUpstream>>,
-    previous: &crate::proxy::runtime::RuntimeSnapshot,
-) -> bool {
-    upstreams
-        .get(dep)
-        .zip(previous.upstreams.get(dep))
-        .is_some_and(|(a, b)| Arc::ptr_eq(a, b))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{
-        Nodes, SelectionType, Upstream, UpstreamHashOn, UpstreamPassHost, UpstreamScheme,
+    use crate::proxy::control_plane::test_fixtures::{
+        global_rule, route_with_upstream_id, service, service_with_upstream_id,
+        traffic_split_plugin, upstream,
     };
-    use std::collections::HashMap as StdHashMap;
-
-    fn sample_upstream(id: &str, node: &str) -> Upstream {
-        let mut nodes = StdHashMap::new();
-        nodes.insert(node.to_string(), 1);
-        Upstream {
-            id: id.to_string(),
-            retries: None,
-            retry_timeout: None,
-            timeout: None,
-            nodes: Nodes::from_map(nodes),
-            r#type: SelectionType::RoundRobin,
-            checks: None,
-            hash_on: UpstreamHashOn::VARS,
-            key: "uri".into(),
-            scheme: UpstreamScheme::HTTP,
-            pass_host: UpstreamPassHost::PASS,
-            upstream_host: None,
-            tls: None,
-            keepalive_pool: None,
-        }
-    }
 
     #[test]
-    fn validate_config_set_rejects_dangling_route_upstream_id() {
+    fn validate_stored_form_rejects_dangling_route_upstream_id() {
         let mut set = ResourceConfigSet::default();
-        set.routes.insert(
-            "r1".into(),
-            crate::config::Route {
-                id: "r1".into(),
-                name: None,
-                uri: Some("/".into()),
-                uris: vec![],
-                methods: vec![],
-                host: None,
-                hosts: vec![],
-                priority: 0,
-                plugins: Default::default(),
-                upstream: None,
-                upstream_id: Some("missing".into()),
-                service_id: None,
-                timeout: None,
-                enable_websocket: false,
-            },
-        );
-        assert!(validate_config_set(&set).is_err());
+        set.routes
+            .insert("r1".into(), route_with_upstream_id("r1", "/", "missing"));
+        assert!(validate_stored_form(&set).is_err());
     }
 
     #[test]
-    fn validate_config_set_rejects_dangling_route_service_id() {
+    fn validate_stored_form_rejects_dangling_route_service_id() {
         let mut set = ResourceConfigSet::default();
         set.upstreams
-            .insert("u1".into(), sample_upstream("u1", "10.0.0.1:80"));
-        set.routes.insert(
-            "r1".into(),
-            crate::config::Route {
-                id: "r1".into(),
-                name: None,
-                uri: Some("/".into()),
-                uris: vec![],
-                methods: vec![],
-                host: None,
-                hosts: vec![],
-                priority: 0,
-                plugins: Default::default(),
-                upstream: None,
-                upstream_id: Some("u1".into()),
-                service_id: Some("missing".into()),
-                timeout: None,
-                enable_websocket: false,
-            },
-        );
-        assert!(validate_config_set(&set).is_err());
+            .insert("u1".into(), upstream("u1", "10.0.0.1:80"));
+        let mut route = route_with_upstream_id("r1", "/", "u1");
+        route.service_id = Some("missing".into());
+        set.routes.insert("r1".into(), route);
+        assert!(validate_stored_form(&set).is_err());
     }
 
     #[test]
-    fn validate_config_set_rejects_dangling_service_upstream_id() {
+    fn validate_stored_form_rejects_dangling_service_upstream_id() {
         let mut set = ResourceConfigSet::default();
-        set.services.insert(
-            "s1".into(),
-            crate::config::Service {
-                id: "s1".into(),
-                name: None,
-                plugins: Default::default(),
-                upstream: None,
-                upstream_id: Some("missing".into()),
-                hosts: vec![],
-            },
-        );
-        assert!(validate_config_set(&set).is_err());
+        set.services
+            .insert("s1".into(), service_with_upstream_id("s1", "missing"));
+        assert!(validate_stored_form(&set).is_err());
     }
 
     #[test]
-    fn validate_config_set_rejects_traffic_split_missing_upstream_on_route() {
+    fn validate_stored_form_rejects_traffic_split_missing_upstream_on_route() {
         let mut set = ResourceConfigSet::default();
         set.upstreams
-            .insert("u1".into(), sample_upstream("u1", "10.0.0.1:80"));
-        let mut plugins = std::collections::HashMap::new();
-        plugins.insert(
-            "traffic-split".into(),
-            serde_json::json!({
-                "rules": [{
-                    "weighted_upstreams": [
-                        { "upstream_id": "does-not-exist", "weight": 100 }
-                    ]
-                }]
-            }),
-        );
-        set.routes.insert(
-            "r1".into(),
-            crate::config::Route {
-                id: "r1".into(),
-                name: None,
-                uri: Some("/".into()),
-                uris: vec![],
-                methods: vec![],
-                host: None,
-                hosts: vec![],
-                priority: 0,
-                plugins,
-                upstream: None,
-                upstream_id: Some("u1".into()),
-                service_id: None,
-                timeout: None,
-                enable_websocket: false,
-            },
-        );
-        let err = validate_config_set(&set).unwrap_err().to_string();
+            .insert("u1".into(), upstream("u1", "10.0.0.1:80"));
+        let mut route = route_with_upstream_id("r1", "/", "u1");
+        route.plugins = traffic_split_plugin("does-not-exist");
+        set.routes.insert("r1".into(), route);
+        let err = validate_stored_form(&set).unwrap_err().to_string();
         assert!(
             err.contains("does-not-exist"),
             "expected missing upstream error, got: {err}"
@@ -335,180 +254,65 @@ mod tests {
     }
 
     #[test]
-    fn validate_config_set_rejects_traffic_split_missing_upstream_on_service() {
+    fn validate_stored_form_rejects_traffic_split_missing_upstream_on_service() {
         let mut set = ResourceConfigSet::default();
         set.upstreams
-            .insert("u1".into(), sample_upstream("u1", "10.0.0.1:80"));
-        let mut plugins = std::collections::HashMap::new();
-        plugins.insert(
-            "traffic-split".into(),
-            serde_json::json!({
-                "rules": [{
-                    "weighted_upstreams": [
-                        { "upstream_id": "missing-svc-up", "weight": 100 }
-                    ]
-                }]
-            }),
-        );
-        set.services.insert(
-            "s1".into(),
-            crate::config::Service {
-                id: "s1".into(),
-                name: None,
-                plugins,
-                upstream: None,
-                upstream_id: Some("u1".into()),
-                hosts: vec![],
-            },
-        );
-        let err = validate_config_set(&set).unwrap_err().to_string();
+            .insert("u1".into(), upstream("u1", "10.0.0.1:80"));
+        let mut service = service_with_upstream_id("s1", "u1");
+        service.plugins = traffic_split_plugin("missing-svc-up");
+        set.services.insert("s1".into(), service);
+        let err = validate_stored_form(&set).unwrap_err().to_string();
         assert!(err.contains("missing-svc-up"), "got: {err}");
     }
 
     #[test]
-    fn validate_config_set_rejects_traffic_split_missing_upstream_on_global_rule() {
+    fn validate_stored_form_rejects_traffic_split_missing_upstream_on_global_rule() {
         let mut set = ResourceConfigSet::default();
-        let mut plugins = std::collections::HashMap::new();
-        plugins.insert(
-            "traffic-split".into(),
-            serde_json::json!({
-                "rules": [{
-                    "weighted_upstreams": [
-                        { "upstream_id": "missing-gr-up", "weight": 100 }
-                    ]
-                }]
-            }),
-        );
-        set.global_rules.insert(
-            "g1".into(),
-            crate::config::GlobalRule {
-                id: "g1".into(),
-                plugins,
-            },
-        );
-        let err = validate_config_set(&set).unwrap_err().to_string();
+        let mut rule = global_rule("g1");
+        rule.plugins = traffic_split_plugin("missing-gr-up");
+        set.global_rules.insert("g1".into(), rule);
+        let err = validate_stored_form(&set).unwrap_err().to_string();
         assert!(err.contains("missing-gr-up"), "got: {err}");
     }
 
     #[test]
-    fn validate_config_set_accepts_traffic_split_with_existing_upstream() {
+    fn validate_stored_form_accepts_traffic_split_with_existing_upstream() {
         let mut set = ResourceConfigSet::default();
         set.upstreams
-            .insert("u1".into(), sample_upstream("u1", "10.0.0.1:80"));
-        set.upstreams.insert(
-            "payments".into(),
-            sample_upstream("payments", "10.0.0.2:80"),
-        );
-        let mut plugins = std::collections::HashMap::new();
-        plugins.insert(
-            "traffic-split".into(),
-            serde_json::json!({
-                "rules": [{
-                    "weighted_upstreams": [
-                        { "upstream_id": "payments", "weight": 100 }
-                    ]
-                }]
-            }),
-        );
-        set.routes.insert(
-            "r1".into(),
-            crate::config::Route {
-                id: "r1".into(),
-                name: None,
-                uri: Some("/".into()),
-                uris: vec![],
-                methods: vec![],
-                host: None,
-                hosts: vec![],
-                priority: 0,
-                plugins,
-                upstream: None,
-                upstream_id: Some("u1".into()),
-                service_id: None,
-                timeout: None,
-                enable_websocket: false,
-            },
-        );
-        assert!(validate_config_set(&set).is_ok());
+            .insert("u1".into(), upstream("u1", "10.0.0.1:80"));
+        set.upstreams
+            .insert("payments".into(), upstream("payments", "10.0.0.2:80"));
+        let mut route = route_with_upstream_id("r1", "/", "u1");
+        route.plugins = traffic_split_plugin("payments");
+        set.routes.insert("r1".into(), route);
+        assert!(validate_stored_form(&set).is_ok());
     }
 
     #[test]
-    fn validate_config_set_delete_upstream_referenced_by_traffic_split_fails() {
+    fn validate_stored_form_delete_upstream_referenced_by_traffic_split_fails() {
         // Simulate DELETE of upstream "payments" while a route traffic-split still
         // references it: the candidate set without "payments" must be rejected.
         let mut set = ResourceConfigSet::default();
         set.upstreams
-            .insert("u1".into(), sample_upstream("u1", "10.0.0.1:80"));
+            .insert("u1".into(), upstream("u1", "10.0.0.1:80"));
         // payments intentionally absent (deleted).
-        let mut plugins = std::collections::HashMap::new();
-        plugins.insert(
-            "traffic-split".into(),
-            serde_json::json!({
-                "rules": [{
-                    "weighted_upstreams": [
-                        { "upstream_id": "payments", "weight": 100 }
-                    ]
-                }]
-            }),
-        );
-        set.routes.insert(
-            "r1".into(),
-            crate::config::Route {
-                id: "r1".into(),
-                name: None,
-                uri: Some("/".into()),
-                uris: vec![],
-                methods: vec![],
-                host: None,
-                hosts: vec![],
-                priority: 0,
-                plugins,
-                upstream: None,
-                upstream_id: Some("u1".into()),
-                service_id: None,
-                timeout: None,
-                enable_websocket: false,
-            },
-        );
-        assert!(validate_config_set(&set).is_err());
+        let mut route = route_with_upstream_id("r1", "/", "u1");
+        route.plugins = traffic_split_plugin("payments");
+        set.routes.insert("r1".into(), route);
+        assert!(validate_stored_form(&set).is_err());
     }
 
     #[test]
-    fn validate_config_set_accepts_valid_graph() {
+    fn validate_runtime_form_accepts_valid_graph() {
         let mut set = ResourceConfigSet::default();
         set.upstreams
-            .insert("u1".into(), sample_upstream("u1", "10.0.0.1:80"));
-        set.services.insert(
-            "s1".into(),
-            crate::config::Service {
-                id: "s1".into(),
-                name: None,
-                plugins: Default::default(),
-                upstream: None,
-                upstream_id: Some("u1".into()),
-                hosts: vec![],
-            },
-        );
-        set.routes.insert(
-            "r1".into(),
-            crate::config::Route {
-                id: "r1".into(),
-                name: None,
-                uri: Some("/".into()),
-                uris: vec![],
-                methods: vec![],
-                host: None,
-                hosts: vec![],
-                priority: 0,
-                plugins: Default::default(),
-                upstream: None,
-                upstream_id: Some("u1".into()),
-                service_id: Some("s1".into()),
-                timeout: None,
-                enable_websocket: false,
-            },
-        );
-        assert!(validate_config_set(&set).is_ok());
+            .insert("u1".into(), upstream("u1", "10.0.0.1:80"));
+        set.services
+            .insert("s1".into(), service_with_upstream_id("s1", "u1"));
+        let mut route = route_with_upstream_id("r1", "/", "u1");
+        route.service_id = Some("s1".into());
+        set.routes.insert("r1".into(), route);
+        assert!(validate_runtime_form(&set).is_ok());
     }
 
     // ---------------------------------------------------------------------
@@ -517,51 +321,6 @@ mod tests {
 
     mod scope_dependency {
         use super::*;
-
-        fn route_with_upstream_id(id: &str, uri: &str, upstream_id: &str) -> crate::config::Route {
-            crate::config::Route {
-                id: id.into(),
-                name: None,
-                uri: Some(uri.into()),
-                uris: vec![],
-                methods: vec![],
-                host: None,
-                hosts: vec![],
-                priority: 0,
-                plugins: Default::default(),
-                upstream: None,
-                upstream_id: Some(upstream_id.into()),
-                service_id: None,
-                timeout: None,
-                enable_websocket: false,
-            }
-        }
-
-        fn service_with_upstream_id(id: &str, upstream_id: &str) -> crate::config::Service {
-            crate::config::Service {
-                id: id.into(),
-                name: None,
-                plugins: Default::default(),
-                upstream: None,
-                upstream_id: Some(upstream_id.into()),
-                hosts: vec![],
-            }
-        }
-
-        fn traffic_split_plugin(upstream_id: &str) -> HashMap<String, serde_json::Value> {
-            let mut plugins = HashMap::new();
-            plugins.insert(
-                "traffic-split".into(),
-                serde_json::json!({
-                    "rules": [{
-                        "weighted_upstreams": [
-                            { "upstream_id": upstream_id, "weight": 100 }
-                        ]
-                    }]
-                }),
-            );
-            plugins
-        }
 
         #[test]
         fn service_deps_are_direct_id_plus_plugin_refs() {
@@ -587,23 +346,13 @@ mod tests {
 
         #[test]
         fn global_rule_without_plugins_has_empty_deps() {
-            let rule = crate::config::GlobalRule {
-                id: "g1".into(),
-                plugins: Default::default(),
-            };
+            let rule = global_rule("g1");
             assert!(plugin_upstream_deps(&rule.plugins).unwrap().is_empty());
         }
 
         #[test]
         fn service_without_refs_has_empty_deps() {
-            let service = crate::config::Service {
-                id: "s1".into(),
-                name: None,
-                plugins: Default::default(),
-                upstream: None,
-                upstream_id: None,
-                hosts: vec![],
-            };
+            let service = service("s1");
             assert!(scope_upstream_deps(&service).unwrap().is_empty());
         }
     }

@@ -1,10 +1,7 @@
 use std::{
     borrow::Cow,
     collections::{HashMap, VecDeque},
-    sync::{
-        atomic::{AtomicU64, Ordering},
-        Arc, Mutex, RwLock, Weak,
-    },
+    sync::{Arc, Mutex, RwLock, Weak},
     time::{Duration, Instant},
 };
 
@@ -25,14 +22,13 @@ use crate::{
     core::{PluginPhases, ProxyContext, ProxyError, ProxyPlugin, ProxyResult},
     plugins::{
         config::parse_and_validate_plugin_config,
-        limiter_shards::{
-            shard_idx, TouchOrder, CLEANUP_BUDGET, LIMIT_SHARDS, PER_SHARD_REGULAR_MAX,
+        limiting::{
+            default_rejected_code, next_instance_ctx_key, select_rules, send_rejection,
+            validate_key, validate_rejected_msg, BoundedShardMap, CountKeyType as KeyType,
+            CountPolicy as Policy, RejectPolicy, Shard, SweepMiss, LIMIT_COUNT_OVERFLOW,
         },
     },
-    utils::{
-        request::{apisix_key, render_apisix_request_template, request_selector_key},
-        response::ResponseBuilder,
-    },
+    utils::request::{apisix_key, request_selector_key},
 };
 
 pub const PLUGIN_NAME: &str = "limit-count";
@@ -42,10 +38,9 @@ const PRIORITY: i32 = 1002;
 /// Keeping a single `vars` entry (instead of three string entries) avoids
 /// three key allocations per request on the hot path. Keyed per instance so a
 /// global and a route limit-count instance never overwrite each other's quota.
-static NEXT_INSTANCE_ID: AtomicU64 = AtomicU64::new(1);
-
+#[cfg(test)]
 fn rate_limit_quota_key(instance_id: u64) -> String {
-    format!("pingsix_rate_limit_quota_{instance_id}")
+    crate::plugins::limiting::instance_ctx_key("pingsix_rate_limit_quota_", instance_id)
 }
 
 /// Hard cap on timestamp history per sliding-window key. Older entries are
@@ -122,10 +117,11 @@ pub fn create_limit_count_plugin(
     }
 
     Ok(Arc::new(PluginRateLimit {
+        reject: RejectPolicy::new(config.rejected_code, config.rejected_msg.clone()),
         fixed_rates: build_fixed_rates(&config),
         config,
-        sliding: std::array::from_fn(|_| Mutex::new(SlidingShard::default())),
-        quota_key: rate_limit_quota_key(NEXT_INSTANCE_ID.fetch_add(1, Ordering::Relaxed)),
+        sliding: BoundedShardMap::new(),
+        quota_key: next_instance_ctx_key("pingsix_rate_limit_quota_"),
         group_state,
     }))
 }
@@ -143,7 +139,7 @@ struct GroupState {
     /// never serialized on this registry; the write lock is taken only to
     /// register a window for the first time.
     fixed_rates: RwLock<HashMap<u32, Arc<Rate>>>,
-    sliding: [Mutex<SlidingShard>; LIMIT_SHARDS],
+    sliding: BoundedShardMap<SlidingWindow>,
 }
 
 impl GroupState {
@@ -175,11 +171,8 @@ impl GroupState {
             }
             WindowType::Sliding => {
                 let now = Instant::now();
-                let mut shard = self.sliding[shard_idx(key)]
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner());
-                let window = shard.get_or_insert_window(key, now);
-                window.observe(now, time_window) as isize
+                let mut shard = self.sliding.lock(key);
+                sliding_window_for(&mut shard, key, now).observe(now, time_window) as isize
             }
         }
     }
@@ -198,7 +191,7 @@ fn group_state(group: &str) -> Arc<GroupState> {
     }
     let state = Arc::new(GroupState {
         fixed_rates: RwLock::new(HashMap::new()),
-        sliding: std::array::from_fn(|_| Mutex::new(SlidingShard::default())),
+        sliding: BoundedShardMap::new(),
     });
     registry.insert(group.to_string(), Arc::downgrade(&state));
     state
@@ -279,7 +272,7 @@ struct PluginConfig {
     window_type: WindowType,
 
     /// HTTP status code for rejected requests (default: 503).
-    #[serde(default = "PluginConfig::default_rejected_code")]
+    #[serde(default = "default_rejected_code")]
     #[validate(range(min = 200, max = 599))]
     rejected_code: u16,
 
@@ -334,32 +327,6 @@ enum WindowType {
     Sliding,
 }
 
-#[derive(Debug, Serialize, Deserialize, Clone, Copy, Default, PartialEq, Eq)]
-#[serde(rename_all = "lowercase")]
-enum KeyType {
-    #[default]
-    Var,
-    #[serde(rename = "var_combination")]
-    VarCombination,
-    Constant,
-    /// Pingsix legacy selector: `key` names an HTTP request header.
-    Head,
-    /// Pingsix legacy selector: `key` names a cookie.
-    Cookie,
-}
-
-#[derive(Debug, Serialize, Deserialize, Clone, Copy, Default, PartialEq, Eq)]
-#[serde(rename_all = "lowercase")]
-enum Policy {
-    #[default]
-    Local,
-    Redis,
-    #[serde(rename = "redis-cluster")]
-    RedisCluster,
-    #[serde(rename = "redis-sentinel")]
-    RedisSentinel,
-}
-
 #[derive(Debug, Serialize, Deserialize, Clone, Copy, Default)]
 #[serde(rename_all = "lowercase")]
 enum KeyMissingPolicy {
@@ -385,10 +352,6 @@ impl PluginConfig {
         "remote_addr".to_string()
     }
 
-    fn default_rejected_code() -> u16 {
-        503
-    }
-
     fn default_show_limit_quota_header() -> bool {
         true
     }
@@ -404,11 +367,7 @@ impl TryFrom<JsonValue> for PluginConfig {
     fn try_from(value: JsonValue) -> Result<Self, Self::Error> {
         let config: PluginConfig =
             parse_and_validate_plugin_config(value, "Invalid limit count plugin config")?;
-        if config.policy != Policy::Local {
-            return Err(ProxyError::validation_error(
-                "limit-count policy 'redis'/'redis-cluster'/'redis-sentinel' requires a distributed backend; only 'local' is supported",
-            ));
-        }
+        config.policy.ensure_local("limit-count")?;
         if config.scope == Scope::Cluster {
             return Err(ProxyError::validation_error(
                 "limit-count scope 'cluster' requires a distributed backend",
@@ -447,15 +406,6 @@ impl TryFrom<JsonValue> for PluginConfig {
     }
 }
 
-/// Validates the `key` field. APISIX keys may be nginx variables or variable
-/// combinations, so no character restrictions are applied beyond non-emptiness.
-fn validate_key(key: &str) -> Result<(), ValidationError> {
-    if key.trim().is_empty() {
-        return Err(ValidationError::new("key cannot be empty"));
-    }
-    Ok(())
-}
-
 fn validate_optional_count(value: u32) -> Result<(), ValidationError> {
     if value < 1 {
         return Err(ValidationError::new("count must be > 0"));
@@ -467,15 +417,6 @@ fn validate_optional_time_window(value: u32) -> Result<(), ValidationError> {
     if !(1..=86400).contains(&value) {
         return Err(ValidationError::new(
             "time_window must be between 1 and 86400 seconds",
-        ));
-    }
-    Ok(())
-}
-
-fn validate_rejected_msg(value: &&String) -> Result<(), ValidationError> {
-    if value.is_empty() {
-        return Err(ValidationError::new(
-            "rejected_msg must have at least 1 character",
         ));
     }
     Ok(())
@@ -565,61 +506,31 @@ impl SlidingWindow {
     }
 }
 
-/// Sharded storage for sliding-window histories. Bounded like the other local
-/// limiters: one stable overflow entry per shard once regular capacity fills.
-#[derive(Default)]
-struct SlidingShard {
-    entries: HashMap<String, SlidingWindow>,
-    touch_order: TouchOrder,
+/// True when the window's newest event is older than any configured window
+/// can possibly be ([`MAX_WINDOW_SECS`]), or the window holds no events — the
+/// sweep predicate for the shared budgeted stale-sweep.
+fn sliding_stale(window: &SlidingWindow, now: Instant) -> bool {
+    match window.events.back() {
+        Some(last) => now
+            .checked_duration_since(*last)
+            .is_some_and(|age| age >= Duration::from_secs(MAX_WINDOW_SECS as u64)),
+        None => true,
+    }
 }
 
-impl SlidingShard {
-    fn touch(&mut self, key: &str) {
-        self.touch_order.touch(key);
-    }
-
-    /// Remove no more than `CLEANUP_BUDGET` oldest histories whose newest event
-    /// is older than any configured window can possibly be.
-    fn sweep_stale(&mut self, now: Instant) {
-        for _ in 0..CLEANUP_BUDGET {
-            let Some((touch, key)) = self.touch_order.pop_oldest() else {
-                break;
-            };
-            let stale = match self.entries.get(&key) {
-                Some(window) => match window.events.back() {
-                    Some(last) => now
-                        .checked_duration_since(*last)
-                        .is_some_and(|age| age >= Duration::from_secs(MAX_WINDOW_SECS as u64)),
-                    None => true,
-                },
-                None => true,
-            };
-            if stale {
-                self.entries.remove(&key);
-            } else {
-                self.touch_order.restore(touch, key);
-            }
-        }
-    }
-
-    /// Get (or create) the window for `key`, applying the shared bounded-shard
-    /// admission rules first.
-    fn get_or_insert_window(&mut self, key: &str, now: Instant) -> &mut SlidingWindow {
-        if !self.entries.contains_key(key) && self.entries.len() >= PER_SHARD_REGULAR_MAX {
-            self.sweep_stale(now);
-        }
-        let storage_key =
-            if self.entries.contains_key(key) || self.entries.len() < PER_SHARD_REGULAR_MAX {
-                key
-            } else {
-                "__pingsix_limit_count_overflow__"
-            };
-        self.entries.entry(storage_key.to_string()).or_default();
-        self.touch(storage_key);
-        self.entries
-            .get_mut(storage_key)
-            .expect("inserted sliding window exists")
-    }
+/// Get (or create) the window for `key` within one shard, applying the shared
+/// bounded-shard admission rules (one stable overflow entry per shard once
+/// regular capacity fills) first.
+fn sliding_window_for<'a>(
+    shard: &'a mut Shard<SlidingWindow>,
+    key: &str,
+    now: Instant,
+) -> &'a mut SlidingWindow {
+    shard
+        .admit(key, LIMIT_COUNT_OVERFLOW, |shard| {
+            shard.sweep(|window| sliding_stale(window, now), SweepMiss::Restore)
+        })
+        .or_default()
 }
 
 /// Rate Limit plugin implementation.
@@ -631,11 +542,12 @@ pub struct PluginRateLimit {
     /// One fixed-window [`Rate`] per configured time window.
     fixed_rates: HashMap<u32, Rate>,
     /// Sharded sliding-window histories, used only when `window_type: sliding`.
-    sliding: [Mutex<SlidingShard>; LIMIT_SHARDS],
+    sliding: BoundedShardMap<SlidingWindow>,
     /// Per-instance context key for the quota shared with `response_filter`.
     quota_key: String,
     /// Shared counters for APISIX `group` semantics, when configured.
     group_state: Option<Arc<GroupState>>,
+    reject: RejectPolicy,
 }
 
 #[async_trait]
@@ -664,14 +576,14 @@ impl ProxyPlugin for PluginRateLimit {
             RATE_LIMIT_REQUESTS
                 .with_label_values(&["rejected", "local"])
                 .inc();
-            ResponseBuilder::send_proxy_error(
+            return send_rejection(
                 session,
+                ctx,
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Some("failed to get rate limit rules"),
-                None,
+                &[],
             )
-            .await?;
-            return Ok(true);
+            .await;
         };
 
         let mut quotas = Vec::new();
@@ -693,6 +605,7 @@ impl ProxyPlugin for PluginRateLimit {
                 return self
                     .handle_rate_limit(
                         session,
+                        ctx,
                         &selection,
                         outcome.current_count,
                         outcome.remaining,
@@ -750,18 +663,6 @@ impl ProxyPlugin for PluginRateLimit {
     }
 }
 
-/// Evaluate a `rules` entry's key template. APISIX skips a rule only when
-/// the template contains no placeholders; a placeholder whose variable is
-/// absent renders empty and is still enforced as the empty-key bucket.
-fn resolve_rule_key(session: &mut Session, rule_key: &str) -> Option<Cow<'static, str>> {
-    if !rule_key.contains('$') {
-        return None;
-    }
-    Some(Cow::Owned(render_apisix_request_template(
-        session, rule_key,
-    )))
-}
-
 impl PluginRateLimit {
     /// The plugin-level branch, when the oneOf validation guarantees it.
     fn main_selection(&self) -> Option<LimitSelection> {
@@ -802,10 +703,12 @@ impl PluginRateLimit {
         session: &mut Session,
     ) -> Option<Vec<(Cow<'static, str>, LimitSelection)>> {
         if !self.config.rules.is_empty() {
-            let mut limits = Vec::new();
-            for (index, rule) in self.config.rules.iter().enumerate() {
-                if let Some(key) = resolve_rule_key(session, &rule.key) {
-                    limits.push((
+            return select_rules(
+                session,
+                &self.config.rules,
+                |rule| rule.key.as_str(),
+                |index, rule, key| {
+                    (
                         key,
                         LimitSelection {
                             count: rule.count,
@@ -818,14 +721,9 @@ impl PluginRateLimit {
                                 .unwrap_or_else(|| (index + 1).to_string()),
                             from_rule: true,
                         },
-                    ));
-                }
-            }
-            return if limits.is_empty() {
-                None
-            } else {
-                Some(limits)
-            };
+                    )
+                },
+            );
         }
 
         let selection = self.main_selection()?;
@@ -868,14 +766,14 @@ impl PluginRateLimit {
                 RATE_LIMIT_REQUESTS
                     .with_label_values(&["rejected", "local"])
                     .inc();
-                ResponseBuilder::send_proxy_error(
+                send_rejection(
                     session,
+                    ctx,
                     StatusCode::BAD_REQUEST,
                     Some("Missing required key for rate limiting"),
-                    None,
+                    &[],
                 )
-                .await?;
-                Ok(true)
+                .await
             }
             KeyMissingPolicy::Default => {
                 // Use a default key for all requests with missing keys
@@ -890,6 +788,7 @@ impl PluginRateLimit {
                         .inc();
                     self.handle_rate_limit(
                         session,
+                        ctx,
                         &selection,
                         outcome.current_count,
                         outcome.remaining,
@@ -942,11 +841,9 @@ impl PluginRateLimit {
             }
             (None, WindowType::Sliding) => {
                 let now = Instant::now();
-                let mut shard = self.sliding[shard_idx(namespaced.as_ref())]
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner());
-                let window = shard.get_or_insert_window(namespaced.as_ref(), now);
-                window.observe(now, selection.time_window) as isize
+                let mut shard = self.sliding.lock(namespaced.as_ref());
+                sliding_window_for(&mut shard, namespaced.as_ref(), now)
+                    .observe(now, selection.time_window) as isize
             }
         };
         let remaining = (selection.count as isize) - current_count;
@@ -963,6 +860,7 @@ impl PluginRateLimit {
     async fn handle_rate_limit(
         &self,
         session: &mut Session,
+        ctx: &ProxyContext,
         selection: &LimitSelection,
         current_count: isize,
         remaining: isize,
@@ -977,27 +875,16 @@ impl PluginRateLimit {
             HeaderPath::Rejection,
         );
 
-        let headers_ref: Vec<(&str, &str)> = headers
-            .iter()
-            .map(|(k, v)| (k.as_str(), v.as_str()))
-            .collect();
-
         session.set_keepalive(None);
 
-        ResponseBuilder::send_proxy_error(
+        send_rejection(
             session,
-            StatusCode::from_u16(self.config.rejected_code)
-                .unwrap_or(StatusCode::SERVICE_UNAVAILABLE),
+            ctx,
+            self.reject.status(),
             self.config.rejected_msg.as_deref(),
-            if headers_ref.is_empty() {
-                None
-            } else {
-                Some(&headers_ref)
-            },
+            &headers,
         )
-        .await?;
-
-        Ok(true)
+        .await
     }
 }
 
@@ -1071,14 +958,16 @@ fn build_rate_limit_headers(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::hash_map::Entry;
 
     fn make_plugin(cfg: JsonValue) -> PluginRateLimit {
         let config = PluginConfig::try_from(cfg).unwrap();
         let fixed_rates = build_fixed_rates(&config);
         PluginRateLimit {
-            config,
+            reject: RejectPolicy::new(config.rejected_code, config.rejected_msg.clone()),
             fixed_rates,
-            sliding: std::array::from_fn(|_| Mutex::new(SlidingShard::default())),
+            config,
+            sliding: BoundedShardMap::new(),
             quota_key: rate_limit_quota_key(99),
             group_state: None,
         }
@@ -1488,28 +1377,36 @@ mod tests {
 
     #[test]
     fn sliding_window_drops_events_older_than_window() {
-        let mut shard = SlidingShard::default();
+        let mut shard = Shard::<SlidingWindow>::default();
         let start = Instant::now();
 
-        let window = shard.get_or_insert_window("key", start);
-        assert_eq!(window.observe(start, 10), 1);
-        assert_eq!(window.observe(start, 10), 2);
+        assert_eq!(
+            sliding_window_for(&mut shard, "key", start).observe(start, 10),
+            1
+        );
+        assert_eq!(
+            sliding_window_for(&mut shard, "key", start).observe(start, 10),
+            2
+        );
 
         let later = start + Duration::from_secs(10);
-        let window = shard.get_or_insert_window("key", later);
-        assert_eq!(window.observe(later, 10), 1);
+        assert_eq!(
+            sliding_window_for(&mut shard, "key", later).observe(later, 10),
+            1
+        );
     }
 
     #[test]
     fn sliding_window_history_is_bounded_per_key() {
-        let mut shard = SlidingShard::default();
+        let mut shard = Shard::<SlidingWindow>::default();
         let now = Instant::now();
         for _ in 0..MAX_SLIDING_ENTRIES_PER_KEY + 10 {
-            let window = shard.get_or_insert_window("key", now);
-            window.observe(now, MAX_WINDOW_SECS);
+            sliding_window_for(&mut shard, "key", now).observe(now, MAX_WINDOW_SECS);
         }
-        let window = shard.entries.get("key").unwrap();
-        assert_eq!(window.events.len(), MAX_SLIDING_ENTRIES_PER_KEY);
+        let Entry::Occupied(window) = shard.entry("key".into()) else {
+            panic!("the observed window exists")
+        };
+        assert_eq!(window.get().events.len(), MAX_SLIDING_ENTRIES_PER_KEY);
     }
 
     #[test]

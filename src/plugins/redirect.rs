@@ -11,7 +11,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
 use validator::{Validate, ValidationError};
 
-use crate::utils::request::get_direct_client_ip;
+use crate::utils::request::{
+    get_direct_client_ip, render_template, resolve_var, session_is_tls, TemplateOptions,
+};
 use crate::{
     core::{
         apply_regex_uri_template, PluginPhases, ProxyContext, ProxyError, ProxyPlugin, ProxyResult,
@@ -369,10 +371,7 @@ impl PluginRedirect {
 }
 
 fn session_has_tls(session: &Session) -> bool {
-    session
-        .digest()
-        .and_then(|d| d.ssl_digest.as_ref())
-        .is_some()
+    session_is_tls(session)
 }
 
 /// Percent-encode a URI path without touching unreserved characters, `/`, or
@@ -408,87 +407,19 @@ fn encode_uri_safe_path(path: &str) -> String {
 }
 
 /// Expand APISIX nginx-style `$name` / `${name}` variables in a redirect URI
-/// template. Escaped `\$` stays a literal `$`; unknown variables expand to an
-/// empty string.
+/// template with the shared request-phase variable registry. Escaped `\$`
+/// stays a literal `$`; unknown variables expand to an empty string.
+///
+/// `scheme` needs the connection's TLS state when the URI is origin-form;
+/// [`resolve_var`] derives it from the session itself.
 fn expand_uri_template(template: &str, session: &Session) -> String {
-    render_redirect_template(template, |name| {
-        resolve_redirect_var(session.req_header(), session_has_tls(session), name)
-    })
-}
-
-/// Variable-expansion parser, kept free of `Session` for unit testing.
-fn render_redirect_template<F>(template: &str, mut resolve: F) -> String
-where
-    F: FnMut(&str) -> String,
-{
-    let mut rendered = String::with_capacity(template.len());
-    let mut chars = template.chars().peekable();
-    while let Some(ch) = chars.next() {
-        match ch {
-            '\\' => {
-                if chars.peek() == Some(&'$') {
-                    chars.next();
-                    rendered.push('$');
-                } else {
-                    rendered.push('\\');
-                }
-            }
-            '$' => {
-                let name = if chars.peek() == Some(&'{') {
-                    chars.next();
-                    let mut name = String::new();
-                    for ch in chars.by_ref() {
-                        if ch == '}' {
-                            break;
-                        }
-                        name.push(ch);
-                    }
-                    name
-                } else {
-                    let mut name = String::new();
-                    while matches!(chars.peek(), Some(ch) if ch.is_ascii_alphanumeric() || *ch == '_')
-                    {
-                        name.push(chars.next().expect("peeked character exists"));
-                    }
-                    name
-                };
-                if name.is_empty() {
-                    rendered.push('$');
-                } else {
-                    rendered.push_str(&resolve(&name));
-                }
-            }
-            other => rendered.push(other),
-        }
-    }
-    rendered
-}
-
-/// Resolve the nginx-style variables supported by redirect templates.
-fn resolve_redirect_var(req: &RequestHeader, tls: bool, name: &str) -> String {
-    match name {
-        "host" => req
-            .headers
-            .get(header::HOST)
-            .and_then(|value| value.to_str().ok())
-            .map(str::to_string)
-            .or_else(|| req.uri.host().map(str::to_string))
-            .unwrap_or_default(),
-        "request_uri" => req
-            .uri
-            .path_and_query()
-            .map_or_else(|| req.uri.path().to_string(), |pq| pq.as_str().to_string()),
-        "uri" => req.uri.path().to_string(),
-        "scheme" => req.uri.scheme_str().map(str::to_string).unwrap_or_else(|| {
-            if tls {
-                "https".to_string()
-            } else {
-                "http".to_string()
-            }
-        }),
-        "request_method" => req.method.as_str().to_string(),
-        _ => String::new(),
-    }
+    render_template(
+        template,
+        TemplateOptions {
+            escape_dollar: true,
+        },
+        |name| resolve_var(session, name).into_owned(),
+    )
 }
 
 /// Determine whether an HTTP request header should trigger an HTTPS redirect.
@@ -518,6 +449,7 @@ mod tests {
     use super::*;
     use std::net::IpAddr;
 
+    use crate::utils::{request::apisix_key, testing::session_from_request};
     use pingora_http::RequestHeader;
 
     fn ip_is_trusted(ip: IpAddr, trusted: &[IpNetwork]) -> bool {
@@ -705,31 +637,88 @@ mod tests {
         assert_eq!(encode_uri_safe_path("/%zz"), "/%25zz");
     }
 
-    #[test]
-    fn redirect_template_expands_known_vars_and_escaped_dollar() {
-        let rendered = render_redirect_template(
-            "$host$request_uri-$uri-${scheme}-${request_method}-$unknown-\\$host",
-            |name| match name {
-                "host" => "example.com".to_string(),
-                "request_uri" => "/p?q=1".to_string(),
-                "uri" => "/p".to_string(),
-                "scheme" => "https".to_string(),
-                "request_method" => "GET".to_string(),
-                _ => String::new(),
-            },
+    #[tokio::test]
+    async fn expand_uri_template_resolves_request_vars_and_keeps_escaped_dollar() {
+        // `$name` / `${name}` equivalence, `\$` -> literal `$`, unknown -> "".
+        let session =
+            session_from_request("POST /p?q=1 HTTP/1.1\r\nHost: example.com\r\n\r\n").await;
+        assert_eq!(
+            expand_uri_template(
+                "$host$request_uri-$uri-${scheme}-${request_method}-$unknown-\\$host",
+                &session,
+            ),
+            "example.com/p?q=1-/p-http-POST--$host"
         );
-        assert_eq!(rendered, "example.com/p?q=1-/p-https-GET--$host");
     }
 
-    #[test]
-    fn resolve_redirect_var_reads_request() {
-        let req = make_req_header("GET", b"/p?q=1", vec![("host", "example.com")]);
-        assert_eq!(resolve_redirect_var(&req, false, "host"), "example.com");
-        assert_eq!(resolve_redirect_var(&req, false, "request_uri"), "/p?q=1");
-        assert_eq!(resolve_redirect_var(&req, false, "uri"), "/p");
-        assert_eq!(resolve_redirect_var(&req, false, "scheme"), "http");
-        assert_eq!(resolve_redirect_var(&req, true, "scheme"), "https");
-        assert_eq!(resolve_redirect_var(&req, false, "request_method"), "GET");
-        assert_eq!(resolve_redirect_var(&req, false, "unknown"), "");
+    /// Wire a session over a real loopback TCP pair so the session digest
+    /// carries a real peer address (`$remote_addr` / `$remote_port`).
+    #[cfg(unix)]
+    async fn tcp_session(raw: &str) -> (Session, std::net::SocketAddr) {
+        use pingora_core::protocols::l4::stream::Stream;
+        use pingora_core::protocols::{GetSocketDigest, SocketDigest, IO};
+        use std::os::unix::io::AsRawFd;
+        use tokio::io::AsyncWriteExt as _;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mut client = tokio::net::TcpStream::connect(listener.local_addr().unwrap())
+            .await
+            .unwrap();
+        let client_addr = client.local_addr().unwrap();
+        let (server, _) = listener.accept().await.unwrap();
+        client.write_all(raw.as_bytes()).await.unwrap();
+
+        let raw_fd = server.as_raw_fd();
+        let mut stream = Stream::from(server);
+        stream.set_socket_digest(SocketDigest::from_raw_fd(raw_fd));
+        let mut session = Session::new_h1(Box::new(stream) as Box<dyn IO>);
+        session
+            .downstream_session
+            .read_request()
+            .await
+            .expect("loopback request parses");
+        (session, client_addr)
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn expand_uri_template_resolves_connection_and_selector_vars() {
+        // Intended T5 gains: `$remote_addr`, `$remote_port`, `arg_*` and
+        // `http_*` previously expanded to "" in redirect templates.
+        let wire = "GET /p?a=q1 HTTP/1.1\r\nHost: example.com\r\nX-K: v1\r\n\r\n";
+        let (session, client_addr) = tcp_session(wire).await;
+        assert_eq!(
+            expand_uri_template("$remote_addr:$remote_port:$arg_a:$http_x_k", &session),
+            format!("{}:{}:q1:v1", client_addr.ip(), client_addr.port(),)
+        );
+        assert_eq!(client_addr.ip().to_string(), "127.0.0.1");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn expand_uri_template_scheme_falls_back_to_connection_tls_state() {
+        // Origin-form URI + plaintext loopback connection -> "http".
+        let (session, _) = tcp_session("GET /p HTTP/1.1\r\nHost: t\r\n\r\n").await;
+        assert_eq!(expand_uri_template("$scheme", &session), "http");
+    }
+
+    #[tokio::test]
+    async fn redirect_host_var_matches_apisix_key_precedence() {
+        // Host precedence parity: URI authority wins over the Host header in
+        // both the redirect template and the APISIX limiter-key path.
+        let wire = "GET /p?a=1 HTTP/1.1\r\nHost: header.example:9090\r\n\r\n";
+        let mut for_redirect = session_from_request(wire).await;
+        for_redirect
+            .req_header_mut()
+            .set_uri("http://uri.example:8080/p?a=1".parse().unwrap());
+        let mut for_key = session_from_request(wire).await;
+        for_key
+            .req_header_mut()
+            .set_uri("http://uri.example:8080/p?a=1".parse().unwrap());
+
+        let redirect_host = expand_uri_template("$host", &for_redirect);
+        let key_host = apisix_key(&mut for_key, "host", false);
+        assert_eq!(redirect_host, key_host.as_ref());
+        assert_eq!(redirect_host, "uri.example");
     }
 }

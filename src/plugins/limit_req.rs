@@ -8,16 +8,17 @@
 //! requests are rejected until the bucket drains.
 //!
 //! The algorithm mirrors `lua-resty-limit-traffic`'s `limit/req.lua`
-//! `incoming()` so behavior matches APISIX with `policy: local`.
+//! `incoming()` so behavior matches APISIX with `policy: local`. Schema,
+//! pure transition, and hook wiring live here; shard admission/overflow,
+//! policy enums, and the rejection writer live in `plugins::limiting`.
 
 use std::{
-    collections::{hash_map::Entry, HashMap},
-    sync::{Arc, Mutex},
+    collections::hash_map::Entry,
+    sync::Arc,
     time::{Duration, Instant},
 };
 
 use async_trait::async_trait;
-use http::StatusCode;
 use pingora_error::Result;
 use pingora_proxy::Session;
 use serde::{Deserialize, Serialize};
@@ -26,10 +27,14 @@ use validator::{Validate, ValidationError};
 
 use crate::{
     core::{PluginPhases, ProxyContext, ProxyError, ProxyPlugin, ProxyResult},
-    plugins::limiter_shards::{
-        shard_idx, TouchOrder, CLEANUP_BUDGET, LIMIT_SHARDS, PER_SHARD_REGULAR_MAX,
+    plugins::{
+        config::parse_and_validate_plugin_config,
+        limiting::{
+            default_rejected_code, validate_key, validate_rejected_msg, BoundedShardMap, KeyType,
+            Policy, RejectPolicy, SweepMiss, LIMIT_REQ_OVERFLOW,
+        },
     },
-    utils::{request::apisix_key, response::ResponseBuilder},
+    utils::request::apisix_key,
 };
 
 pub const PLUGIN_NAME: &str = "limit-req";
@@ -44,8 +49,9 @@ pub fn create_limit_req_plugin(
 ) -> ProxyResult<Arc<dyn ProxyPlugin>> {
     let config = PluginConfig::try_from(cfg)?;
     Ok(Arc::new(PluginLimitReq {
+        reject: RejectPolicy::new(config.rejected_code, config.rejected_msg.clone()),
         config,
-        buckets: std::array::from_fn(|_| Mutex::new(BucketShard::default())),
+        buckets: BoundedShardMap::new(),
     }))
 }
 
@@ -54,35 +60,6 @@ pub fn create_limit_req_plugin(
 struct Bucket {
     excess: f64,
     last: Instant,
-}
-
-#[derive(Default)]
-struct BucketShard {
-    entries: HashMap<String, Bucket>,
-    touch_order: TouchOrder,
-}
-
-impl BucketShard {
-    fn touch(&mut self, key: &str) {
-        self.touch_order.touch(key);
-    }
-
-    /// Remove no more than `CLEANUP_BUDGET` oldest drained buckets.
-    fn sweep_drained(&mut self, now: Instant, rate: f64) {
-        for _ in 0..CLEANUP_BUDGET {
-            let Some((touch, key)) = self.touch_order.pop_oldest() else {
-                break;
-            };
-            let drained = self.entries.get(&key).is_some_and(|bucket| {
-                now.duration_since(bucket.last).as_secs_f64() * rate >= bucket.excess
-            });
-            if drained {
-                self.entries.remove(&key);
-            } else {
-                self.touch_order.restore(touch, key);
-            }
-        }
-    }
 }
 
 /// Pure leaky-bucket transition (unit-testable).
@@ -130,25 +107,6 @@ fn bucket_incoming(
     }
 }
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-enum KeyType {
-    #[default]
-    Var,
-    #[serde(rename = "var_combination")]
-    VarCombination,
-}
-
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-enum Policy {
-    #[default]
-    Local,
-    Redis,
-    #[serde(rename = "redis-cluster")]
-    RedisCluster,
-}
-
 #[derive(Debug, Serialize, Deserialize, Validate)]
 struct PluginConfig {
     /// Maximum number of requests allowed per second (bucket drain rate).
@@ -168,7 +126,7 @@ struct PluginConfig {
     #[validate(custom(function = "validate_key"))]
     key: String,
 
-    #[serde(default = "PluginConfig::default_rejected_code")]
+    #[serde(default = "default_rejected_code")]
     #[validate(range(min = 200, max = 599))]
     rejected_code: u16,
 
@@ -186,12 +144,6 @@ struct PluginConfig {
     policy: Policy,
 }
 
-impl PluginConfig {
-    fn default_rejected_code() -> u16 {
-        503
-    }
-}
-
 fn validate_rate(value: f64) -> Result<(), ValidationError> {
     if !value.is_finite() || value <= 0.0 {
         return Err(ValidationError::new("rate must be > 0"));
@@ -206,34 +158,13 @@ fn validate_burst(value: f64) -> Result<(), ValidationError> {
     Ok(())
 }
 
-fn validate_rejected_msg(value: &&String) -> Result<(), ValidationError> {
-    if value.is_empty() {
-        return Err(ValidationError::new(
-            "rejected_msg must have at least 1 character",
-        ));
-    }
-    Ok(())
-}
-
-fn validate_key(key: &str) -> Result<(), ValidationError> {
-    if key.trim().is_empty() {
-        return Err(ValidationError::new("key cannot be empty"));
-    }
-    Ok(())
-}
-
 impl TryFrom<JsonValue> for PluginConfig {
     type Error = ProxyError;
 
     fn try_from(value: JsonValue) -> Result<Self, Self::Error> {
-        let config: PluginConfig = serde_json::from_value(value)
-            .map_err(|e| ProxyError::serialization_error("Invalid limit-req plugin config", e))?;
-        config.validate()?;
-        if config.policy != Policy::Local {
-            return Err(ProxyError::validation_error(
-                "limit-req policy 'redis'/'redis-cluster' requires a distributed backend; only 'local' is supported",
-            ));
-        }
+        let config: PluginConfig =
+            parse_and_validate_plugin_config(value, "Invalid limit-req plugin config")?;
+        config.policy.ensure_local("limit-req")?;
         Ok(config)
     }
 }
@@ -241,21 +172,11 @@ impl TryFrom<JsonValue> for PluginConfig {
 /// Leaky-bucket rate limiting plugin implementation.
 pub struct PluginLimitReq {
     config: PluginConfig,
-    buckets: [Mutex<BucketShard>; LIMIT_SHARDS],
-}
-
-impl PluginLimitReq {
-    async fn reject(&self, session: &mut Session) -> Result<bool> {
-        ResponseBuilder::send_proxy_error(
-            session,
-            StatusCode::from_u16(self.config.rejected_code)
-                .unwrap_or(StatusCode::SERVICE_UNAVAILABLE),
-            self.config.rejected_msg.as_deref(),
-            None,
-        )
-        .await?;
-        Ok(true)
-    }
+    /// Sharded leaky buckets. Admission, the stable overflow bucket, and the
+    /// budgeted drain sweep are the shared `plugins::limiting` machinery;
+    /// only the drain predicate and the transition are plugin-local.
+    buckets: BoundedShardMap<Bucket>,
+    reject: RejectPolicy,
 }
 
 #[async_trait]
@@ -271,7 +192,7 @@ impl ProxyPlugin for PluginLimitReq {
         PluginPhases::REQUEST
     }
 
-    async fn request_filter(&self, session: &mut Session, _ctx: &mut ProxyContext) -> Result<bool> {
+    async fn request_filter(&self, session: &mut Session, ctx: &mut ProxyContext) -> Result<bool> {
         let key = apisix_key(
             session,
             &self.config.key,
@@ -279,28 +200,20 @@ impl ProxyPlugin for PluginLimitReq {
         );
 
         let now = Instant::now();
+        let rate = self.config.rate;
 
         // The lock is held only for the pure state transition; sleeping and
         // response writes happen after the bucket state is updated.
         let (delay, rejected) = {
-            let mut buckets = self.buckets[shard_idx(key.as_ref())]
-                .lock()
-                .unwrap_or_else(|e| e.into_inner());
-            // Preserve extant buckets. A new key gets one bounded sweep when
-            // the shard is full, then either a regular slot or the stable
-            // overflow bucket shared with other overflowed keys.
-            let new_key = !buckets.entries.contains_key(key.as_ref());
-            if new_key && buckets.entries.len() >= PER_SHARD_REGULAR_MAX {
-                // Fixed work budget; no request can scan the full map.
-                buckets.sweep_drained(now, self.config.rate);
-            }
-            let storage_key = if !new_key || buckets.entries.len() < PER_SHARD_REGULAR_MAX {
-                key.into_owned()
-            } else {
-                "__pingsix_limit_req_overflow__".to_string()
-            };
-            buckets.touch(&storage_key);
-            match buckets.entries.entry(storage_key) {
+            let mut buckets = self.buckets.lock(key.as_ref());
+            match buckets.admit(&key, LIMIT_REQ_OVERFLOW, |shard| {
+                // A drained bucket leaves no residue worth keeping. Fixed
+                // work budget; no request can scan the full map.
+                shard.sweep(
+                    |bucket| now.duration_since(bucket.last).as_secs_f64() * rate >= bucket.excess,
+                    SweepMiss::Restore,
+                )
+            }) {
                 Entry::Vacant(slot) => {
                     // First request for this bucket initializes it and passes.
                     slot.insert(Bucket {
@@ -312,7 +225,7 @@ impl ProxyPlugin for PluginLimitReq {
                 Entry::Occupied(slot) => match bucket_incoming(
                     slot.into_mut(),
                     now,
-                    self.config.rate,
+                    rate,
                     self.config.burst,
                     self.config.nodelay,
                 ) {
@@ -323,7 +236,7 @@ impl ProxyPlugin for PluginLimitReq {
         };
 
         if rejected {
-            return self.reject(session).await;
+            return self.reject.reject(session, ctx).await;
         }
 
         let delay = delay.expect("not rejected implies a delay");
@@ -388,59 +301,6 @@ mod tests {
         // excess 2, rate 1: after 1.5s the new excess is 1.5, which
         // exceeds burst 1 and is rejected.
         assert_eq!(leaky_bucket_step(2.0, 1.5, 1.0, 1.0, false), Err(()));
-    }
-
-    #[test]
-    fn full_shard_uses_stable_overflow_bucket() {
-        let now = Instant::now();
-        let mut shard = BucketShard::default();
-        for i in 0..PER_SHARD_REGULAR_MAX {
-            let key = i.to_string();
-            shard.entries.insert(
-                key.clone(),
-                Bucket {
-                    excess: 1.0,
-                    last: now,
-                },
-            );
-            shard.touch(&key);
-        }
-        shard.sweep_drained(now, 1.0);
-        let storage_key = if shard.entries.len() < PER_SHARD_REGULAR_MAX {
-            "new-key"
-        } else {
-            "__pingsix_limit_req_overflow__"
-        };
-        shard.entries.insert(
-            storage_key.into(),
-            Bucket {
-                excess: 0.0,
-                last: now,
-            },
-        );
-        shard.touch(storage_key);
-
-        assert_eq!(storage_key, "__pingsix_limit_req_overflow__");
-        assert_eq!(shard.entries.len(), PER_SHARD_REGULAR_MAX + 1);
-    }
-
-    #[test]
-    fn bounded_sweep_removes_at_most_budget_entries() {
-        let now = Instant::now();
-        let mut shard = BucketShard::default();
-        for i in 0..CLEANUP_BUDGET + 2 {
-            let key = i.to_string();
-            shard.entries.insert(
-                key.clone(),
-                Bucket {
-                    excess: 0.0,
-                    last: now - Duration::from_secs(1),
-                },
-            );
-            shard.touch(&key);
-        }
-        shard.sweep_drained(now, 1.0);
-        assert_eq!(shard.entries.len(), 2);
     }
 
     #[test]

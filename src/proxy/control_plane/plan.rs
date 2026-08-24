@@ -1,17 +1,20 @@
-use std::{collections::HashSet, sync::Arc};
-
-#[cfg(test)]
-use std::collections::HashMap;
+use std::{collections::HashMap, sync::Arc};
 
 use futures::{stream, StreamExt, TryStreamExt};
 
 use crate::{
     config,
     core::{ProxyError, ProxyResult},
-};
-
-use crate::proxy::upstream::{
-    discovery::prepare_upstream, PreparedUpstreams, TrafficSplitOwner, UpstreamOccurrence,
+    proxy::{
+        global_rule::ProxyGlobalRule,
+        route::ProxyRoute,
+        service::ProxyService,
+        ssl::ProxySSL,
+        upstream::{
+            discovery::prepare_upstream, PreparedUpstreams, ProxyUpstream, TrafficSplitOwner,
+            UpstreamOccurrence,
+        },
+    },
 };
 
 #[cfg(test)]
@@ -20,6 +23,29 @@ use crate::proxy::upstream::discovery::prepare_static_upstream;
 use super::resources::{
     plugin_upstream_deps, scope_upstream_deps, scope_upstream_deps_rule, ResourceConfigSet,
 };
+
+/// A per-resource compile decision produced by the plan.
+///
+/// The compiler consumes these mechanically: `Reuse` carries the previously
+/// compiled object (the same `Arc`), `Rebuild` means "construct from
+/// candidate inputs". Decisions are computed once in [`CandidatePlan::build`]
+/// from `(config, previous)`; the compiler never re-derives them.
+#[derive(Clone, Debug)]
+pub(crate) enum ResourceDecision<T> {
+    /// Reuse the previously compiled object, Arc-identical.
+    Reuse(T),
+    /// The plan proved reuse unsound (own config changed, or a referenced
+    /// dependency is itself rebuilt): compile from candidate inputs.
+    Rebuild,
+}
+
+impl<T> ResourceDecision<T> {
+    /// True for `Reuse`.
+    #[cfg(test)]
+    pub(crate) fn is_reuse(&self) -> bool {
+        matches!(self, Self::Reuse(_))
+    }
+}
 
 /// One authoritative reuse/preparation plan for a candidate graph.
 ///
@@ -40,11 +66,13 @@ use super::resources::{
 /// - SSL entries reuse independently;
 /// - inline and traffic-split upstreams of a reused scope need no preparation.
 pub(crate) struct CandidatePlan {
-    reused_upstreams: HashSet<String>,
-    reused_services: HashSet<String>,
-    reused_global_rules: HashSet<String>,
-    reused_routes: HashSet<String>,
-    reused_ssls: HashSet<String>,
+    /// Reusable previously-compiled upstreams (cloned `Arc`s), keyed by id.
+    /// Absence means "rebuild".
+    reused_upstreams: HashMap<String, Arc<ProxyUpstream>>,
+    reused_services: HashMap<String, Arc<ProxyService>>,
+    reused_global_rules: HashMap<String, Arc<ProxyGlobalRule>>,
+    reused_routes: HashMap<String, Arc<ProxyRoute>>,
+    reused_ssls: HashMap<String, Arc<ProxySSL>>,
     /// Upstream occurrences that must be (re)prepared because their owning
     /// scope will be rebuilt. Exactly the material `build_prepared` needs.
     pub(crate) jobs: Vec<(UpstreamOccurrence, config::Upstream)>,
@@ -61,85 +89,87 @@ impl CandidatePlan {
         config: &ResourceConfigSet,
         previous: &crate::proxy::runtime::RuntimeSnapshot,
     ) -> ProxyResult<Self> {
-        let mut reused_upstreams = HashSet::new();
+        let mut reused_upstreams = HashMap::new();
         for (id, upstream) in &config.upstreams {
-            if previous
+            if let Some(existing) = previous
                 .upstreams
                 .get(id)
-                .is_some_and(|existing| existing.inner == *upstream)
+                .filter(|existing| existing.inner == *upstream)
             {
-                reused_upstreams.insert(id.clone());
+                reused_upstreams.insert(id.clone(), existing.clone());
             }
         }
 
         // A scope is reused only when its own config matches and every named
         // upstream it actually references is reused; a changed upstream no
-        // longer cascades to scopes that never referenced it.
-        let mut reused_services = HashSet::new();
+        // longer cascades to scopes that never referenced it. Evaluation order
+        // (config match first, dependency derivation only for unchanged
+        // configs) is preserved from the pre-consolidation build.
+        let mut reused_services = HashMap::new();
         for (id, service) in &config.services {
-            if previous
-                .services
-                .get(id)
-                .is_some_and(|existing| existing.inner == *service)
-                && scope_upstream_deps(service)?
-                    .iter()
-                    .all(|dep| reused_upstreams.contains(dep))
-            {
-                reused_services.insert(id.clone());
+            if let Some(existing) = previous.services.get(id) {
+                if existing.inner == *service
+                    && scope_upstream_deps(service)?
+                        .iter()
+                        .all(|dep| reused_upstreams.contains_key(dep))
+                {
+                    reused_services.insert(id.clone(), existing.clone());
+                }
             }
         }
-        let mut reused_global_rules = HashSet::new();
+        let mut reused_global_rules = HashMap::new();
         for (id, rule) in &config.global_rules {
-            if previous
-                .global_rules
-                .get(id)
-                .is_some_and(|existing| existing.inner == *rule)
-                && plugin_upstream_deps(&rule.plugins)?
-                    .iter()
-                    .all(|dep| reused_upstreams.contains(dep))
-            {
-                reused_global_rules.insert(id.clone());
+            if let Some(existing) = previous.global_rules.get(id) {
+                if existing.inner == *rule
+                    && plugin_upstream_deps(&rule.plugins)?
+                        .iter()
+                        .all(|dep| reused_upstreams.contains_key(dep))
+                {
+                    reused_global_rules.insert(id.clone(), existing.clone());
+                }
             }
         }
 
-        let mut reused_routes = HashSet::new();
+        let mut reused_routes = HashMap::new();
         for (id, route) in &config.routes {
+            // A route additionally requires the service its `service_id`
+            // points at to be reused (not all services).
             let service_ok = route
                 .service_id
                 .as_ref()
-                .is_none_or(|sid| reused_services.contains(sid));
-            if service_ok
-                && previous
-                    .routes
-                    .get(id)
-                    .is_some_and(|existing| existing.inner == *route)
-                && scope_upstream_deps_rule(route)?
-                    .iter()
-                    .all(|dep| reused_upstreams.contains(dep))
-            {
-                reused_routes.insert(id.clone());
+                .is_none_or(|sid| reused_services.contains_key(sid));
+            if service_ok {
+                if let Some(existing) = previous.routes.get(id) {
+                    if existing.inner == *route
+                        && scope_upstream_deps_rule(route)?
+                            .iter()
+                            .all(|dep| reused_upstreams.contains_key(dep))
+                    {
+                        reused_routes.insert(id.clone(), existing.clone());
+                    }
+                }
             }
         }
-        let mut reused_ssls = HashSet::new();
+        let mut reused_ssls = HashMap::new();
         for (id, ssl) in &config.ssls {
-            if previous
+            if let Some(existing) = previous
                 .ssls
                 .get(id)
-                .is_some_and(|existing| existing.inner == *ssl)
+                .filter(|existing| existing.inner == *ssl)
             {
-                reused_ssls.insert(id.clone());
+                reused_ssls.insert(id.clone(), existing.clone());
             }
         }
 
         // Preparation jobs: every occurrence owned by a scope that will be rebuilt.
         let mut jobs = Vec::new();
         for (id, upstream) in &config.upstreams {
-            if !reused_upstreams.contains(id) {
+            if !reused_upstreams.contains_key(id) {
                 jobs.push((UpstreamOccurrence::Named(id.clone()), upstream.clone()));
             }
         }
         for (id, service) in &config.services {
-            if !reused_services.contains(id) {
+            if !reused_services.contains_key(id) {
                 if let Some(upstream) = &service.upstream {
                     jobs.push((
                         UpstreamOccurrence::ServiceInline(id.clone()),
@@ -153,7 +183,7 @@ impl CandidatePlan {
             }
         }
         for (id, rule) in &config.global_rules {
-            if !reused_global_rules.contains(id) {
+            if !reused_global_rules.contains_key(id) {
                 jobs.extend(crate::plugins::plugin_upstream_jobs(
                     TrafficSplitOwner::GlobalRule(id.clone()),
                     &rule.plugins,
@@ -161,7 +191,7 @@ impl CandidatePlan {
             }
         }
         for (id, route) in &config.routes {
-            if !reused_routes.contains(id) {
+            if !reused_routes.contains_key(id) {
                 if let Some(upstream) = &route.upstream {
                     jobs.push((
                         UpstreamOccurrence::RouteInline(id.clone()),
@@ -185,25 +215,95 @@ impl CandidatePlan {
         })
     }
 
+    /// Typed decision for `id`, consumed mechanically by the compiler.
+    pub(crate) fn upstream_decision(&self, id: &str) -> ResourceDecision<Arc<ProxyUpstream>> {
+        match self.reused_upstreams.get(id) {
+            Some(existing) => ResourceDecision::Reuse(existing.clone()),
+            None => ResourceDecision::Rebuild,
+        }
+    }
+
+    pub(crate) fn service_decision(&self, id: &str) -> ResourceDecision<Arc<ProxyService>> {
+        match self.reused_services.get(id) {
+            Some(existing) => ResourceDecision::Reuse(existing.clone()),
+            None => ResourceDecision::Rebuild,
+        }
+    }
+
+    pub(crate) fn global_rule_decision(&self, id: &str) -> ResourceDecision<Arc<ProxyGlobalRule>> {
+        match self.reused_global_rules.get(id) {
+            Some(existing) => ResourceDecision::Reuse(existing.clone()),
+            None => ResourceDecision::Rebuild,
+        }
+    }
+
+    pub(crate) fn route_decision(&self, id: &str) -> ResourceDecision<Arc<ProxyRoute>> {
+        match self.reused_routes.get(id) {
+            Some(existing) => ResourceDecision::Reuse(existing.clone()),
+            None => ResourceDecision::Rebuild,
+        }
+    }
+
+    pub(crate) fn ssl_decision(&self, id: &str) -> ResourceDecision<Arc<ProxySSL>> {
+        match self.reused_ssls.get(id) {
+            Some(existing) => ResourceDecision::Reuse(existing.clone()),
+            None => ResourceDecision::Rebuild,
+        }
+    }
+
+    #[cfg(test)]
     pub(crate) fn upstream_reused(&self, id: &str) -> bool {
-        self.reused_upstreams.contains(id)
+        self.upstream_decision(id).is_reuse()
     }
 
+    #[cfg(test)]
     pub(crate) fn service_reused(&self, id: &str) -> bool {
-        self.reused_services.contains(id)
+        self.service_decision(id).is_reuse()
     }
 
-    pub(crate) fn global_rule_reused(&self, id: &str) -> bool {
-        self.reused_global_rules.contains(id)
-    }
-
+    #[cfg(test)]
     pub(crate) fn route_reused(&self, id: &str) -> bool {
-        self.reused_routes.contains(id)
+        self.route_decision(id).is_reuse()
     }
+}
 
-    pub(crate) fn ssl_reused(&self, id: &str) -> bool {
-        self.reused_ssls.contains(id)
-    }
+/// DNS strategy used to prepare the plan's occurrences.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum DnsPreparation {
+    /// Production path: resolve hostname nodes asynchronously with the
+    /// configured `dns_resolution_timeout`.
+    Resolve,
+    /// No DNS I/O: only IP-literal nodes are accepted; hostname nodes fail
+    /// with the static-discovery error. Test path.
+    #[cfg(test)]
+    StaticOnly,
+}
+
+/// Shared core: build the plan, then prepare exactly the plan's jobs.
+///
+/// This is the *only* occurrence walk in the control plane; the DNS strategy
+/// is the single difference between the production and DNS-off (test) paths.
+async fn prepare_candidate_mode(
+    config: &ResourceConfigSet,
+    previous: &crate::proxy::runtime::RuntimeSnapshot,
+    defaults: &config::EffectiveDefaults,
+    resolver: &Arc<hickory_resolver::TokioResolver>,
+    dns: DnsPreparation,
+) -> ProxyResult<(CandidatePlan, PreparedUpstreams)> {
+    let plan = CandidatePlan::build(config, previous)?;
+    let prepared = stream::iter(plan.jobs.clone())
+        .map(|(occurrence, upstream)| async move {
+            let prepared = match dns {
+                DnsPreparation::Resolve => prepare_upstream(&upstream, defaults, resolver).await?,
+                #[cfg(test)]
+                DnsPreparation::StaticOnly => prepare_static_upstream(&upstream, resolver)?,
+            };
+            Ok::<_, ProxyError>((occurrence, prepared))
+        })
+        .buffer_unordered(8)
+        .try_collect::<Vec<_>>()
+        .await?;
+    Ok((plan, prepared.into_iter().collect()))
 }
 
 /// Prepare every upstream occurrence the candidate plan marks for rebuild.
@@ -217,172 +317,50 @@ pub(crate) async fn prepare_candidate(
     defaults: &crate::config::EffectiveDefaults,
     resolver: &Arc<hickory_resolver::TokioResolver>,
 ) -> ProxyResult<(CandidatePlan, PreparedUpstreams)> {
-    let plan = CandidatePlan::build(config, previous)?;
-    let prepared = stream::iter(plan.jobs.clone())
-        .map(|(occurrence, upstream)| async move {
-            Ok::<_, ProxyError>((
-                occurrence,
-                prepare_upstream(&upstream, defaults, resolver).await?,
-            ))
-        })
-        .buffer_unordered(8)
-        .try_collect::<Vec<_>>()
-        .await?;
-    Ok((plan, prepared.into_iter().collect()))
+    prepare_candidate_mode(
+        config,
+        previous,
+        defaults,
+        resolver,
+        DnsPreparation::Resolve,
+    )
+    .await
 }
 
-/// Prepare every upstream occurrence synchronously for static startup.
-///
-/// There is no previous runtime to reuse, so every occurrence is prepared;
-/// DNS-only occurrences return an error directing callers to the asynchronous
-/// preparation path.
+/// DNS-off variant of [`prepare_candidate`]: the identical plan build and
+/// occurrence dispatch, with every job resolved through the static
+/// (IP-literal-only) path instead of asynchronous DNS. Tests therefore
+/// exercise the production plan → prepare → compile pipeline end to end.
 #[cfg(test)]
-pub(crate) fn prepare_static_candidate(
+pub(crate) fn prepare_candidate_static(
     config: &ResourceConfigSet,
+    previous: &crate::proxy::runtime::RuntimeSnapshot,
     resolver: &Arc<hickory_resolver::TokioResolver>,
-) -> ProxyResult<PreparedUpstreams> {
-    let mut prepared = PreparedUpstreams::new();
-    for (id, upstream) in &config.upstreams {
-        prepared.insert(
-            UpstreamOccurrence::Named(id.clone()),
-            prepare_static_upstream(upstream, resolver)?,
-        );
-    }
-    for (id, route) in &config.routes {
-        if let Some(upstream) = &route.upstream {
-            prepared.insert(
-                UpstreamOccurrence::RouteInline(id.clone()),
-                prepare_static_upstream(upstream, resolver)?,
-            );
-        }
-        prepare_static_plugin_upstreams(
-            &mut prepared,
-            TrafficSplitOwner::Route(id.clone()),
-            &route.plugins,
-            resolver,
-        )?;
-    }
-    for (id, service) in &config.services {
-        if let Some(upstream) = &service.upstream {
-            prepared.insert(
-                UpstreamOccurrence::ServiceInline(id.clone()),
-                prepare_static_upstream(upstream, resolver)?,
-            );
-        }
-        prepare_static_plugin_upstreams(
-            &mut prepared,
-            TrafficSplitOwner::Service(id.clone()),
-            &service.plugins,
-            resolver,
-        )?;
-    }
-    for (id, rule) in &config.global_rules {
-        prepare_static_plugin_upstreams(
-            &mut prepared,
-            TrafficSplitOwner::GlobalRule(id.clone()),
-            &rule.plugins,
-            resolver,
-        )?;
-    }
-    Ok(prepared)
-}
-
-#[cfg(test)]
-fn prepare_static_plugin_upstreams(
-    prepared: &mut PreparedUpstreams,
-    owner: TrafficSplitOwner,
-    plugins: &HashMap<String, serde_json::Value>,
-    resolver: &Arc<hickory_resolver::TokioResolver>,
-) -> ProxyResult<()> {
-    for (occurrence, upstream) in crate::plugins::plugin_upstream_jobs(owner, plugins)? {
-        prepared.insert(occurrence, prepare_static_upstream(&upstream, resolver)?);
-    }
-    Ok(())
+) -> ProxyResult<(CandidatePlan, PreparedUpstreams)> {
+    // `StaticOnly` never awaits real I/O, so the core completes on first poll.
+    futures::executor::block_on(prepare_candidate_mode(
+        config,
+        previous,
+        &config::EffectiveDefaults::default(),
+        resolver,
+        DnsPreparation::StaticOnly,
+    ))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{
-        Nodes, SelectionType, Upstream, UpstreamHashOn, UpstreamPassHost, UpstreamScheme,
+    use crate::config::Upstream;
+    use crate::proxy::control_plane::test_fixtures::{
+        route_bound_to_service, route_with_inline, route_with_upstream_id, service_with_inline,
+        service_with_upstream_id, traffic_split_with_named_and_inline, upstream,
     };
     use crate::proxy::control_plane::CandidateSnapshot;
-    use std::collections::HashMap as StdHashMap;
-
-    fn sample_upstream(id: &str, node: &str) -> Upstream {
-        let mut nodes = StdHashMap::new();
-        nodes.insert(node.to_string(), 1);
-        Upstream {
-            id: id.to_string(),
-            retries: None,
-            retry_timeout: None,
-            timeout: None,
-            nodes: Nodes::from_map(nodes),
-            r#type: SelectionType::RoundRobin,
-            checks: None,
-            hash_on: UpstreamHashOn::VARS,
-            key: "uri".into(),
-            scheme: UpstreamScheme::HTTP,
-            pass_host: UpstreamPassHost::PASS,
-            upstream_host: None,
-            tls: None,
-            keepalive_pool: None,
-        }
-    }
 
     // ---------------------------------------------------------------------
     // Preparation jobs: derived from the same plan compilation consumes, so
     // an unchanged occurrence is never re-resolved.
     // ---------------------------------------------------------------------
-
-    fn route_with_inline(id: &str, uri: &str, node: &str) -> crate::config::Route {
-        crate::config::Route {
-            id: id.into(),
-            name: None,
-            uri: Some(uri.into()),
-            uris: vec![],
-            methods: vec![],
-            host: None,
-            hosts: vec![],
-            priority: 0,
-            plugins: Default::default(),
-            upstream: Some(sample_upstream("", node)),
-            upstream_id: None,
-            service_id: None,
-            timeout: None,
-            enable_websocket: false,
-        }
-    }
-
-    fn route_with_upstream_id(id: &str, uri: &str, upstream_id: &str) -> crate::config::Route {
-        crate::config::Route {
-            id: id.into(),
-            name: None,
-            uri: Some(uri.into()),
-            uris: vec![],
-            methods: vec![],
-            host: None,
-            hosts: vec![],
-            priority: 0,
-            plugins: Default::default(),
-            upstream: None,
-            upstream_id: Some(upstream_id.into()),
-            service_id: None,
-            timeout: None,
-            enable_websocket: false,
-        }
-    }
-
-    fn service_with_upstream_id(id: &str, upstream_id: &str) -> crate::config::Service {
-        crate::config::Service {
-            id: id.into(),
-            name: None,
-            plugins: Default::default(),
-            upstream: None,
-            upstream_id: Some(upstream_id.into()),
-            hosts: vec![],
-        }
-    }
 
     /// Compile a snapshot from an empty previous runtime (no Arc reuse).
     fn publish_seed(
@@ -411,7 +389,7 @@ mod tests {
     fn preparation_jobs_skips_unchanged_inline_upstreams_on_route_update() {
         let mut set = ResourceConfigSet::default();
         set.upstreams
-            .insert("u1".into(), sample_upstream("u1", "127.0.0.1:80"));
+            .insert("u1".into(), upstream("u1", "127.0.0.1:80"));
         set.routes
             .insert("r1".into(), route_with_inline("r1", "/a", "127.0.0.1:81"));
         set.routes
@@ -439,7 +417,7 @@ mod tests {
     fn preparation_jobs_only_affect_scopes_referencing_the_changed_upstream() {
         let mut set = ResourceConfigSet::default();
         set.upstreams
-            .insert("u1".into(), sample_upstream("u1", "127.0.0.1:80"));
+            .insert("u1".into(), upstream("u1", "127.0.0.1:80"));
         // r1 references u1 directly (no inline occurrence of its own).
         set.routes
             .insert("r1".into(), route_with_upstream_id("r1", "/a", "u1"));
@@ -450,7 +428,7 @@ mod tests {
 
         let mut next = set;
         next.upstreams
-            .insert("u1".into(), sample_upstream("u1", "127.0.0.1:90"));
+            .insert("u1".into(), upstream("u1", "127.0.0.1:90"));
         let plan = CandidatePlan::build(&next, &previous).unwrap();
         assert_eq!(
             job_occurrences(&plan.jobs),
@@ -465,50 +443,16 @@ mod tests {
     fn preparation_jobs_service_backed_route_update_needs_no_dns() {
         let mut set = ResourceConfigSet::default();
         set.upstreams
-            .insert("u1".into(), sample_upstream("u1", "127.0.0.1:80"));
+            .insert("u1".into(), upstream("u1", "127.0.0.1:80"));
         set.services
             .insert("s1".into(), service_with_upstream_id("s1", "u1"));
-        set.routes.insert(
-            "r1".into(),
-            crate::config::Route {
-                id: "r1".into(),
-                name: None,
-                uri: Some("/a".into()),
-                uris: vec![],
-                methods: vec![],
-                host: None,
-                hosts: vec![],
-                priority: 0,
-                plugins: Default::default(),
-                upstream: None,
-                upstream_id: None,
-                service_id: Some("s1".into()),
-                timeout: None,
-                enable_websocket: false,
-            },
-        );
+        set.routes
+            .insert("r1".into(), route_bound_to_service("r1", "/a", "s1"));
         let previous = publish_seed(&set, 300);
 
         let mut next = set;
-        next.routes.insert(
-            "r1".into(),
-            crate::config::Route {
-                id: "r1".into(),
-                name: None,
-                uri: Some("/b".into()),
-                uris: vec![],
-                methods: vec![],
-                host: None,
-                hosts: vec![],
-                priority: 0,
-                plugins: Default::default(),
-                upstream: None,
-                upstream_id: None,
-                service_id: Some("s1".into()),
-                timeout: None,
-                enable_websocket: false,
-            },
-        );
+        next.routes
+            .insert("r1".into(), route_bound_to_service("r1", "/b", "s1"));
         let plan = CandidatePlan::build(&next, &previous).unwrap();
         assert!(
             plan.jobs.is_empty(),
@@ -523,7 +467,7 @@ mod tests {
     fn plan_drives_compilation_reuse() {
         let mut set = ResourceConfigSet::default();
         set.upstreams
-            .insert("u1".into(), sample_upstream("u1", "127.0.0.1:80"));
+            .insert("u1".into(), upstream("u1", "127.0.0.1:80"));
         set.services
             .insert("s1".into(), service_with_upstream_id("s1", "u1"));
         set.routes
@@ -536,7 +480,8 @@ mod tests {
             "r1".into(),
             route_with_inline("r1", "/a/v2", "127.0.0.1:81"),
         );
-        let plan = CandidatePlan::build(&next, &previous).unwrap();
+        let resolver = crate::proxy::upstream::discovery::build_resolver_for_state().unwrap();
+        let (plan, prepared) = prepare_candidate_static(&next, &previous, &resolver).unwrap();
         assert!(plan.upstream_reused("u1"));
         assert!(plan.service_reused("s1"));
         assert!(!plan.route_reused("r1"));
@@ -545,8 +490,6 @@ mod tests {
             std::collections::HashSet::from([UpstreamOccurrence::RouteInline("r1".into())])
         );
 
-        let resolver = crate::proxy::upstream::discovery::build_resolver_for_state().unwrap();
-        let prepared = prepare_static_candidate(&next, &resolver).unwrap();
         let candidate = CandidateSnapshot::build_prepared(
             next,
             &plan,
@@ -574,18 +517,17 @@ mod tests {
         // compilation follows the plan. r1 references u1 directly here.
         let mut next = ResourceConfigSet::default();
         next.upstreams
-            .insert("u1".into(), sample_upstream("u1", "127.0.0.1:90"));
+            .insert("u1".into(), upstream("u1", "127.0.0.1:90"));
         next.services
             .insert("s1".into(), service_with_upstream_id("s1", "u1"));
         next.routes
             .insert("r1".into(), route_with_upstream_id("r1", "/a/v2", "u1"));
-        let plan = CandidatePlan::build(&next, &previous).unwrap();
+        let resolver = crate::proxy::upstream::discovery::build_resolver_for_state().unwrap();
+        let (plan, prepared) = prepare_candidate_static(&next, &previous, &resolver).unwrap();
         assert!(!plan.upstream_reused("u1"));
         assert!(!plan.service_reused("s1"));
         assert!(!plan.route_reused("r1"));
 
-        let resolver = crate::proxy::upstream::discovery::build_resolver_for_state().unwrap();
-        let prepared = prepare_static_candidate(&next, &resolver).unwrap();
         let candidate = CandidateSnapshot::build_prepared(
             next,
             &plan,
@@ -617,36 +559,13 @@ mod tests {
     mod jobs {
         use super::*;
 
-        fn traffic_split_with_named_and_inline(
-            named_upstream: &str,
-            inline_node: &str,
-        ) -> HashMap<String, serde_json::Value> {
-            HashMap::from([(
-                "traffic-split".into(),
-                serde_json::json!({
-                    "rules": [{
-                        "weighted_upstreams": [
-                            { "upstream_id": named_upstream, "weight": 1 },
-                            {
-                                "upstream": {
-                                    "nodes": { inline_node: 1 },
-                                    "type": "roundrobin"
-                                },
-                                "weight": 1
-                            }
-                        ]
-                    }]
-                }),
-            )])
-        }
-
         /// Changing a named upstream must not schedule the inline DNS of an
         /// unrelated scope that never references it.
         #[test]
         fn unrelated_inline_dns_is_not_prepared() {
             let mut set = ResourceConfigSet::default();
             set.upstreams
-                .insert("u1".into(), sample_upstream("u1", "127.0.0.1:80"));
+                .insert("u1".into(), upstream("u1", "127.0.0.1:80"));
             set.routes
                 .insert("r1".into(), route_with_upstream_id("r1", "/a", "u1"));
             set.routes
@@ -655,7 +574,7 @@ mod tests {
 
             let mut next = set;
             next.upstreams
-                .insert("u1".into(), sample_upstream("u1", "127.0.0.1:90"));
+                .insert("u1".into(), upstream("u1", "127.0.0.1:90"));
             let plan = CandidatePlan::build(&next, &previous).unwrap();
             let occurrences = job_occurrences(&plan.jobs);
             assert!(
@@ -672,20 +591,15 @@ mod tests {
         fn unrelated_service_and_traffic_split_occurrences_are_not_prepared() {
             let mut set = ResourceConfigSet::default();
             set.upstreams
-                .insert("u1".into(), sample_upstream("u1", "127.0.0.1:80"));
+                .insert("u1".into(), upstream("u1", "127.0.0.1:80"));
             set.upstreams
-                .insert("u2".into(), sample_upstream("u2", "127.0.0.1:81"));
+                .insert("u2".into(), upstream("u2", "127.0.0.1:81"));
 
             // A direct service inline upstream has no named dependency.
-            let service_inline = crate::config::Service {
-                id: "s-inline".into(),
-                name: None,
-                plugins: Default::default(),
-                upstream: Some(sample_upstream("", "127.0.0.1:82")),
-                upstream_id: None,
-                hosts: vec![],
-            };
-            set.services.insert("s-inline".into(), service_inline);
+            set.services.insert(
+                "s-inline".into(),
+                service_with_inline("s-inline", "127.0.0.1:82"),
+            );
 
             let mut service_plugin = service_with_upstream_id("s-plugin", "u2");
             service_plugin.plugins = traffic_split_with_named_and_inline("u2", "127.0.0.1:83");
@@ -698,13 +612,13 @@ mod tests {
 
             let mut next = set;
             next.upstreams
-                .insert("u1".into(), sample_upstream("u1", "127.0.0.1:90"));
+                .insert("u1".into(), upstream("u1", "127.0.0.1:90"));
             let plan = CandidatePlan::build(&next, &previous).unwrap();
             let occurrences = job_occurrences(&plan.jobs);
 
             assert_eq!(
                 occurrences,
-                HashSet::from([UpstreamOccurrence::Named("u1".into())]),
+                std::collections::HashSet::from([UpstreamOccurrence::Named("u1".into())]),
                 "u1 is unrelated to these scopes, so neither service/route inline nor traffic-split DNS may be prepared"
             );
         }
@@ -715,7 +629,7 @@ mod tests {
         fn dependent_traffic_split_occurrence_is_still_prepared() {
             let mut set = ResourceConfigSet::default();
             set.upstreams
-                .insert("u1".into(), sample_upstream("u1", "127.0.0.1:80"));
+                .insert("u1".into(), upstream("u1", "127.0.0.1:80"));
             let mut route = route_with_upstream_id("r1", "/a", "u1");
             route.plugins = traffic_split_with_named_and_inline("u1", "127.0.0.1:81");
             set.routes.insert("r1".into(), route);
@@ -723,7 +637,7 @@ mod tests {
 
             let mut next = set;
             next.upstreams
-                .insert("u1".into(), sample_upstream("u1", "127.0.0.1:90"));
+                .insert("u1".into(), upstream("u1", "127.0.0.1:90"));
             let plan = CandidatePlan::build(&next, &previous).unwrap();
             let occurrences = job_occurrences(&plan.jobs);
             assert!(occurrences.contains(&UpstreamOccurrence::Named("u1".into())));
@@ -740,7 +654,7 @@ mod tests {
         fn rebuilt_scope_inline_dns_is_still_prepared() {
             let mut set = ResourceConfigSet::default();
             set.upstreams
-                .insert("u1".into(), sample_upstream("u1", "127.0.0.1:80"));
+                .insert("u1".into(), upstream("u1", "127.0.0.1:80"));
             set.routes
                 .insert("r1".into(), route_with_inline("r1", "/a", "127.0.0.1:81"));
             let previous = publish_seed(&set, 600);

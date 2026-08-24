@@ -1795,11 +1795,22 @@ plugins:
       - "/new/$1"
 ```
 
-**URI templates**: `$host`, `$request_uri`, `$uri`, `$scheme`,
-`$request_method`, and `${name}` forms expand to the corresponding request
-values; escape a literal `$` with `\$`. The variable set is closed — an
-unknown variable expands to an empty string (config validation does not
-reject it). `encode_uri` percent-encodes the rewritten path but, unlike APISIX's
+**URI templates**: redirect templates share the request-phase variable
+registry used by limiter keys and upstream hashing: `$host` (URI authority
+first, then the `Host` header), `$request_uri`, `$uri`, `$query_string`,
+`$remote_addr`, `$remote_port`, `$server_addr`, `$scheme`, `$request_method`,
+any `$arg_<name>` query argument, and any `$http_<name>` request header
+(nginx naming: `X-Custom-Id` -> `$http_x_custom_id`). Both `$name` and
+`${name}` spell a variable; escape a literal `$` with `\$`, and unknown
+variables expand to an empty string (config validation does not reject them).
+
+> **Behavior note**: only `$host`, `$request_uri`, `$uri`, `$scheme`, and
+> `$request_method` expanded in earlier releases — `$remote_addr`,
+> `$server_addr`, `$remote_port`, `$arg_*`, and `$http_*` rendered as
+> "" — and `$host` preferred the `Host` header over the URI authority. Both
+> now match every other plugin's variable resolution.
+
+`encode_uri` percent-encodes the rewritten path but, unlike APISIX's
 `ngx_escape_uri`, preserves existing `%XX` sequences and unreserved characters
 instead of double-encoding `%` and reserved characters.
 
@@ -2935,6 +2946,10 @@ global_rules:
       file-logger:
         log_format: '$remote_addr - $remote_user [$time_local] "$request" $status $body_bytes_sent "$http_referer" "$http_user_agent" $request_time'
 ```
+
+Both the `$name` and `${name}` spellings are accepted in `log_format`; a
+bare `$` not followed by a variable name stays literal, and unknown
+variables render empty.
 
 Available log variables:
 - `$remote_addr` - Client IP address

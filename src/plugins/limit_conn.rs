@@ -8,13 +8,14 @@
 //!
 //! The counter is exact and process-local (APISIX `policy: local`). Redis
 //! policies are rejected at configuration time because this release ships no
-//! distributed counter backend.
+//! distributed counter backend. Schema, pure decision, and hook wiring live
+//! here; shard admission/overflow, rule-key resolution, and the rejection
+//! writer live in `plugins::limiting`.
 
 use std::{
     borrow::Cow,
-    collections::HashMap,
     sync::{
-        atomic::{AtomicU64, AtomicUsize, Ordering},
+        atomic::{AtomicUsize, Ordering},
         Arc, Mutex,
     },
     time::{Duration, Instant},
@@ -30,13 +31,15 @@ use validator::{Validate, ValidationError};
 
 use crate::{
     core::{PluginPhases, ProxyContext, ProxyError, ProxyPlugin, ProxyResult},
-    plugins::limiter_shards::{
-        shard_idx, TouchOrder, CLEANUP_BUDGET, LIMIT_SHARDS, PER_SHARD_REGULAR_MAX,
+    plugins::{
+        config::parse_and_validate_plugin_config,
+        limiting::{
+            default_rejected_code, next_instance_ctx_key, select_rules, send_rejection,
+            validate_key, validate_rejected_msg, BoundedShardMap, KeyType, Policy, RejectPolicy,
+            SweepMiss, LIMIT_CONN_OVERFLOW,
+        },
     },
-    utils::{
-        request::{apisix_key, render_apisix_request_template},
-        response::ResponseBuilder,
-    },
+    utils::request::apisix_key,
 };
 
 pub const PLUGIN_NAME: &str = "limit-conn";
@@ -47,10 +50,9 @@ const PRIORITY: i32 = 1003;
 /// Context key holding the concurrency guard while the request is in flight.
 /// Keyed per instance so a global and a route limit-conn instance never
 /// overwrite each other's guard slot.
-static NEXT_INSTANCE_ID: AtomicU64 = AtomicU64::new(1);
-
+#[cfg(test)]
 fn conn_guard_key(instance_id: u64) -> String {
-    format!("pingsix_limit_conn_guard_{instance_id}")
+    crate::plugins::limiting::instance_ctx_key("pingsix_limit_conn_guard_", instance_id)
 }
 
 /// Creates a `limit-conn` plugin instance from JSON configuration.
@@ -60,9 +62,10 @@ pub fn create_limit_conn_plugin(
 ) -> ProxyResult<Arc<dyn ProxyPlugin>> {
     let config = PluginConfig::try_from(cfg)?;
     Ok(Arc::new(PluginLimitConn {
+        reject: RejectPolicy::new(config.rejected_code, config.rejected_msg.clone()),
         config,
-        counters: std::array::from_fn(|_| Mutex::new(CounterShard::default())),
-        guard_key: conn_guard_key(NEXT_INSTANCE_ID.fetch_add(1, Ordering::Relaxed)),
+        counters: BoundedShardMap::new(),
+        guard_key: next_instance_ctx_key("pingsix_limit_conn_guard_"),
     }))
 }
 
@@ -102,38 +105,6 @@ fn decide(count: usize, conn: u32, burst: u32, unit_delay: f64) -> Decision {
 struct ConnState {
     count: AtomicUsize,
     unit_delay: Mutex<f64>,
-}
-
-#[derive(Default)]
-struct CounterShard {
-    entries: HashMap<String, Arc<ConnState>>,
-    touch_order: TouchOrder,
-}
-
-impl CounterShard {
-    fn touch(&mut self, key: &str) {
-        self.touch_order.touch(key);
-    }
-
-    /// Remove at most `CLEANUP_BUDGET` inactive states; active states remain.
-    fn sweep_inactive(&mut self) {
-        for _ in 0..CLEANUP_BUDGET {
-            let Some((_touch, key)) = self.touch_order.pop_oldest() else {
-                break;
-            };
-            if self
-                .entries
-                .get(&key)
-                .is_some_and(|state| state.count.load(Ordering::Relaxed) == 0)
-            {
-                self.entries.remove(&key);
-            } else {
-                // Move active entries to the back so one active oldest entry
-                // cannot consume every cleanup slot.
-                self.touch(&key);
-            }
-        }
-    }
 }
 
 /// Request-scoped state released by the reliable `logging` lifecycle hook.
@@ -194,25 +165,6 @@ impl Drop for ConnGuard {
     }
 }
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-enum KeyType {
-    #[default]
-    Var,
-    #[serde(rename = "var_combination")]
-    VarCombination,
-}
-
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-enum Policy {
-    #[default]
-    Local,
-    Redis,
-    #[serde(rename = "redis-cluster")]
-    RedisCluster,
-}
-
 /// One rule from APISIX `limit-conn`'s `rules` array.
 #[derive(Debug, Serialize, Deserialize, Validate)]
 struct ConnRule {
@@ -267,7 +219,7 @@ struct PluginConfig {
     #[validate(custom(function = "validate_conn_rules"))]
     rules: Vec<ConnRule>,
 
-    #[serde(default = "PluginConfig::default_rejected_code")]
+    #[serde(default = "default_rejected_code")]
     #[validate(range(min = 200, max = 599))]
     rejected_code: u16,
 
@@ -283,12 +235,6 @@ struct PluginConfig {
     /// Counter backend. Only `local` is supported in this release.
     #[serde(default)]
     policy: Policy,
-}
-
-impl PluginConfig {
-    fn default_rejected_code() -> u16 {
-        503
-    }
 }
 
 fn validate_conn_delay(value: f64) -> Result<(), ValidationError> {
@@ -308,22 +254,6 @@ fn validate_optional_conn(value: u32) -> Result<(), ValidationError> {
 fn validate_optional_key(value: &&String) -> Result<(), ValidationError> {
     if value.trim().is_empty() {
         return Err(ValidationError::new("key cannot be empty"));
-    }
-    Ok(())
-}
-
-fn validate_key(key: &str) -> Result<(), ValidationError> {
-    if key.trim().is_empty() {
-        return Err(ValidationError::new("key cannot be empty"));
-    }
-    Ok(())
-}
-
-fn validate_rejected_msg(value: &&String) -> Result<(), ValidationError> {
-    if value.is_empty() {
-        return Err(ValidationError::new(
-            "rejected_msg must have at least 1 character",
-        ));
     }
     Ok(())
 }
@@ -369,14 +299,9 @@ impl TryFrom<JsonValue> for PluginConfig {
     type Error = ProxyError;
 
     fn try_from(value: JsonValue) -> Result<Self, Self::Error> {
-        let config: PluginConfig = serde_json::from_value(value)
-            .map_err(|e| ProxyError::serialization_error("Invalid limit-conn plugin config", e))?;
-        config.validate()?;
-        if config.policy != Policy::Local {
-            return Err(ProxyError::validation_error(
-                "limit-conn policy 'redis'/'redis-cluster' requires a distributed backend; only 'local' is supported",
-            ));
-        }
+        let config: PluginConfig =
+            parse_and_validate_plugin_config(value, "Invalid limit-conn plugin config")?;
+        config.policy.ensure_local("limit-conn")?;
         Ok(config)
     }
 }
@@ -384,25 +309,13 @@ impl TryFrom<JsonValue> for PluginConfig {
 /// Concurrency limiting plugin implementation.
 pub struct PluginLimitConn {
     config: PluginConfig,
-    /// Sharded in-flight counters. Entries are swept when a shard grows past
-    /// the per-shard capacity to avoid unbounded memory from ephemeral keys.
-    /// Sharding keeps requests with different keys off the same mutex and
-    /// bounds any cleanup sweep to one shard (1/`LIMIT_SHARDS` of keys).
-    counters: [Mutex<CounterShard>; LIMIT_SHARDS],
+    /// Sharded in-flight counters. Admission, the stable overflow state, and
+    /// the budgeted inactivity sweep are the shared `plugins::limiting`
+    /// machinery; `ConnState` activeness is the plugin-local predicate.
+    counters: BoundedShardMap<Arc<ConnState>>,
     /// Per-instance context key for the request guard.
     guard_key: String,
-}
-
-/// Evaluate a `rules` entry's key template. APISIX skips a rule only when
-/// the template contains no placeholders; a placeholder whose variable is
-/// absent renders empty and is still enforced as the empty-key bucket.
-fn resolve_rule_key(session: &mut Session, rule_key: &str) -> Option<Cow<'static, str>> {
-    if !rule_key.contains('$') {
-        return None;
-    }
-    Some(Cow::Owned(render_apisix_request_template(
-        session, rule_key,
-    )))
+    reject: RejectPolicy,
 }
 
 impl PluginLimitConn {
@@ -413,21 +326,16 @@ impl PluginLimitConn {
     /// pass, mirroring APISIX.
     fn select_limits(&self, session: &mut Session) -> Option<Vec<LimitSelection>> {
         if !self.config.rules.is_empty() {
-            let mut limits = Vec::new();
-            for rule in &self.config.rules {
-                if let Some(key) = resolve_rule_key(session, &rule.key) {
-                    limits.push(LimitSelection {
-                        key,
-                        conn: rule.conn,
-                        burst: rule.burst,
-                    });
-                }
-            }
-            return if limits.is_empty() {
-                None
-            } else {
-                Some(limits)
-            };
+            return select_rules(
+                session,
+                &self.config.rules,
+                |rule| rule.key.as_str(),
+                |_index, rule, key| LimitSelection {
+                    key,
+                    conn: rule.conn,
+                    burst: rule.burst,
+                },
+            );
         }
 
         let (Some(conn), Some(key)) = (&self.config.conn, &self.config.key) else {
@@ -445,56 +353,25 @@ impl PluginLimitConn {
     }
 
     fn get_or_insert_counter(&self, key: &str) -> Arc<ConnState> {
-        let mut shard = self.counters[shard_idx(key)]
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        if let Some(state) = shard.entries.get(key).cloned() {
-            shard.touch(key);
-            return state;
-        }
-        if shard.entries.len() >= PER_SHARD_REGULAR_MAX {
-            // A fixed, small cleanup budget prevents a request-time full scan.
-            shard.sweep_inactive();
-        }
-        // Never evict active entries. New keys use one stable overflow state
-        // once all regular entries are active, avoiding split guards.
-        let storage_key = if shard.entries.len() < PER_SHARD_REGULAR_MAX {
-            key
-        } else {
-            "__pingsix_limit_conn_overflow__"
-        };
-        let state = shard
-            .entries
-            .entry(storage_key.to_string())
+        self.counters
+            .lock(key)
+            // Never evict active entries: the sweep only retires zero-count
+            // states, and a still-full shard shares one stable overflow state
+            // so overflowed keys never hold split guards. The sweep's fixed
+            // budget prevents a request-time full scan.
+            .admit(key, LIMIT_CONN_OVERFLOW, |shard| {
+                shard.sweep(
+                    |state| state.count.load(Ordering::Relaxed) == 0,
+                    SweepMiss::PushBack,
+                )
+            })
             .or_insert_with(|| {
                 Arc::new(ConnState {
                     count: AtomicUsize::new(0),
                     unit_delay: Mutex::new(self.config.default_conn_delay),
                 })
             })
-            .clone();
-        shard.touch(storage_key);
-        state
-    }
-
-    async fn reject(&self, session: &mut Session) -> Result<bool> {
-        self.reject_with(
-            session,
-            StatusCode::from_u16(self.config.rejected_code)
-                .unwrap_or(StatusCode::SERVICE_UNAVAILABLE),
-            self.config.rejected_msg.as_deref(),
-        )
-        .await
-    }
-
-    async fn reject_with(
-        &self,
-        session: &mut Session,
-        status: StatusCode,
-        body: Option<&str>,
-    ) -> Result<bool> {
-        ResponseBuilder::send_proxy_error(session, status, body, None).await?;
-        Ok(true)
+            .clone()
     }
 }
 
@@ -518,13 +395,14 @@ impl ProxyPlugin for PluginLimitConn {
             if self.config.allow_degradation {
                 return Ok(false);
             }
-            return self
-                .reject_with(
-                    session,
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    Some("failed to get limit conn rules"),
-                )
-                .await;
+            return send_rejection(
+                session,
+                ctx,
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Some("failed to get limit conn rules"),
+                &[],
+            )
+            .await;
         };
 
         let mut guards = Vec::with_capacity(limits.len());
@@ -558,7 +436,7 @@ impl ProxyPlugin for PluginLimitConn {
                         limit.conn,
                         limit.burst
                     );
-                    return self.reject(session).await;
+                    return self.reject.reject(session, ctx).await;
                 }
             }
         }
@@ -589,6 +467,17 @@ impl ProxyPlugin for PluginLimitConn {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::plugins::{limiter_shards::shard_idx, limiting::LIMIT_CONN_OVERFLOW};
+
+    fn make_plugin(cfg: JsonValue) -> PluginLimitConn {
+        let config = PluginConfig::try_from(cfg).unwrap();
+        PluginLimitConn {
+            reject: RejectPolicy::new(config.rejected_code, config.rejected_msg.clone()),
+            config,
+            counters: BoundedShardMap::new(),
+            guard_key: conn_guard_key(99),
+        }
+    }
 
     #[test]
     fn requests_within_conn_pass_immediately() {
@@ -682,23 +571,21 @@ mod tests {
 
     #[test]
     fn full_active_shard_uses_one_stable_overflow_state() {
-        let plugin = PluginLimitConn {
-            config: PluginConfig::try_from(serde_json::json!({
-                "conn": 2,
-                "default_conn_delay": 0.1,
-                "key": "remote_addr"
-            }))
-            .unwrap(),
-            counters: std::array::from_fn(|_| Mutex::new(CounterShard::default())),
-            guard_key: conn_guard_key(99),
-        };
+        let plugin = make_plugin(serde_json::json!({
+            "conn": 2,
+            "default_conn_delay": 0.1,
+            "key": "remote_addr"
+        }));
         let shard = shard_idx("regular-0");
         let regular_keys: Vec<_> = (0..100_000)
             .map(|i| format!("regular-{i}"))
             .filter(|key| shard_idx(key) == shard)
-            .take(PER_SHARD_REGULAR_MAX)
+            .take(crate::plugins::limiter_shards::PER_SHARD_REGULAR_MAX)
             .collect();
-        assert_eq!(regular_keys.len(), PER_SHARD_REGULAR_MAX);
+        assert_eq!(
+            regular_keys.len(),
+            crate::plugins::limiter_shards::PER_SHARD_REGULAR_MAX
+        );
         for key in &regular_keys {
             plugin
                 .get_or_insert_counter(key)
@@ -714,43 +601,12 @@ mod tests {
         let second = plugin.get_or_insert_counter(&overflow_keys[1]);
 
         assert!(Arc::ptr_eq(&first, &second));
-        let shard = plugin.counters[shard].lock().unwrap();
-        assert_eq!(shard.entries.len(), PER_SHARD_REGULAR_MAX + 1);
-        assert!(shard
-            .entries
-            .contains_key("__pingsix_limit_conn_overflow__"));
-    }
-
-    #[test]
-    fn bounded_sweep_keeps_active_state_and_removes_only_budget() {
-        let mut shard = CounterShard::default();
-        let active = "active".to_string();
-        shard.entries.insert(
-            active.clone(),
-            Arc::new(ConnState {
-                count: AtomicUsize::new(1),
-                unit_delay: Mutex::new(0.1),
-            }),
-        );
-        shard.touch(&active);
-        for i in 0..CLEANUP_BUDGET + 2 {
-            let key = i.to_string();
-            shard.entries.insert(
-                key.clone(),
-                Arc::new(ConnState {
-                    count: AtomicUsize::new(0),
-                    unit_delay: Mutex::new(0.1),
-                }),
-            );
-            shard.touch(&key);
-        }
-        shard.sweep_inactive();
-        assert!(shard.entries.contains_key(&active));
+        let shard = plugin.counters.lock(&regular_keys[0]);
         assert_eq!(
-            shard.entries.len(),
-            4,
-            "the active entry plus two inactive entries remain after an 8-item bounded sweep"
+            shard.len(),
+            crate::plugins::limiter_shards::PER_SHARD_REGULAR_MAX + 1
         );
+        assert!(shard.contains_key(LIMIT_CONN_OVERFLOW));
     }
 
     #[test]
@@ -933,18 +789,13 @@ mod tests {
 
     #[tokio::test]
     async fn rejects_at_conn_plus_burst_with_configured_code_and_frees_slot() {
-        let plugin = PluginLimitConn {
-            config: PluginConfig::try_from(serde_json::json!({
-                "conn": 1,
-                "burst": 0,
-                "default_conn_delay": 0.1,
-                "key": "remote_addr",
-                "rejected_code": 429
-            }))
-            .unwrap(),
-            counters: std::array::from_fn(|_| Mutex::new(CounterShard::default())),
-            guard_key: conn_guard_key(96),
-        };
+        let plugin = make_plugin(serde_json::json!({
+            "conn": 1,
+            "burst": 0,
+            "default_conn_delay": 0.1,
+            "key": "remote_addr",
+            "rejected_code": 429
+        }));
         let request = "GET / HTTP/1.1\r\nHost: example.com\r\n\r\n";
 
         // First in-flight request occupies the single slot.
@@ -985,18 +836,13 @@ mod tests {
 
     #[tokio::test]
     async fn rules_select_every_matching_rule_and_skip_unresolved() {
-        let plugin = PluginLimitConn {
-            config: PluginConfig::try_from(serde_json::json!({
-                "default_conn_delay": 0.1,
-                "rules": [
-                    {"conn": 3, "burst": 1, "key": "$http_x_user"},
-                    {"conn": 10, "burst": 0, "key": "$http_x_role"}
-                ]
-            }))
-            .unwrap(),
-            counters: std::array::from_fn(|_| Mutex::new(CounterShard::default())),
-            guard_key: conn_guard_key(98),
-        };
+        let plugin = make_plugin(serde_json::json!({
+            "default_conn_delay": 0.1,
+            "rules": [
+                {"conn": 3, "burst": 1, "key": "$http_x_user"},
+                {"conn": 10, "burst": 0, "key": "$http_x_role"}
+            ]
+        }));
 
         let mut session = session_with_header("x-user", "alice").await;
         session
@@ -1018,15 +864,10 @@ mod tests {
         assert!(limits.iter().all(|limit| limit.key.is_empty()));
 
         // Bare rule keys resolve no variables and are skipped, like APISIX.
-        let bare = PluginLimitConn {
-            config: PluginConfig::try_from(serde_json::json!({
-                "default_conn_delay": 0.1,
-                "rules": [{"conn": 3, "burst": 1, "key": "remote_addr"}]
-            }))
-            .unwrap(),
-            counters: std::array::from_fn(|_| Mutex::new(CounterShard::default())),
-            guard_key: conn_guard_key(97),
-        };
+        let bare = make_plugin(serde_json::json!({
+            "default_conn_delay": 0.1,
+            "rules": [{"conn": 3, "burst": 1, "key": "remote_addr"}]
+        }));
         let mut session = session_with_header("host", "example.com").await;
         assert!(bare.select_limits(&mut session).is_none());
     }

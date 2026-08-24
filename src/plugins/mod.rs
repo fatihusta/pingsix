@@ -21,6 +21,7 @@ pub mod limit_conn;
 pub mod limit_count;
 pub mod limit_req;
 pub(crate) mod limiter_shards;
+pub(crate) mod limiting;
 pub mod prometheus;
 pub mod proxy_mirror;
 pub mod proxy_rewrite;

@@ -18,7 +18,6 @@ use pingora_core::Error;
 use pingora_error::Result;
 use pingora_proxy::Session;
 use prometheus::{register_int_counter, IntCounter};
-use regex::Regex;
 use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
 
@@ -111,6 +110,7 @@ struct PluginConfig {
     /// Supported variables include: `request_method`, `uri`, `query_string`, `http_host`, `request_time`,
     /// `http_user_agent`, `http_referer`, `remote_addr`, `remote_port`, `server_addr`, `status`,
     /// `server_protocol`, `request_id`, `body_bytes_sent`, `error`, and custom variables via `var_<name>`.
+    /// Both the `$name` and `${name}` spelling are accepted.
     ///
     /// APISIX master accepts an object here, but pingsix keeps the existing
     /// custom string format extension.
@@ -261,7 +261,7 @@ pub struct PluginFileLogger {
 
 impl PluginFileLogger {
     fn build(config: PluginConfig) -> ProxyResult<Self> {
-        let log_format = LogFormat::parse(&config.log_format)?;
+        let log_format = LogFormat::new(config.log_format);
 
         let writer = config
             .path
@@ -615,76 +615,20 @@ fn render_json_entry(
     JsonValue::Object(entry).to_string()
 }
 
-#[derive(Debug)]
-enum Segment {
-    Static(String),
-    Variable(String),
-}
-
+/// A log format template. Parsing is deferred to render time and shared
+/// with every other `$var` template in the gateway
+/// ([`request::render_template`]); both `$name` and `${name}` spell a
+/// variable, a bare `$` not followed by a name stays literal, and unknown
+/// variables render empty. There is no escape syntax: a `\` is an ordinary
+/// character, same as before.
 #[derive(Debug)]
 struct LogFormat {
-    segments: Vec<Segment>,
-    estimated_capacity: usize, // Pre-calculated capacity estimation
+    format: String,
 }
 
 impl LogFormat {
-    /// Parses a log format string into a `LogFormat` struct.
-    /// Variables are identified by `$` prefix (e.g., `$remote_addr`).
-    fn parse(format: &str) -> ProxyResult<Self> {
-        let re = Regex::new(r"\$[a-zA-Z0-9_]+")
-            .map_err(|e| ProxyError::Internal(format!("Failed to parse log format: {e}")))?;
-        let mut segments = Vec::new();
-        let mut last_pos = 0;
-        let mut estimated_capacity = 0;
-
-        for mat in re.find_iter(format) {
-            // Add static part before the variable
-            if last_pos < mat.start() {
-                let static_part = format[last_pos..mat.start()].to_string();
-                estimated_capacity += static_part.len();
-                segments.push(Segment::Static(static_part));
-            }
-            // Add variable (remove $ prefix)
-            let var_name = mat.as_str()[1..].to_string();
-            estimated_capacity += Self::estimate_variable_size(&var_name);
-            segments.push(Segment::Variable(var_name));
-            last_pos = mat.end();
-        }
-
-        // Add remaining static part
-        if last_pos < format.len() {
-            let static_part = format[last_pos..].to_string();
-            estimated_capacity += static_part.len();
-            segments.push(Segment::Static(static_part));
-        }
-
-        Ok(LogFormat {
-            segments,
-            estimated_capacity,
-        })
-    }
-
-    /// Estimate the size of a variable for capacity pre-allocation
-    fn estimate_variable_size(var_name: &str) -> usize {
-        match var_name {
-            "status" => 4,                           // 3-4 bytes (e.g., "200")
-            "request_method" => 8,                   // 3-7 bytes (e.g., "GET")
-            "request_id" => 36,                      // UUID length
-            "http_user_agent" => 128,                // Browser UA can be long
-            "uri" => 64,                             // Average URI length
-            "query_string" => 32,                    // Average query string length
-            "http_host" => 32,                       // Average host length
-            "request_time" => 8,                     // Milliseconds as string
-            "http_referer" => 64,                    // Average referer length
-            "remote_addr" => 16,                     // IPv4/IPv6 address
-            "remote_port" => 6,                      // Port number
-            "server_addr" => 16,                     // Server address
-            "server_protocol" => 8,                  // "http/1.1" or "http/2"
-            "body_bytes_sent" => 12,                 // Large numbers
-            "error" => 128,                          // Error messages can be long
-            _ if var_name.starts_with("var_") => 32, // Custom variables
-            _ => 16,                                 // Default for unknown variables
-        }
+    fn new(format: String) -> Self {
+        LogFormat { format }
     }
 
     /// Renders the log format into a string, replacing variables with their values.
@@ -699,106 +643,99 @@ impl LogFormat {
         ctx: &mut ProxyContext,
         redact_query_params: &[String],
     ) -> String {
-        // Create output string with pre-allocated capacity
-        let mut output = String::with_capacity(self.estimated_capacity);
+        request::render_template(&self.format, request::TemplateOptions::default(), |name| {
+            resolve_log_var(name, session, e, ctx, redact_query_params)
+        })
+    }
+}
 
-        for segment in &self.segments {
-            match segment {
-                Segment::Static(text) => output.push_str(text),
-                Segment::Variable(var) => {
-                    self.write_variable(&mut output, var, session, e, ctx, redact_query_params)
-                }
-            }
-        }
+/// Log-phase resolver for [`LogFormat`]: request-derived variables plus the
+/// log-phase-only ones (`status`, `body_bytes_sent`, `request_time`,
+/// `server_protocol`, `error`) and `var_<name>` context values.
+fn resolve_log_var(
+    var: &str,
+    session: &mut Session,
+    e: Option<&Error>,
+    ctx: &mut ProxyContext,
+    redact_query_params: &[String],
+) -> String {
+    use std::fmt::Write;
 
-        output
+    let mut output = String::new();
+
+    if let Some(custom_var_name) = var.strip_prefix("var_") {
+        push_escaped(&mut output, ctx.get_str(custom_var_name).unwrap_or(""));
+        return output;
     }
 
-    /// Writes a variable directly into the final buffer to avoid a temporary
-    /// allocation for borrowed request fields.
-    fn write_variable(
-        &self,
-        output: &mut String,
-        var: &str,
-        session: &mut Session,
-        e: Option<&Error>,
-        ctx: &mut ProxyContext,
-        redact_query_params: &[String],
-    ) {
-        use std::fmt::Write;
-
-        if let Some(custom_var_name) = var.strip_prefix("var_") {
-            push_escaped(output, ctx.get_str(custom_var_name).unwrap_or(""));
-            return;
-        }
-
-        match var {
-            "request_method" => push_escaped(output, session.req_header().method.as_str()),
-            "uri" => push_escaped(output, session.req_header().uri.path()),
-            "query_string" => {
-                let query = session.req_header().uri.query().unwrap_or_default();
-                if redact_query_params.is_empty() {
-                    push_escaped(output, query);
-                } else {
-                    push_escaped(output, &redact_query(query, redact_query_params));
-                }
-            }
-            "http_host" => {
-                push_escaped(output, session.req_header().uri.host().unwrap_or_default())
-            }
-            "request_time" => {
-                let _ = write!(output, "{}", ctx.elapsed_ms());
-            }
-            "http_user_agent" => push_escaped(
-                output,
-                request::get_req_header_value(session.req_header(), "user-agent")
-                    .unwrap_or_default(),
-            ),
-            "http_referer" => push_escaped(
-                output,
-                request::get_req_header_value(session.req_header(), "referer").unwrap_or_default(),
-            ),
-            "remote_addr" => {
-                if let Some(addr) = session.client_addr() {
-                    let _ = write!(output, "{addr}");
-                }
-            }
-            "remote_port" => {
-                if let Some(port) = session
-                    .client_addr()
-                    .and_then(|addr| addr.as_inet())
-                    .map(|addr| addr.port())
-                {
-                    let _ = write!(output, "{port}");
-                }
-            }
-            "server_addr" => {
-                if let Some(addr) = session.server_addr() {
-                    let _ = write!(output, "{addr}");
-                }
-            }
-            "status" => {
-                if let Some(response) = session.response_written() {
-                    let _ = write!(output, "{}", response.status.as_u16());
-                }
-            }
-            "server_protocol" => output.push_str(if session.is_http2() {
-                "http/2"
+    match var {
+        "request_method" => push_escaped(&mut output, session.req_header().method.as_str()),
+        "uri" => push_escaped(&mut output, session.req_header().uri.path()),
+        "query_string" => {
+            let query = session.req_header().uri.query().unwrap_or_default();
+            if redact_query_params.is_empty() {
+                push_escaped(&mut output, query);
             } else {
-                "http/1.1"
-            }),
-            "request_id" => push_escaped(output, ctx.request_id().unwrap_or("")),
-            "body_bytes_sent" => {
-                let _ = write!(output, "{}", session.body_bytes_sent());
+                push_escaped(&mut output, &redact_query(query, redact_query_params));
             }
-            "error" => {
-                if let Some(error) = e {
-                    push_escaped(output, &format!("{error}"));
-                }
-            }
-            _ => {}
         }
+        "http_host" => push_escaped(
+            &mut output,
+            session.req_header().uri.host().unwrap_or_default(),
+        ),
+        "request_time" => {
+            let _ = write!(output, "{}", ctx.elapsed_ms());
+        }
+        "http_user_agent" => push_escaped(
+            &mut output,
+            request::get_req_header_value(session.req_header(), "user-agent").unwrap_or_default(),
+        ),
+        "http_referer" => push_escaped(
+            &mut output,
+            request::get_req_header_value(session.req_header(), "referer").unwrap_or_default(),
+        ),
+        "remote_addr" => {
+            if let Some(addr) = session.client_addr() {
+                let _ = write!(output, "{addr}");
+            }
+        }
+        "remote_port" => {
+            if let Some(port) = session
+                .client_addr()
+                .and_then(|addr| addr.as_inet())
+                .map(|addr| addr.port())
+            {
+                let _ = write!(output, "{port}");
+            }
+        }
+        "server_addr" => {
+            if let Some(addr) = session.server_addr() {
+                let _ = write!(output, "{addr}");
+            }
+        }
+        "status" => {
+            if let Some(response) = session.response_written() {
+                let _ = write!(output, "{}", response.status.as_u16());
+            }
+        }
+        "server_protocol" => output.push_str(if session.is_http2() {
+            "http/2"
+        } else {
+            "http/1.1"
+        }),
+        "request_id" => push_escaped(&mut output, ctx.request_id().unwrap_or("")),
+        "body_bytes_sent" => {
+            let _ = write!(output, "{}", session.body_bytes_sent());
+        }
+        "error" => {
+            if let Some(error) = e {
+                push_escaped(&mut output, &format!("{error}"));
+            }
+        }
+        _ => {}
     }
+
+    output
 }
 
 #[cfg(test)]
@@ -1084,6 +1021,36 @@ mod tests {
         assert_eq!(entry["request_body_truncated"], json!(true));
         assert_eq!(entry["response_body"], BASE64.encode(b"response-data"));
         assert!(entry.get("response_body_truncated").is_none());
+    }
+
+    #[tokio::test]
+    async fn log_format_braced_and_plain_variables_are_equivalent() {
+        let mut session = session_for("GET /legacy?token=secret HTTP/1.1\r\nHost: t\r\n\r\n").await;
+        write_ok_response(&mut session).await;
+        let mut ctx = ProxyContext::default();
+        ctx.set_request_id("req-eq".to_string());
+
+        let plain = LogFormat::new("$request_method $uri $status $request_id".to_string());
+        let braced = LogFormat::new("${request_method} ${uri} ${status} ${request_id}".to_string());
+        let plain_rendered = plain.render(&mut session, None, &mut ctx, &[]);
+        let braced_rendered = braced.render(&mut session, None, &mut ctx, &[]);
+        assert_eq!(plain_rendered, braced_rendered);
+        assert_eq!(plain_rendered, "GET /legacy 200 req-eq");
+    }
+
+    #[tokio::test]
+    async fn log_format_keeps_unmatched_dollars_literal_and_blanks_unknown_vars() {
+        // Guards the pre-T5 rendering contract of the regex parser: a `$`
+        // not followed by a name stays literal and unknown names vanish.
+        let mut session = session_for("GET /x HTTP/1.1\r\nHost: t\r\n\r\n").await;
+        write_ok_response(&mut session).await;
+        let mut ctx = ProxyContext::default();
+
+        let format = LogFormat::new("cost: $ x |$ |$$uri|$bogus|".to_string());
+        assert_eq!(
+            format.render(&mut session, None, &mut ctx, &[]),
+            "cost: $ x |$ |$/x||"
+        );
     }
 
     #[test]
