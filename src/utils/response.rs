@@ -111,11 +111,28 @@ pub(crate) fn resolve_exit_response(
     extra_headers: &[(String, String)],
     request_id: Option<&str>,
 ) -> ResolvedExitResponse {
+    // Framing is owned exclusively by `send_exit_response`; accepting it from
+    // plugins or transformer rules could produce conflicting lengths or
+    // response-smuggling-friendly CL/TE combinations. Content-Type is also
+    // normalized into its typed slot so transformer overrides are definitive.
+    let mut normalized_content_type = content_type.map(str::to_string);
+    let mut normalized_headers = Vec::with_capacity(extra_headers.len());
+    for (name, value) in extra_headers {
+        if name.eq_ignore_ascii_case("content-type") {
+            // Generic rejection headers historically followed the typed
+            // default and therefore override it. Transformer headers are
+            // applied later and remain the final authority.
+            normalized_content_type = Some(value.clone());
+        } else if !is_framing_header(name) {
+            normalized_headers.push((name.clone(), value.clone()));
+        }
+    }
+
     let mut resolved = ResolvedExitResponse {
         status,
         body: body.map(|b| b.as_bytes().to_vec()),
-        content_type: content_type.map(str::to_string),
-        headers: extra_headers.to_vec(),
+        content_type: normalized_content_type,
+        headers: normalized_headers,
     };
 
     let Some(rule) = transform.and_then(|t| t.matching(status)) else {
@@ -140,7 +157,7 @@ pub(crate) fn resolve_exit_response(
         let value = substitute_exit_vars(value, resolved.status, body, request_id);
         if name.eq_ignore_ascii_case("content-type") {
             resolved.content_type = Some(value);
-        } else {
+        } else if !is_framing_header(name) {
             // Later rule headers override earlier ones with the same name.
             resolved
                 .headers
@@ -150,6 +167,10 @@ pub(crate) fn resolve_exit_response(
     }
 
     resolved
+}
+
+fn is_framing_header(name: &str) -> bool {
+    name.eq_ignore_ascii_case("content-length") || name.eq_ignore_ascii_case("transfer-encoding")
 }
 
 /// Send a gateway-generated exit response through `exit-transformer` rules.
@@ -199,12 +220,14 @@ pub(crate) async fn send_exit_response(
     let mut resp = ResponseHeader::build(status_code, None)?;
 
     let has_body = final_body.as_ref().is_some_and(|body| !body.is_empty());
-    if has_body {
-        let body = final_body.expect("checked above");
-        resp.insert_header(header::CONTENT_LENGTH, body.len().to_string())?;
+    if !body_forbidden {
         if let Some(ct) = &final_content_type {
             resp.insert_header(header::CONTENT_TYPE, ct.as_str())?;
         }
+    }
+    if has_body {
+        let body = final_body.expect("checked above");
+        resp.insert_header(header::CONTENT_LENGTH, body.len().to_string())?;
         for (name, value) in &headers {
             resp.insert_header(name.clone(), value.clone())?;
         }
@@ -338,6 +361,68 @@ mod tests {
         assert_eq!(
             resolved.headers,
             vec![("X-Error-Code".to_string(), "403".to_string())]
+        );
+    }
+
+    #[test]
+    fn content_type_is_normalized_and_transformer_override_wins() {
+        let t = transform(vec![ExitTransformRule {
+            codes: vec![302],
+            status_code: None,
+            body: Some("transformed".into()),
+            headers: vec![("Content-Type".into(), "application/json".into())],
+        }]);
+        let resolved = resolve_exit_response(
+            t.as_ref(),
+            302,
+            Some("redirect"),
+            None,
+            &[("content-type".into(), "text/plain".into())],
+            None,
+        );
+        assert_eq!(resolved.content_type.as_deref(), Some("application/json"));
+        assert!(resolved
+            .headers
+            .iter()
+            .all(|(name, _)| !name.eq_ignore_ascii_case("content-type")));
+    }
+
+    #[test]
+    fn extra_content_type_overrides_typed_default() {
+        let resolved = resolve_exit_response(
+            None,
+            503,
+            Some("unavailable"),
+            Some("text/plain"),
+            &[("Content-Type".into(), "application/json".into())],
+            None,
+        );
+        assert_eq!(resolved.content_type.as_deref(), Some("application/json"));
+        assert!(resolved.headers.is_empty());
+    }
+
+    #[test]
+    fn framing_headers_are_discarded_from_all_extra_header_sources() {
+        let t = transform(vec![ExitTransformRule {
+            codes: vec![503],
+            status_code: None,
+            body: None,
+            headers: vec![
+                ("Transfer-Encoding".into(), "chunked".into()),
+                ("X-Safe".into(), "yes".into()),
+            ],
+        }]);
+        let resolved = resolve_exit_response(
+            t.as_ref(),
+            503,
+            Some("unavailable"),
+            Some("text/plain"),
+            &[("Content-Length".into(), "999".into())],
+            None,
+        );
+        assert_eq!(
+            resolved.headers,
+            vec![("X-Safe".to_string(), "yes".to_string())]
         );
     }
 

@@ -543,41 +543,72 @@ mod builtin_phases_tests {
     use crate::core::{PluginEntry, ProxyPluginExecutor};
     use crate::proxy::upstream::discovery::build_resolver_for_state;
 
-    /// All builtin plugin names; anchors the inventory-completion assertion.
-    fn builtin_names() -> HashSet<&'static str> {
-        [
-            client_control::PLUGIN_NAME,
-            exit_transformer::PLUGIN_NAME,
-            request_id::PLUGIN_NAME,
-            fault_injection::PLUGIN_NAME,
-            cors::PLUGIN_NAME,
-            ip_restriction::PLUGIN_NAME,
-            uri_blocker::PLUGIN_NAME,
-            ai_proxy::PLUGIN_NAME,
-            request_validation::PLUGIN_NAME,
-            csrf::PLUGIN_NAME,
-            basic_auth::PLUGIN_NAME,
-            jwt_auth::PLUGIN_NAME,
-            key_auth::PLUGIN_NAME,
-            cache::PLUGIN_NAME,
-            proxy_rewrite::PLUGIN_NAME,
-            api_breaker::PLUGIN_NAME,
-            proxy_mirror::PLUGIN_NAME,
-            limit_conn::PLUGIN_NAME,
-            limit_count::PLUGIN_NAME,
-            limit_req::PLUGIN_NAME,
-            brotli::PLUGIN_NAME,
-            gzip::PLUGIN_NAME,
-            redirect::PLUGIN_NAME,
-            response_rewrite::PLUGIN_NAME,
-            grpc_web::PLUGIN_NAME,
-            prometheus::PLUGIN_NAME,
-            echo::PLUGIN_NAME,
-            file_logger::PLUGIN_NAME,
-            traffic_split::PLUGIN_NAME,
-        ]
-        .into_iter()
-        .collect()
+    /// Independent behavioral oracle for builtin hook declarations. Metadata
+    /// is the production source of truth; this table deliberately duplicates
+    /// expectations so accidentally omitting a phase cannot silently disable
+    /// an implemented hook while all construction tests remain green.
+    fn expected_phases() -> HashMap<&'static str, PluginPhases> {
+        let request = PluginPhases::REQUEST;
+        let early = PluginPhases::EARLY_REQUEST;
+        let logging = PluginPhases::LOGGING;
+        HashMap::from([
+            (
+                client_control::PLUGIN_NAME,
+                request | PluginPhases::REQUEST_BODY,
+            ),
+            (exit_transformer::PLUGIN_NAME, PluginPhases::empty()),
+            (request_id::PLUGIN_NAME, request | PluginPhases::RESPONSE),
+            (fault_injection::PLUGIN_NAME, request),
+            (cors::PLUGIN_NAME, request | PluginPhases::RESPONSE),
+            (ip_restriction::PLUGIN_NAME, request),
+            (uri_blocker::PLUGIN_NAME, request),
+            (
+                ai_proxy::PLUGIN_NAME,
+                request
+                    | PluginPhases::UPSTREAM_REQUEST
+                    | PluginPhases::REQUEST_BODY
+                    | PluginPhases::UPSTREAM_PEER,
+            ),
+            (
+                request_validation::PLUGIN_NAME,
+                request | PluginPhases::REQUEST_BODY,
+            ),
+            (csrf::PLUGIN_NAME, request | PluginPhases::RESPONSE),
+            (basic_auth::PLUGIN_NAME, request),
+            (jwt_auth::PLUGIN_NAME, request | PluginPhases::RESPONSE),
+            (key_auth::PLUGIN_NAME, request),
+            (cache::PLUGIN_NAME, request),
+            (proxy_rewrite::PLUGIN_NAME, PluginPhases::UPSTREAM_REQUEST),
+            (
+                proxy_mirror::PLUGIN_NAME,
+                request | PluginPhases::UPSTREAM_REQUEST | PluginPhases::REQUEST_BODY,
+            ),
+            (api_breaker::PLUGIN_NAME, request | PluginPhases::RESPONSE),
+            (limit_conn::PLUGIN_NAME, request | logging),
+            (limit_count::PLUGIN_NAME, request | PluginPhases::RESPONSE),
+            (limit_req::PLUGIN_NAME, request),
+            (brotli::PLUGIN_NAME, early),
+            (gzip::PLUGIN_NAME, early),
+            (redirect::PLUGIN_NAME, request),
+            (
+                response_rewrite::PLUGIN_NAME,
+                PluginPhases::RESPONSE | PluginPhases::RESPONSE_BODY,
+            ),
+            (
+                grpc_web::PLUGIN_NAME,
+                early | request | PluginPhases::REQUEST_BODY | PluginPhases::RESPONSE,
+            ),
+            (prometheus::PLUGIN_NAME, logging),
+            (
+                echo::PLUGIN_NAME,
+                PluginPhases::RESPONSE | PluginPhases::RESPONSE_BODY,
+            ),
+            (
+                file_logger::PLUGIN_NAME,
+                logging | PluginPhases::REQUEST_BODY | PluginPhases::RESPONSE_BODY,
+            ),
+            (traffic_split::PLUGIN_NAME, request),
+        ])
     }
 
     fn minimal_config(name: &str) -> JsonValue {
@@ -614,7 +645,7 @@ mod builtin_phases_tests {
 
     #[test]
     fn plugin_meta_inventory_is_complete_and_unique() {
-        let expected_names = builtin_names();
+        let expected_names: HashSet<_> = expected_phases().into_keys().collect();
         let inventory_names: std::collections::HashSet<_> =
             PLUGIN_META.iter().map(|meta| meta.name).collect();
         assert_eq!(
@@ -658,15 +689,20 @@ mod builtin_phases_tests {
             .is_none());
     }
 
-    /// The wiring is tested, not a second copy of the data: each builtin is
-    /// built through the same construction path the proxy uses, and the
-    /// resulting executor partition must match the plugin's `PLUGIN_META`
-    /// phases — that is the whole point of construction-time derivation.
+    /// Check both the independent hook expectations and the production
+    /// construction path. The former catches omitted metadata; the latter
+    /// catches executor partitioning regressions.
     #[test]
-    fn builtin_executor_partition_matches_meta_phases() {
+    fn builtin_executor_partition_matches_expected_phases() {
         let defaults = crate::config::EffectiveDefaults::default();
+        let expected = expected_phases();
 
         for meta in PLUGIN_META {
+            assert_eq!(
+                meta.phases, expected[meta.name],
+                "phase mismatch for {}",
+                meta.name
+            );
             if matches!(meta.factory, PluginFactory::WithUpstreams(_)) {
                 // traffic-split / ai-proxy need upstream build context; their
                 // pairing is pinned below in their own assertions.

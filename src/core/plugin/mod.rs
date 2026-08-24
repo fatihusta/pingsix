@@ -66,9 +66,11 @@ pub struct Rejection {
     pub status: StatusCode,
     /// Optional response body. `exit-transformer` templates it as `$message`.
     pub body: Option<String>,
-    /// Content-Type for the body. Only emitted when a non-empty body is sent.
+    /// Content-Type for the response. Emitted for empty bodies too, except on
+    /// status codes that forbid response content (1xx/204/304).
     pub content_type: Option<String>,
-    /// Extra response headers (appended verbatim, in order).
+    /// Extra response headers. The shared renderer normalizes Content-Type
+    /// into the typed field and discards framing headers it owns.
     pub headers: Vec<(String, String)>,
     /// `true` drops downstream keep-alive after the response (Pingora closes
     /// the connection). Mirrors limit-count's historical
@@ -95,7 +97,7 @@ impl Rejection {
         self
     }
 
-    /// Set the body's content type (only emitted when a body is sent).
+    /// Set the response content type.
     pub fn with_content_type(mut self, content_type: impl Into<String>) -> Self {
         self.content_type = Some(content_type.into());
         self

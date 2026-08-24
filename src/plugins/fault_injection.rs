@@ -380,6 +380,21 @@ mod tests {
     }
 
     #[test]
+    fn bodyless_abort_preserves_plain_text_content_type() {
+        let config = PluginConfig::try_from(json!({
+            "abort": { "http_status": 503 }
+        }))
+        .expect("valid abort");
+        let abort = config.abort.as_ref().expect("abort config");
+        let rejection = PluginFaultInjection::abort_rejection(abort);
+        assert_eq!(rejection.body.as_deref(), Some(""));
+        assert_eq!(
+            rejection.content_type.as_deref(),
+            Some(crate::utils::response::content_type::TEXT_PLAIN)
+        );
+    }
+
+    #[test]
     fn nonempty_apisix_vars_are_rejected() {
         let delay = json!({
             "delay": {
