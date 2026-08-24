@@ -14,7 +14,6 @@ fn init_log() {
 #[test]
 fn passive_schema_accepts_disabled_thresholds_and_rejects_bad_statuses() {
     let valid = PassiveCheck {
-        r#type: PassiveCheckType::HTTP,
         healthy: PassiveHealthy {
             http_statuses: vec![200],
             successes: 0,
@@ -44,7 +43,6 @@ fn health_check_requires_active_or_passive() {
     let passive_only = HealthCheck {
         active: None,
         passive: Some(PassiveCheck {
-            r#type: PassiveCheckType::HTTP,
             healthy: PassiveHealthy::default(),
             unhealthy: PassiveUnhealthy::default(),
         }),
@@ -1441,21 +1439,17 @@ fn upstream_rejects_explicit_zero_port_in_list_form() {
 #[test]
 fn keepalive_pool_defaults_match_apisix() {
     let pool: KeepalivePool = serde_json::from_value(serde_json::json!({})).unwrap();
-    assert_eq!(pool.size, 320);
     assert_eq!(pool.idle_timeout_ms, 60_000);
-    assert_eq!(pool.requests, 1000);
-    assert!(!pool.has_unsupported_overrides());
     assert!(pool.validate().is_ok());
 }
 
 #[test]
 fn keepalive_pool_accepts_fractional_idle_timeout_seconds() {
     let pool: KeepalivePool = serde_json::from_value(serde_json::json!({
-        "size": 128, "idle_timeout": 90.5, "requests": 200
+        "idle_timeout": 90.5
     }))
     .unwrap();
     assert_eq!(pool.idle_timeout_ms, 90_500);
-    assert!(pool.has_unsupported_overrides());
     assert!(pool.validate().is_ok());
 }
 
@@ -1465,11 +1459,6 @@ fn keepalive_pool_rejects_invalid_values() {
         "idle_timeout": -1
     }))
     .is_err());
-    let zero_size: KeepalivePool = serde_json::from_value(serde_json::json!({"size": 0})).unwrap();
-    assert!(zero_size.validate().is_err());
-    let zero_requests: KeepalivePool =
-        serde_json::from_value(serde_json::json!({"requests": 0})).unwrap();
-    assert!(zero_requests.validate().is_err());
 }
 
 #[test]
@@ -1495,7 +1484,7 @@ fn keepalive_pool_typo_is_flagged_by_schema_warnings() {
         "upstreams",
         &serde_json::json!({
             "nodes": {"127.0.0.1:8080": 1},
-            "keepalive_pool": {"size": 10, "idle_timout": 30}
+            "keepalive_pool": {"idle_timout": 30}
         }),
     );
     assert_eq!(

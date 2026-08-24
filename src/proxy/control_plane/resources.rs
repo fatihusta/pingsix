@@ -207,7 +207,6 @@ mod tests {
         nodes.insert(node.to_string(), 1);
         Upstream {
             id: id.to_string(),
-            name: None,
             retries: None,
             retry_timeout: None,
             timeout: None,

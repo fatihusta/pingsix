@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::{fmt::Write as _, sync::Arc};
 
 use async_trait::async_trait;
 use http::{header, uri::Scheme, StatusCode, Uri};
@@ -76,6 +76,7 @@ struct PluginConfig {
     /// The URI to redirect to. Takes precedence over `regex_uri` if both are set.
     uri: Option<String>,
     /// List of regex pattern and replacement template pairs for URI rewriting.
+    #[serde(default)]
     #[validate(custom(function = "PluginConfig::validate_regex_uri"))]
     regex_uri: Vec<String>,
     /// HTTP status code for the redirect (e.g., 301, 302, 307, 308). Defaults to 302 (temporary redirect).
@@ -84,6 +85,10 @@ struct PluginConfig {
     /// If true, appends the original query string to the redirect URI, even if the target URI has a query string.
     #[serde(default)]
     append_query_string: bool,
+    /// If true, percent-encode the rewritten path part of the redirect URI.
+    /// Existing percent-encoded sequences and `/` are preserved.
+    #[serde(default)]
+    encode_uri: bool,
     /// Fixed host for the HTTPS redirect Location. Required when `http_to_https`
     /// is true. Prevents host-header injection into the Location header.
     redirect_host: Option<String>,
@@ -123,6 +128,14 @@ impl TryFrom<JsonValue> for PluginConfig {
         let config: PluginConfig =
             parse_and_validate_plugin_config(value, "Invalid redirect plugin config")?;
 
+        let has_action =
+            config.http_to_https || config.uri.is_some() || !config.regex_uri.is_empty();
+        if !has_action {
+            return Err(ProxyError::validation_error(
+                "redirect plugin requires one of 'http_to_https', 'uri', or 'regex_uri'",
+            ));
+        }
+
         if config.http_to_https {
             let host = config.redirect_host.as_deref().map(str::trim).unwrap_or("");
             if host.is_empty() {
@@ -130,6 +143,14 @@ impl TryFrom<JsonValue> for PluginConfig {
                     "redirect plugin: http_to_https requires redirect_host \
                      (do not fall back to the request Host header)"
                         .into(),
+                ));
+            }
+        }
+
+        if let Some(uri) = &config.uri {
+            if uri.len() < 2 {
+                return Err(ProxyError::validation_error(
+                    "redirect uri must be at least 2 characters",
                 ));
             }
         }
@@ -252,7 +273,8 @@ impl PluginRedirect {
         let parts = session.req_header().uri.clone().into_parts();
 
         if let Some(ref path) = self.config.uri {
-            return self.build_uri_from_path(path, parts, original_query);
+            let expanded = expand_uri_template(path, session);
+            return self.build_uri_from_path(&expanded, parts, original_query);
         }
 
         if !self.regex_patterns.is_empty() {
@@ -274,6 +296,11 @@ impl PluginRedirect {
             .and_then(|uri| uri.query().map(|q| q.to_string()))
             .unwrap_or_default();
         let new_path = path.split('?').next().unwrap_or(path);
+        let new_path = if self.config.encode_uri {
+            encode_uri_safe_path(new_path)
+        } else {
+            new_path.to_string()
+        };
         let new_query = Self::merge_query_string(
             &target_query,
             original_query,
@@ -281,7 +308,7 @@ impl PluginRedirect {
         );
 
         let new_path_and_query = if new_query.is_empty() {
-            new_path.to_string()
+            new_path
         } else {
             format!("{new_path}?{new_query}")
         };
@@ -301,6 +328,11 @@ impl PluginRedirect {
             let (new_path, target_query) = rewritten
                 .split_once('?')
                 .map_or_else(|| (rewritten.as_ref(), ""), |(p, q)| (p, q));
+            let new_path = if self.config.encode_uri {
+                encode_uri_safe_path(new_path)
+            } else {
+                new_path.to_string()
+            };
             let new_query = Self::merge_query_string(
                 target_query,
                 original_query,
@@ -308,7 +340,7 @@ impl PluginRedirect {
             );
 
             let new_uri = if new_query.is_empty() {
-                new_path.to_string()
+                new_path
             } else {
                 format!("{new_path}?{new_query}")
             };
@@ -341,6 +373,122 @@ fn session_has_tls(session: &Session) -> bool {
         .digest()
         .and_then(|d| d.ssl_digest.as_ref())
         .is_some()
+}
+
+/// Percent-encode a URI path without touching unreserved characters, `/`, or
+/// already-encoded `%XX` sequences.
+fn encode_uri_safe_path(path: &str) -> String {
+    fn is_hex_digit(byte: u8) -> bool {
+        byte.is_ascii_hexdigit()
+    }
+
+    let bytes = path.as_bytes();
+    let mut encoded = String::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        let byte = bytes[index];
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'~' | b'/') {
+            encoded.push(byte as char);
+            index += 1;
+        } else if byte == b'%'
+            && bytes.len() >= index + 3
+            && is_hex_digit(bytes[index + 1])
+            && is_hex_digit(bytes[index + 2])
+        {
+            encoded.push('%');
+            encoded.push(bytes[index + 1] as char);
+            encoded.push(bytes[index + 2] as char);
+            index += 3;
+        } else {
+            write!(&mut encoded, "%{byte:02X}").expect("writing to a String cannot fail");
+            index += 1;
+        }
+    }
+    encoded
+}
+
+/// Expand APISIX nginx-style `$name` / `${name}` variables in a redirect URI
+/// template. Escaped `\$` stays a literal `$`; unknown variables expand to an
+/// empty string.
+fn expand_uri_template(template: &str, session: &Session) -> String {
+    render_redirect_template(template, |name| {
+        resolve_redirect_var(session.req_header(), session_has_tls(session), name)
+    })
+}
+
+/// Variable-expansion parser, kept free of `Session` for unit testing.
+fn render_redirect_template<F>(template: &str, mut resolve: F) -> String
+where
+    F: FnMut(&str) -> String,
+{
+    let mut rendered = String::with_capacity(template.len());
+    let mut chars = template.chars().peekable();
+    while let Some(ch) = chars.next() {
+        match ch {
+            '\\' => {
+                if chars.peek() == Some(&'$') {
+                    chars.next();
+                    rendered.push('$');
+                } else {
+                    rendered.push('\\');
+                }
+            }
+            '$' => {
+                let name = if chars.peek() == Some(&'{') {
+                    chars.next();
+                    let mut name = String::new();
+                    for ch in chars.by_ref() {
+                        if ch == '}' {
+                            break;
+                        }
+                        name.push(ch);
+                    }
+                    name
+                } else {
+                    let mut name = String::new();
+                    while matches!(chars.peek(), Some(ch) if ch.is_ascii_alphanumeric() || *ch == '_')
+                    {
+                        name.push(chars.next().expect("peeked character exists"));
+                    }
+                    name
+                };
+                if name.is_empty() {
+                    rendered.push('$');
+                } else {
+                    rendered.push_str(&resolve(&name));
+                }
+            }
+            other => rendered.push(other),
+        }
+    }
+    rendered
+}
+
+/// Resolve the nginx-style variables supported by redirect templates.
+fn resolve_redirect_var(req: &RequestHeader, tls: bool, name: &str) -> String {
+    match name {
+        "host" => req
+            .headers
+            .get(header::HOST)
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_string)
+            .or_else(|| req.uri.host().map(str::to_string))
+            .unwrap_or_default(),
+        "request_uri" => req
+            .uri
+            .path_and_query()
+            .map_or_else(|| req.uri.path().to_string(), |pq| pq.as_str().to_string()),
+        "uri" => req.uri.path().to_string(),
+        "scheme" => req.uri.scheme_str().map(str::to_string).unwrap_or_else(|| {
+            if tls {
+                "https".to_string()
+            } else {
+                "http".to_string()
+            }
+        }),
+        "request_method" => req.method.as_str().to_string(),
+        _ => String::new(),
+    }
 }
 
 /// Determine whether an HTTP request header should trigger an HTTPS redirect.
@@ -520,5 +668,68 @@ mod tests {
         }))
         .unwrap();
         assert!(cfg.redirect_host.is_none());
+    }
+
+    #[test]
+    fn empty_config_is_rejected_by_oneof() {
+        let err = PluginConfig::try_from(serde_json::json!({})).unwrap_err();
+        assert!(err.to_string().contains("http_to_https"));
+
+        let err = PluginConfig::try_from(serde_json::json!({
+            "http_to_https": false,
+            "regex_uri": []
+        }))
+        .unwrap_err();
+        assert!(err.to_string().contains("http_to_https"));
+    }
+
+    #[test]
+    fn each_oneof_branch_alone_is_valid() {
+        assert!(PluginConfig::try_from(serde_json::json!({
+            "http_to_https": true,
+            "redirect_host": "secure.example.com"
+        }))
+        .is_ok());
+        assert!(PluginConfig::try_from(serde_json::json!({ "uri": "/new" })).is_ok());
+        assert!(
+            PluginConfig::try_from(serde_json::json!({ "regex_uri": ["^/old$", "/new"] })).is_ok()
+        );
+    }
+
+    #[test]
+    fn encode_uri_safe_path_keeps_unreserved_and_percent_sequences() {
+        assert_eq!(encode_uri_safe_path("/a b"), "/a%20b");
+        assert_eq!(encode_uri_safe_path("/a%20b"), "/a%20b");
+        assert_eq!(encode_uri_safe_path("/café"), "/caf%C3%A9");
+        assert_eq!(encode_uri_safe_path("/a-b_c.d~e"), "/a-b_c.d~e");
+        assert_eq!(encode_uri_safe_path("/%zz"), "/%25zz");
+    }
+
+    #[test]
+    fn redirect_template_expands_known_vars_and_escaped_dollar() {
+        let rendered = render_redirect_template(
+            "$host$request_uri-$uri-${scheme}-${request_method}-$unknown-\\$host",
+            |name| match name {
+                "host" => "example.com".to_string(),
+                "request_uri" => "/p?q=1".to_string(),
+                "uri" => "/p".to_string(),
+                "scheme" => "https".to_string(),
+                "request_method" => "GET".to_string(),
+                _ => String::new(),
+            },
+        );
+        assert_eq!(rendered, "example.com/p?q=1-/p-https-GET--$host");
+    }
+
+    #[test]
+    fn resolve_redirect_var_reads_request() {
+        let req = make_req_header("GET", b"/p?q=1", vec![("host", "example.com")]);
+        assert_eq!(resolve_redirect_var(&req, false, "host"), "example.com");
+        assert_eq!(resolve_redirect_var(&req, false, "request_uri"), "/p?q=1");
+        assert_eq!(resolve_redirect_var(&req, false, "uri"), "/p");
+        assert_eq!(resolve_redirect_var(&req, false, "scheme"), "http");
+        assert_eq!(resolve_redirect_var(&req, true, "scheme"), "https");
+        assert_eq!(resolve_redirect_var(&req, false, "request_method"), "GET");
+        assert_eq!(resolve_redirect_var(&req, false, "unknown"), "");
     }
 }

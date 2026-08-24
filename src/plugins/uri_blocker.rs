@@ -46,7 +46,6 @@ pub fn create_uri_blocker_plugin(
 /// strings), `rejected_code` (>=200, default 403), `rejected_msg`,
 /// `case_insensitive` (default false).
 #[derive(Debug, Serialize, Deserialize, Validate)]
-#[serde(deny_unknown_fields)]
 struct PluginConfig {
     /// Regular expressions matched against the request URI (path + query).
     #[validate(length(min = 1))]
@@ -94,6 +93,16 @@ impl TryFrom<JsonValue> for PluginConfig {
     fn try_from(value: JsonValue) -> Result<Self, Self::Error> {
         let config: PluginConfig =
             parse_and_validate_plugin_config(value, "Invalid uri-blocker plugin config")?;
+
+        // APISIX schema: each rule is 1..=4096 characters and the list is unique.
+        for rule in &config.block_rules {
+            let length = rule.chars().count();
+            if !(1..=4096).contains(&length) {
+                return Err(ProxyError::validation_error(format!(
+                    "uri-blocker block_rules entries must be between 1 and 4096 characters, got {length}"
+                )));
+            }
+        }
 
         // uniqueItems: reject duplicates instead of silently deduplicating.
         let mut seen = std::collections::HashSet::with_capacity(config.block_rules.len());
@@ -194,11 +203,24 @@ mod tests {
     }
 
     #[test]
-    fn config_rejects_unknown_fields() {
+    fn config_rejects_empty_and_overlong_rules() {
+        assert!(PluginConfig::try_from(serde_json::json!({ "block_rules": [""] })).is_err());
+        assert!(
+            PluginConfig::try_from(serde_json::json!({ "block_rules": ["x".repeat(4097)] }))
+                .is_err()
+        );
+        assert!(
+            PluginConfig::try_from(serde_json::json!({ "block_rules": ["x".repeat(4096)] }))
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn config_tolerates_unknown_fields() {
         assert!(PluginConfig::try_from(serde_json::json!({
             "block_rules": ["/foo"], "typo_field": true
         }))
-        .is_err());
+        .is_ok());
     }
 
     #[test]

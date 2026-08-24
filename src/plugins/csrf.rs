@@ -414,4 +414,21 @@ mod tests {
             "csrf cookie must be appended, got: {set_cookies:?}"
         );
     }
+
+    #[test]
+    fn cookie_name_defaults_to_pingsix_value() {
+        let config = PluginConfig::try_from(serde_json::json!({ "key": "unit-test-key" }))
+            .expect("minimal csrf config");
+        assert_eq!(config.name, "pingsix-csrf-token");
+    }
+
+    #[test]
+    fn explicit_cookie_name_is_accepted() {
+        let config = PluginConfig::try_from(serde_json::json!({
+            "key": "unit-test-key",
+            "name": "apisix-csrf-token"
+        }))
+        .expect("explicit cookie name");
+        assert_eq!(config.name, "apisix-csrf-token");
+    }
 }

@@ -9,6 +9,7 @@ use std::{any::Any, collections::HashMap, sync::Arc, time::Instant};
 use async_trait::async_trait;
 use bytes::Bytes;
 use once_cell::sync::Lazy;
+use pingora_core::upstreams::peer::HttpPeer;
 use pingora_error::{Error, Result};
 use pingora_http::{RequestHeader, ResponseHeader};
 use pingora_proxy::Session;
@@ -76,7 +77,8 @@ pub trait RouteContext: Send + Sync {
     /// Resolve upstream for this route.
     fn resolve_upstream(&self) -> Option<Arc<dyn UpstreamSelector>>;
 
-    /// Route-level timeout, applied after an upstream override is selected.
+    /// Route-level timeout; applied by the service's upstream selection to
+    /// every selection path (route and traffic-split override).
     fn timeout(&self) -> Option<&crate::config::Timeout>;
 }
 
@@ -117,6 +119,15 @@ pub struct ProxyContext {
     pub original_request_had_credentials: bool,
     /// Set when any auth plugin observes credentials (including custom headers/query).
     pub request_has_credentials: bool,
+    /// Digest of the original request's standard credential headers
+    /// (Authorization, Proxy-Authorization, Cookie), captured in
+    /// `early_request_filter` before any plugin can strip or rewrite them.
+    /// Consumed by shared-cache consumer isolation.
+    pub original_credential_digest: Option<String>,
+    /// Digest of the raw credential successfully verified by an auth plugin
+    /// (covers carriers beyond the standard headers: custom headers, query
+    /// params, cookies). Multiple auth plugins combine order-sensitively.
+    pub noted_credential_digest: Option<String>,
     /// Custom variables available to plugins (type-erased, thread-safe).
     /// Lazily allocated because many requests never store plugin variables.
     pub vars: Option<HashMap<String, Box<dyn Any + Send + Sync>>>,
@@ -136,6 +147,8 @@ impl Default for ProxyContext {
             request_id: None,
             original_request_had_credentials: false,
             request_has_credentials: false,
+            original_credential_digest: None,
+            noted_credential_digest: None,
             vars: None,
         }
     }
@@ -146,6 +159,23 @@ impl ProxyContext {
     pub fn mark_request_has_credentials(&mut self) {
         self.request_has_credentials = true;
         self.original_request_had_credentials = true;
+    }
+
+    /// Record the raw credential an auth plugin just verified, hashed into a
+    /// stable digest so shared-cache consumer isolation can vary the cache
+    /// key per credential without retaining plaintext. Call before hiding
+    /// the credential from the upstream request. Multiple auth plugins on
+    /// one request combine order-sensitively.
+    pub fn note_request_credential(&mut self, credential: &str) {
+        use sha2::{Digest, Sha256};
+        let mut hasher = Sha256::new();
+        hasher.update(b"pingsix-request-credential-v1\0");
+        if let Some(previous) = &self.noted_credential_digest {
+            hasher.update(previous.as_bytes());
+            hasher.update([0]);
+        }
+        hasher.update(credential.as_bytes());
+        self.noted_credential_digest = Some(hex::encode(hasher.finalize()));
     }
 
     /// Store a typed value into the context for inter-plugin communication.
@@ -242,6 +272,7 @@ pub struct ProxyPluginExecutor {
     response: Vec<Arc<dyn ProxyPlugin>>,
     response_body: Vec<Arc<dyn ProxyPlugin>>,
     logging: Vec<Arc<dyn ProxyPlugin>>,
+    upstream_peer: Vec<Arc<dyn ProxyPlugin>>,
 }
 
 /// Invokes a plugin method on each plugin in sequence (async, propagates Result).
@@ -298,6 +329,7 @@ impl ProxyPluginExecutor {
         let mut response = Vec::new();
         let mut response_body = Vec::new();
         let mut logging = Vec::new();
+        let mut upstream_peer = Vec::new();
         for plugin in &plugins {
             let phases = plugin.phases();
             if phases.contains(PluginPhases::EARLY_REQUEST) {
@@ -321,6 +353,9 @@ impl ProxyPluginExecutor {
             if phases.contains(PluginPhases::LOGGING) {
                 logging.push(plugin.clone());
             }
+            if phases.contains(PluginPhases::UPSTREAM_PEER) {
+                upstream_peer.push(plugin.clone());
+            }
         }
         Self {
             plugins,
@@ -331,6 +366,7 @@ impl ProxyPluginExecutor {
             response,
             response_body,
             logging,
+            upstream_peer,
         }
     }
 
@@ -455,6 +491,16 @@ impl ProxyPlugin for ProxyPluginExecutor {
                 ctx
             );
         }
+        Ok(())
+    }
+
+    fn upstream_peer_filter(
+        &self,
+        session: &mut Session,
+        peer: &mut HttpPeer,
+        ctx: &mut ProxyContext,
+    ) -> Result<()> {
+        for_each_plugin_sync!(self.upstream_peer, upstream_peer_filter, session, peer, ctx);
         Ok(())
     }
 
@@ -584,6 +630,19 @@ impl CompiledPluginPipeline {
             .response_body_filter(session, body, end_of_stream, ctx)
     }
 
+    /// Run global-rule plugins then route/service plugins for
+    /// `upstream_peer_filter`, after route-scoped peer policy (route timeout,
+    /// WebSocket relaxation) has been applied by the caller.
+    pub fn upstream_peer_filter(
+        &self,
+        session: &mut Session,
+        peer: &mut HttpPeer,
+        ctx: &mut ProxyContext,
+    ) -> Result<()> {
+        self.global.upstream_peer_filter(session, peer, ctx)?;
+        self.route.upstream_peer_filter(session, peer, ctx)
+    }
+
     /// Run global-rule plugins then route/service plugins for `request_body_filter`.
     pub async fn request_body_filter(
         &self,
@@ -610,6 +669,88 @@ impl CompiledPluginPipeline {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use pingora::protocols::{
+        raw_connect::ProxyDigest, GetProxyDigest, GetSocketDigest, GetTimingDigest, Peek, Shutdown,
+        SocketDigest, Ssl, TimingDigest, UniqueID, UniqueIDType, IO,
+    };
+    use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
+
+    /// Minimal downstream stream: enough `Session::new_h1` plumbing to pass a
+    /// `&mut Session` through phase traversal without reading a request.
+    #[derive(Debug)]
+    struct NoopStream;
+
+    impl AsyncRead for NoopStream {
+        fn poll_read(
+            self: std::pin::Pin<&mut Self>,
+            _: &mut std::task::Context<'_>,
+            _: &mut ReadBuf<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+    }
+
+    impl AsyncWrite for NoopStream {
+        fn poll_write(
+            self: std::pin::Pin<&mut Self>,
+            _: &mut std::task::Context<'_>,
+            buf: &[u8],
+        ) -> std::task::Poll<std::io::Result<usize>> {
+            std::task::Poll::Ready(Ok(buf.len()))
+        }
+
+        fn poll_flush(
+            self: std::pin::Pin<&mut Self>,
+            _: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(
+            self: std::pin::Pin<&mut Self>,
+            _: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+    }
+
+    #[async_trait]
+    impl Shutdown for NoopStream {
+        async fn shutdown(&mut self) {}
+    }
+
+    impl UniqueID for NoopStream {
+        fn id(&self) -> UniqueIDType {
+            0
+        }
+    }
+
+    impl Ssl for NoopStream {}
+
+    impl GetTimingDigest for NoopStream {
+        fn get_timing_digest(&self) -> Vec<Option<TimingDigest>> {
+            Vec::new()
+        }
+    }
+
+    impl GetProxyDigest for NoopStream {
+        fn get_proxy_digest(&self) -> Option<Arc<ProxyDigest>> {
+            None
+        }
+    }
+
+    impl GetSocketDigest for NoopStream {
+        fn get_socket_digest(&self) -> Option<Arc<SocketDigest>> {
+            None
+        }
+    }
+
+    #[async_trait]
+    impl Peek for NoopStream {}
+
+    fn noop_session() -> Session {
+        Session::new_h1(Box::new(NoopStream) as Box<dyn IO>)
+    }
 
     struct BodyFilterPlugin;
 
@@ -650,6 +791,98 @@ mod tests {
         let executor = ProxyPluginExecutor::new(vec![Arc::new(BodyFilterPlugin)]);
         assert!(executor.request.is_empty());
         assert_eq!(executor.response_body.len(), 1);
+    }
+
+    #[test]
+    fn note_request_credential_hashes_and_combines_in_order() {
+        let mut ctx = ProxyContext::default();
+        assert!(ctx.noted_credential_digest.is_none());
+
+        ctx.note_request_credential("key-a");
+        let first = ctx.noted_credential_digest.clone().unwrap();
+        // Digests are hex SHA-256 and never contain the plaintext.
+        assert_eq!(first.len(), 64);
+        assert!(!first.contains("key-a"));
+
+        // Same credential digests identically on a fresh context.
+        let mut again = ProxyContext::default();
+        again.note_request_credential("key-a");
+        assert_eq!(
+            again.noted_credential_digest.as_deref(),
+            Some(first.as_str())
+        );
+
+        // A second, different credential (a second auth plugin) combines
+        // order-sensitively into a different digest.
+        ctx.note_request_credential("key-b");
+        let combined = ctx.noted_credential_digest.clone().unwrap();
+        assert_ne!(combined, first);
+        assert_eq!(combined.len(), 64);
+
+        let mut reordered = ProxyContext::default();
+        reordered.note_request_credential("key-b");
+        reordered.note_request_credential("key-a");
+        assert_ne!(
+            reordered.noted_credential_digest, ctx.noted_credential_digest,
+            "combination must be order-sensitive"
+        );
+    }
+
+    #[test]
+    fn test_executor_partitions_upstream_peer_phase() {
+        struct PeerPlugin {
+            name: &'static str,
+            marker: &'static str,
+        }
+
+        impl ProxyPlugin for PeerPlugin {
+            fn name(&self) -> &str {
+                self.name
+            }
+
+            fn priority(&self) -> i32 {
+                0
+            }
+
+            fn phases(&self) -> PluginPhases {
+                PluginPhases::UPSTREAM_PEER
+            }
+
+            fn upstream_peer_filter(
+                &self,
+                _session: &mut Session,
+                peer: &mut HttpPeer,
+                ctx: &mut ProxyContext,
+            ) -> Result<()> {
+                let order = ctx.get_str("peer_filter_order").unwrap_or("").to_string();
+                ctx.set("peer_filter_order", format!("{order}{}", self.marker));
+                ctx.set("peer_filter_ran", peer.sni.clone());
+                Ok(())
+            }
+        }
+
+        let executor = ProxyPluginExecutor::new(vec![Arc::new(PeerPlugin {
+            name: "route-peer",
+            marker: "r",
+        })]);
+        assert!(executor.request.is_empty());
+        assert_eq!(executor.upstream_peer.len(), 1);
+
+        // Pipeline traversal: global layer runs before the route layer and
+        // both partitions are consulted for the new phase.
+        let mut peer = HttpPeer::new("127.0.0.1:9443", true, "provider.internal".to_string());
+        let global = Arc::new(ProxyPluginExecutor::new(vec![Arc::new(PeerPlugin {
+            name: "global-peer",
+            marker: "g",
+        })]));
+        let pipeline = CompiledPluginPipeline::new(global, Arc::new(executor));
+        let mut ctx = ProxyContext::default();
+        let mut session = noop_session();
+        pipeline
+            .upstream_peer_filter(&mut session, &mut peer, &mut ctx)
+            .unwrap();
+        assert_eq!(ctx.get_str("peer_filter_order"), Some("gr"));
+        assert_eq!(ctx.get_str("peer_filter_ran"), Some("provider.internal"));
     }
 
     #[test]

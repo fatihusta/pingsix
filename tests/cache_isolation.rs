@@ -47,7 +47,7 @@ fn boot_cached_route(
             "uri": "/cache",
             "upstream_id": "1",
             "plugins": {
-                "cache": { "ttl": 120 }
+                "proxy-cache": { "ttl": 120 }
             }
         }),
     );
@@ -134,7 +134,7 @@ fn purge_requires_opt_in() {
             "uri": "/cache",
             "upstream_id": "1",
             "plugins": {
-                "cache": { "ttl": 120, "enable_purge": true }
+                "proxy-cache": { "ttl": 120, "enable_purge": true }
             }
         }),
     );
@@ -287,7 +287,7 @@ fn cache_response_plugin_switch_invalidates_namespace() {
             "uri": "/cache",
             "upstream_id": "1",
             "plugins": {
-                "cache": { "ttl": 120 },
+                "proxy-cache": { "ttl": 120 },
                 "response-rewrite": {
                     "headers": { "X-Rewritten": "v2" }
                 }

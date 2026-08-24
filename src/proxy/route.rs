@@ -12,7 +12,7 @@ use crate::{
         sort_plugins_by_priority_desc, ErrorContext, ProxyError, ProxyPlugin, ProxyPluginExecutor,
         ProxyResult, RouteContext, UpstreamSelection, UpstreamSelector,
     },
-    plugins::build_plugin_with_upstreams,
+    plugins::{build_plugin_with_upstreams, cors},
     utils::request::get_request_host,
 };
 
@@ -145,6 +145,11 @@ pub struct ProxyRoute {
     pub inline_upstream: Option<Arc<ProxyUpstream>>,
     /// Fingerprint of route/service identity and response-affecting plugins.
     cache_namespace_fingerprint: u64,
+    /// Whether the route's effective (route+service) configuration enables
+    /// CORS, making the route a candidate for CORS preflight fallback
+    /// matching. Compiled at build time so the matcher never inspects
+    /// plugin names at request time.
+    serves_preflight: bool,
 }
 
 impl Identifiable for ProxyRoute {
@@ -250,6 +255,7 @@ impl ProxyRoute {
         } else {
             Arc::new(ProxyPluginExecutor::from_sorted(merged_plugins))
         };
+        let serves_preflight = plugin_executor.has_plugin(cors::PLUGIN_NAME);
 
         let cache_namespace_fingerprint =
             route_cache_namespace_fingerprint(&route, service.as_deref());
@@ -265,6 +271,7 @@ impl ProxyRoute {
             plugin_executor,
             inline_upstream,
             cache_namespace_fingerprint,
+            serves_preflight,
         })
     }
 
@@ -328,7 +335,6 @@ impl RouteContext for ProxyRoute {
             )
         })?;
 
-        self.set_timeout(peer);
         Ok(UpstreamSelection {
             peer: Box::new(peer.clone()),
             upstream,
@@ -357,19 +363,14 @@ impl RouteContext for ProxyRoute {
     }
 }
 
-impl ProxyRoute {
-    /// Applies route-level timeout override when the route configures one.
-    ///
-    /// Priority: `route.timeout` > upstream-written timeout (explicit or global).
-    /// When the route has no timeout, leave the peer alone so named/inline upstream
-    /// settings (or `pingsix.defaults.upstream_timeout` applied by the upstream)
-    /// are preserved.
-    fn set_timeout(&self, p: &mut HttpPeer) {
-        apply_route_timeout(self.inner.timeout.as_ref(), p);
-    }
-}
-
 /// Apply an explicit route timeout onto a peer. No-op when `route_timeout` is `None`.
+///
+/// Priority: `route.timeout` > upstream-written timeout (explicit or global).
+/// When the route has no timeout, leave the peer alone so named/inline upstream
+/// settings (or `pingsix.defaults.upstream_timeout` applied by the upstream)
+/// are preserved. Applied by [`HttpService::upstream_peer`]
+/// (crate::service::http::HttpService) so both selection paths (route and
+/// traffic-split override) get exactly one application site.
 pub(crate) fn apply_route_timeout(route_timeout: Option<&config::Timeout>, p: &mut HttpPeer) {
     if let Some(config::Timeout {
         connect,
@@ -389,13 +390,20 @@ pub struct MatchEntry {
     non_host_uri: MatchRouter<Vec<Arc<ProxyRoute>>>,
     /// Router for host URI matching
     host_uris: MatchRouter<MatchRouter<Vec<Arc<ProxyRoute>>>>,
+    /// Whether global rules enable CORS, making every method-compatible route
+    /// a preflight fallback candidate. Compiled at build time.
+    global_cors: bool,
 }
 
 impl MatchEntry {
     pub(crate) fn build(
         routes: &std::collections::HashMap<String, Arc<ProxyRoute>>,
+        global_plugins: &ProxyPluginExecutor,
     ) -> ProxyResult<Self> {
-        let mut matcher = Self::default();
+        let mut matcher = Self {
+            global_cors: global_plugins.has_plugin(cors::PLUGIN_NAME),
+            ..Self::default()
+        };
         // Make the matcher deterministic across process restarts: `HashMap`
         // iteration order is randomized, and equal-priority routes sharing the
         // same URI keep insertion order in `insert_into_router`. Without an
@@ -542,12 +550,9 @@ impl MatchEntry {
 
     /// Match a syntactically valid CORS preflight using its requested method.
     /// Normal OPTIONS routes remain preferred because callers invoke this only
-    /// after normal matching fails.
-    pub(crate) fn match_preflight(
-        &self,
-        session: &mut Session,
-        global_has_cors: bool,
-    ) -> RouteMatchResult {
+    /// after normal matching fails. Preflight eligibility (route/service/global
+    /// CORS) is compiled into the matcher at build time.
+    pub(crate) fn match_preflight(&self, session: &mut Session) -> RouteMatchResult {
         let request = session.req_header();
         if request.method != http::Method::OPTIONS
             || !request.headers.contains_key(http::header::ORIGIN)
@@ -566,24 +571,24 @@ impl MatchEntry {
             let reversed_host = Self::reverse_ascii_lowercase(host);
             if let Ok(routes) = self.host_uris.at(&reversed_host) {
                 if let Some(result) =
-                    Self::match_preflight_uri(routes.value, uri, method, global_has_cors)
+                    Self::match_preflight_uri(routes.value, uri, method, self.global_cors)
                 {
                     return Some(result);
                 }
             }
         }
-        Self::match_preflight_uri(&self.non_host_uri, uri, method, global_has_cors)
+        Self::match_preflight_uri(&self.non_host_uri, uri, method, self.global_cors)
     }
 
     fn match_preflight_uri(
         match_router: &MatchRouter<Vec<Arc<ProxyRoute>>>,
         uri: &str,
         method: &str,
-        global_has_cors: bool,
+        global_cors: bool,
     ) -> RouteMatchResult {
         let matched = match_router.at(uri).ok()?;
         let route = matched.value.iter().find(|route| {
-            (global_has_cors || route.build_plugin_executor().has_plugin("cors"))
+            (global_cors || route.serves_preflight)
                 && (route.inner.methods.is_empty()
                     || route
                         .inner
@@ -877,7 +882,8 @@ mod tests {
             // Deliberately insert in the "wrong" order each time.
             routes.insert("zebra".to_string(), zebra.clone());
             routes.insert("alpha".to_string(), alpha.clone());
-            let matcher = MatchEntry::build(&routes).unwrap();
+            let matcher =
+                MatchEntry::build(&routes, &ProxyPluginExecutor::default_shared()).unwrap();
             let (_, route) = matcher
                 .match_host_uri_method(None, "/tie", "GET")
                 .expect("route matches");

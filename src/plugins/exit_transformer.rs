@@ -57,7 +57,6 @@ pub fn create_exit_transformer_plugin(
 }
 
 #[derive(Debug, Default, Serialize, Deserialize, Validate)]
-#[serde(deny_unknown_fields)]
 struct PluginConfig {
     /// Ordered rewrite rules, evaluated first-match-wins.
     #[validate(length(min = 1))]
@@ -66,7 +65,6 @@ struct PluginConfig {
 }
 
 #[derive(Debug, Default, Serialize, Deserialize, Validate)]
-#[serde(deny_unknown_fields)]
 struct RuleConfig {
     /// Gateway exit statuses this rule matches.
     #[validate(length(min = 1))]
@@ -191,13 +189,19 @@ mod tests {
     }
 
     #[test]
-    fn unknown_fields_are_rejected() {
-        // APISIX configs carry Lua `functions`; porting requires `rules`, and
-        // the typo-prone path must fail loudly instead of silently no-op.
+    fn unknown_fields_are_ignored_but_rules_still_required() {
+        // APISIX configs carry Lua `functions`; porting requires `rules`, so a
+        // `functions`-only config still fails on the missing `rules`.
         assert!(PluginConfig::try_from(serde_json::json!({
             "functions": ["return function() end"]
         }))
         .is_err());
+        // Unknown fields next to valid rules are tolerated and ignored.
+        assert!(PluginConfig::try_from(serde_json::json!({
+            "rules": [{"codes": [404]}],
+            "functions": ["return function() end"]
+        }))
+        .is_ok());
     }
 
     #[test]

@@ -35,7 +35,6 @@ pub(crate) fn schema_for(id: &str) -> Option<&'static ResourceSchema> {
     const UPSTREAM: ResourceSchema = ResourceSchema {
         fields: &[
             "id",
-            "name",
             "retries",
             "retry_timeout",
             "timeout",
@@ -88,7 +87,7 @@ pub(crate) fn schema_for(id: &str) -> Option<&'static ResourceSchema> {
         nested: &[],
     };
     const KEEPALIVE_POOL: ResourceSchema = ResourceSchema {
-        fields: &["size", "idle_timeout", "requests"],
+        fields: &["idle_timeout"],
         nested: &[],
     };
     const HEALTH_CHECK: ResourceSchema = ResourceSchema {
@@ -118,7 +117,7 @@ pub(crate) fn schema_for(id: &str) -> Option<&'static ResourceSchema> {
         nested: &[],
     };
     const PASSIVE_CHECK: ResourceSchema = ResourceSchema {
-        fields: &["type", "healthy", "unhealthy"],
+        fields: &["healthy", "unhealthy"],
         nested: &[
             ("healthy", "passive_healthy"),
             ("unhealthy", "passive_unhealthy"),

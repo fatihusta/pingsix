@@ -165,27 +165,51 @@ pub fn remove_cookie_from_header(
 /// `var_combination` renders `$name` / `${name}` placeholders while retaining
 /// all literal text (including separators next to missing variables).
 ///
-/// APISIX falls back to `remote_addr` when the configured key is unavailable.
+/// APISIX falls back to `remote_addr` when the configured key is
+/// unavailable: for `var_combination` that means no placeholder resolved
+/// (every variable absent), even though the rendered template may still
+/// contain literal separator text like `"-"`.
 pub fn apisix_key(session: &mut Session, key: &str, var_combination: bool) -> Cow<'static, str> {
-    let value = if var_combination {
-        render_apisix_request_template(session, key)
-    } else {
-        resolve_var(session, key.trim_start_matches('$')).into_owned()
-    };
-    if value.is_empty() {
+    if var_combination {
+        let (rendered, resolved) =
+            render_apisix_template_with_count(key, |name| resolve_var(session, name).into_owned());
+        if resolved > 0 {
+            return Cow::Owned(rendered);
+        }
+        // Zero placeholders resolved: APISIX treats the combination as
+        // key-missing and buckets the request by client address instead of
+        // keying it on the literal separators alone.
         resolve_var(session, "remote_addr").into_owned().into()
     } else {
-        Cow::Owned(value)
+        // Plain `var` keys keep the empty-value fallback.
+        let value = resolve_var(session, key.trim_start_matches('$')).into_owned();
+        if value.is_empty() {
+            resolve_var(session, "remote_addr").into_owned().into()
+        } else {
+            Cow::Owned(value)
+        }
     }
 }
 
 /// Render an APISIX nginx-variable template. Kept independent of `Session` so
 /// plugins that need templates can share the exact parser and it is unit-testable.
-pub fn render_apisix_template<F>(template: &str, mut resolve: F) -> String
+pub fn render_apisix_template<F>(template: &str, resolve: F) -> String
+where
+    F: FnMut(&str) -> String,
+{
+    render_apisix_template_with_count(template, resolve).0
+}
+
+/// Like [`render_apisix_template`], additionally reporting how many
+/// placeholders resolved to a non-empty value. APISIX `var_combination`
+/// limiter keys treat a fully unresolved template (count 0) as key-missing,
+/// even when the rendered string still contains literal separator text.
+fn render_apisix_template_with_count<F>(template: &str, mut resolve: F) -> (String, usize)
 where
     F: FnMut(&str) -> String,
 {
     let mut rendered = String::with_capacity(template.len());
+    let mut resolved = 0;
     let mut chars = template.chars().peekable();
     while let Some(ch) = chars.next() {
         if ch != '$' {
@@ -212,10 +236,14 @@ where
         if name.is_empty() {
             rendered.push('$');
         } else {
-            rendered.push_str(&resolve(&name));
+            let value = resolve(&name);
+            if !value.is_empty() {
+                resolved += 1;
+            }
+            rendered.push_str(&value);
         }
     }
-    rendered
+    (rendered, resolved)
 }
 
 /// Render an APISIX nginx-variable template against the live request.
@@ -332,6 +360,80 @@ mod tests {
                 _ => String::new(),
             }),
             "alice:/alice"
+        );
+    }
+
+    #[test]
+    fn render_counts_placeholders_resolved_to_a_value() {
+        // Only placeholders that resolve to a non-empty value count as
+        // resolved; empty resolutions and bare `$` literals do not.
+        let (rendered, resolved) =
+            render_apisix_template_with_count("$a-${b}-$-$c", |name| match name {
+                "b" => "x".to_string(),
+                _ => String::new(),
+            });
+        assert_eq!(rendered, "-x-$-");
+        assert_eq!(resolved, 1);
+
+        let (rendered, resolved) = render_apisix_template_with_count("$a-$b", |_| String::new());
+        assert_eq!(rendered, "-");
+        assert_eq!(resolved, 0);
+    }
+
+    /// A session fed a canned request, for exercising key resolution against
+    /// a live (non-socket) request.
+    async fn request_session(raw: &'static str) -> Session {
+        use tokio::io::AsyncWriteExt;
+
+        let (client, mut server) = tokio::io::duplex(1024);
+        server
+            .write_all(raw.as_bytes())
+            .await
+            .expect("write canned request");
+        drop(server);
+        let mut session = Session::new_h1(Box::new(client));
+        session
+            .downstream_session
+            .read_request()
+            .await
+            .expect("canned request parses");
+        session
+    }
+
+    #[tokio::test]
+    async fn apisix_key_var_combination_without_resolved_vars_uses_remote_addr() {
+        // Both placeholders unresolved: the template renders the literal
+        // "-", but APISIX treats the combination as key-missing and buckets
+        // the request by remote_addr instead.
+        let mut session = request_session("GET / HTTP/1.1\r\nHost: example.com\r\n\r\n").await;
+        let remote_addr = resolve_var(&mut session, "remote_addr").into_owned();
+        let key = apisix_key(&mut session, "$http_a-$http_b", true).into_owned();
+        assert_eq!(key, remote_addr);
+        assert_ne!(key, "-");
+
+        // One placeholder resolved: the rendered template is the key.
+        let mut session =
+            request_session("GET / HTTP/1.1\r\nHost: example.com\r\na: left\r\n\r\n").await;
+        assert_eq!(
+            apisix_key(&mut session, "$http_a-$http_b", true).into_owned(),
+            "left-"
+        );
+    }
+
+    #[tokio::test]
+    async fn apisix_key_plain_var_resolves_and_falls_back_to_remote_addr() {
+        // The plain-var branch is unchanged: a present variable is used
+        // verbatim, an absent one falls back to remote_addr.
+        let mut session =
+            request_session("GET / HTTP/1.1\r\nHost: example.com\r\na: left\r\n\r\n").await;
+        assert_eq!(
+            apisix_key(&mut session, "http_a", false).into_owned(),
+            "left"
+        );
+        let remote_addr = resolve_var(&mut session, "remote_addr").into_owned();
+        assert_eq!(
+            apisix_key(&mut session, "http_b", false).into_owned(),
+            remote_addr
         );
     }
 

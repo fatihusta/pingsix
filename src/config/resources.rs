@@ -132,8 +132,6 @@ impl Route {
 pub struct Upstream {
     #[serde(default)]
     pub id: String,
-    #[serde(default)]
-    pub name: Option<String>,
     pub retries: Option<u32>,
     pub retry_timeout: Option<u64>,
     #[validate(nested)]
@@ -239,10 +237,6 @@ impl HealthCheck {
 #[validate(schema(function = "PassiveCheck::validate"))]
 #[serde(rename_all = "lowercase")]
 pub struct PassiveCheck {
-    /// Check type. Accepted for APISIX schema compatibility; counters are
-    /// driven by real traffic outcomes regardless of this value.
-    #[serde(default)]
-    pub r#type: PassiveCheckType,
     #[serde(default)]
     #[validate(nested)]
     pub healthy: PassiveHealthy,
@@ -274,16 +268,6 @@ fn validate_passive_statuses(statuses: &[u32]) -> Result<(), ValidationError> {
         return Err(ValidationError::new("invalid_passive_http_statuses"));
     }
     Ok(())
-}
-
-#[derive(Clone, Copy, Default, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-#[allow(clippy::upper_case_acronyms)]
-pub enum PassiveCheckType {
-    TCP,
-    #[default]
-    HTTP,
-    HTTPS,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, Validate)]
@@ -516,23 +500,14 @@ mod secs_f64_as_ms {
     }
 }
 
-/// Per-upstream keepalive connection-pool settings, APISIX
-/// `keepalive_pool` schema compatible.
+/// Per-upstream keepalive connection-pool tuning (APISIX `keepalive_pool`).
 ///
-/// * `idle_timeout` (seconds, fractional allowed, default 60) maps onto
-///   Pingora's per-peer idle timeout: how long an idle upstream connection
-///   stays in the pool before it is closed.
-/// * `size` (default 320) and `requests` (default 1000) are accepted for
-///   APISIX schema compatibility. Pingora 0.8 does not expose per-upstream
-///   pool size or per-connection request caps, so non-default values log a
-///   warning at build time and the process-global
-///   `pingora.upstream_keepalive_pool_size` applies instead.
+/// `idle_timeout` (seconds, fractional allowed, default 60) maps onto
+/// Pingora's per-peer idle timeout: how long an idle upstream connection
+/// stays in the pool before it is closed. APISIX `size`/`requests` are not
+/// enforced by Pingora and are deliberately not part of the schema.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, Validate)]
 pub struct KeepalivePool {
-    /// Idle connections to keep per upstream (accepted, not enforced).
-    #[serde(default = "KeepalivePool::default_size")]
-    #[validate(range(min = 1))]
-    pub size: u32,
     /// Seconds an idle connection is kept before closing.
     #[serde(
         default = "KeepalivePool::default_idle_timeout_ms",
@@ -541,28 +516,11 @@ pub struct KeepalivePool {
     )]
     #[validate(range(min = 0))]
     pub idle_timeout_ms: u64,
-    /// Requests per connection before recycling (accepted, not enforced).
-    #[serde(default = "KeepalivePool::default_requests")]
-    #[validate(range(min = 1))]
-    pub requests: u32,
 }
 
 impl KeepalivePool {
-    pub(crate) fn default_size() -> u32 {
-        320
-    }
-
     pub(crate) fn default_idle_timeout_ms() -> u64 {
         60_000
-    }
-
-    pub(crate) fn default_requests() -> u32 {
-        1000
-    }
-
-    /// Whether any accepted-but-unenforced knob deviates from its default.
-    pub(crate) fn has_unsupported_overrides(&self) -> bool {
-        self.size != Self::default_size() || self.requests != Self::default_requests()
     }
 }
 

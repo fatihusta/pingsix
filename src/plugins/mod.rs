@@ -348,6 +348,10 @@ fn plugin_meta(name: &str) -> Option<&'static PluginMeta> {
 /// declared `validate` capability. Defaults only affect fallback resolution
 /// (identical validation outcome), and the Admin path always uses a neutral
 /// default so it never inherits another gateway instance's state.
+///
+/// Validation by construction also runs plain builders' side effects on the
+/// config write path: for file-logger, validating a config opens (or creates)
+/// the log file — accepted behavior.
 pub(crate) fn validate_plugin_config(name: &str, cfg: &JsonValue) -> ProxyResult<()> {
     let meta = plugin_meta(name)
         .ok_or_else(|| ProxyError::Plugin(format!("Unknown plugin type: {name}")))?;
@@ -490,7 +494,10 @@ mod builtin_phases_tests {
             (uri_blocker::PLUGIN_NAME, request),
             (
                 ai_proxy::PLUGIN_NAME,
-                request | PluginPhases::UPSTREAM_REQUEST | PluginPhases::REQUEST_BODY,
+                request
+                    | PluginPhases::UPSTREAM_REQUEST
+                    | PluginPhases::REQUEST_BODY
+                    | PluginPhases::UPSTREAM_PEER,
             ),
             (
                 request_validation::PLUGIN_NAME,
@@ -513,11 +520,23 @@ mod builtin_phases_tests {
             (gzip::PLUGIN_NAME, early),
             (brotli::PLUGIN_NAME, early),
             (redirect::PLUGIN_NAME, request),
-            (echo::PLUGIN_NAME, request),
-            (response_rewrite::PLUGIN_NAME, PluginPhases::RESPONSE),
-            (grpc_web::PLUGIN_NAME, early),
+            (
+                echo::PLUGIN_NAME,
+                PluginPhases::RESPONSE | PluginPhases::RESPONSE_BODY,
+            ),
+            (
+                response_rewrite::PLUGIN_NAME,
+                PluginPhases::RESPONSE | PluginPhases::RESPONSE_BODY,
+            ),
+            (
+                grpc_web::PLUGIN_NAME,
+                early | PluginPhases::REQUEST | PluginPhases::REQUEST_BODY | PluginPhases::RESPONSE,
+            ),
             (prometheus::PLUGIN_NAME, logging),
-            (file_logger::PLUGIN_NAME, logging),
+            (
+                file_logger::PLUGIN_NAME,
+                logging | PluginPhases::REQUEST_BODY | PluginPhases::RESPONSE_BODY,
+            ),
             (traffic_split::PLUGIN_NAME, request),
         ])
     }
@@ -529,7 +548,7 @@ mod builtin_phases_tests {
             "jwt-auth" => json!({"secret": "test-secret"}),
             "key-auth" => json!({"key": "test-key"}),
             "csrf" => json!({"key": "csrf-secret"}),
-            "cache" => json!({"ttl": 60}),
+            "proxy-cache" => json!({"ttl": 60}),
             "limit-req" => json!({"rate": 1.0, "key": "remote_addr"}),
             "limit-conn" => json!({
                 "conn": 2,
@@ -543,6 +562,7 @@ mod builtin_phases_tests {
             "redirect" => json!({"uri": "/next", "regex_uri": []}),
             "uri-blocker" => json!({"block_rules": ["/blocked"]}),
             "request-validation" => json!({"header_schema": {"type": "object"}}),
+            "ip-restriction" => json!({"whitelist": ["127.0.0.1/32"]}),
             "ai-proxy" => json!({
                 "provider": "openai-compatible",
                 "auth": {"header": {"Authorization": "Bearer test"}},

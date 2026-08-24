@@ -279,16 +279,6 @@ impl ProxyUpstream {
         }
 
         let cache_origin_fingerprint = cache_origin_fingerprint(&upstream);
-        if let Some(keepalive) = &upstream.keepalive_pool {
-            if keepalive.has_unsupported_overrides() {
-                log::warn!(
-                    "upstream '{}': keepalive_pool.size/requests are accepted for APISIX \
-                     compatibility but not enforced; the process-global \
-                     pingora.upstream_keepalive_pool_size applies",
-                    upstream.id
-                );
-            }
-        }
         let lb = SelectionLB::from_prepared(upstream.clone(), prepared, defaults, resolver)
             .map_err(|e| {
                 ProxyError::Configuration(format!("Failed to create load balancer: {e}"))
@@ -747,7 +737,6 @@ mod tests {
         nodes.insert("127.0.0.1:18080".to_string(), 1);
         config::Upstream {
             id: id.to_string(),
-            name: None,
             retries: None,
             retry_timeout: None,
             timeout,
@@ -789,9 +778,7 @@ mod tests {
     fn keepalive_idle_timeout_applied_to_peer() {
         let mut upstream = sample_upstream("pooled", None);
         upstream.keepalive_pool = Some(crate::config::KeepalivePool {
-            size: 320,
             idle_timeout_ms: 15_000,
-            requests: 1000,
         });
         let built = ProxyUpstream::build_static(upstream).unwrap();
         let backend = built.select_backend_for_test().unwrap();
@@ -1179,7 +1166,7 @@ mod tests {
 #[cfg(test)]
 mod passive_tests {
     use super::*;
-    use crate::config::{PassiveCheck, PassiveCheckType, PassiveHealthy, PassiveUnhealthy};
+    use crate::config::{PassiveCheck, PassiveHealthy, PassiveUnhealthy};
 
     fn test_state(
         http_failures: u32,
@@ -1197,7 +1184,6 @@ mod passive_tests {
         let restores_clone = restores.clone();
         let state = PassiveHealthState {
             config: PassiveCheck {
-                r#type: PassiveCheckType::HTTP,
                 healthy: PassiveHealthy {
                     http_statuses: vec![200],
                     successes,

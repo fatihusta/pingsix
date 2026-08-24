@@ -752,7 +752,6 @@ mod tests {
         };
         let upstream = Upstream {
             id: "u1".into(),
-            name: None,
             retries: None,
             retry_timeout: None,
             timeout: None,

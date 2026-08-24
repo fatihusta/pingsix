@@ -40,6 +40,14 @@ struct DelayConfig {
     #[serde(default)]
     #[validate(range(min = 0, max = 100))]
     percentage: Option<u32>,
+
+    /// APISIX variable-expression matchers. Parsed only to fail with a clear
+    /// validation error: var-expression evaluation is not supported. Entries
+    /// are JSON values (APISIX vars commonly contain numbers, e.g.
+    /// `["arg_limit", ">", 100]`) so all shapes reach the friendly error
+    /// instead of a raw serde type error.
+    #[serde(default)]
+    vars: Option<Vec<Vec<serde_json::Value>>>,
 }
 
 /// Configuration for aborting requests with a specific status code
@@ -61,6 +69,12 @@ struct AbortConfig {
     #[serde(default)]
     #[validate(range(min = 0, max = 100))]
     percentage: Option<u32>,
+
+    /// APISIX variable-expression matchers. Parsed only to fail with a clear
+    /// validation error: var-expression evaluation is not supported. Entries
+    /// are JSON values (APISIX vars commonly contain numbers).
+    #[serde(default)]
+    vars: Option<Vec<Vec<serde_json::Value>>>,
 }
 
 /// Main plugin configuration
@@ -88,6 +102,64 @@ impl TryFrom<JsonValue> for PluginConfig {
         if config.delay.is_none() && config.abort.is_none() {
             return Err(ProxyError::Plugin(
                 "At least one of 'delay' or 'abort' must be configured".to_string(),
+            ));
+        }
+
+        // APISIX `abort.headers` only supports JSON strings and numbers.
+        if let Some(headers) = config
+            .abort
+            .as_ref()
+            .and_then(|abort| abort.headers.as_ref())
+        {
+            if headers.is_empty() {
+                return Err(ProxyError::validation_error(
+                    "fault injection abort.headers must not be empty",
+                ));
+            }
+            for (name, value) in headers {
+                if !value.is_string() && !value.is_number() {
+                    return Err(ProxyError::validation_error(format!(
+                        "fault injection abort header '{name}' must be a JSON string or number"
+                    )));
+                }
+                // Dry-run name/value conversion at config time so a malformed
+                // entry fails the config write instead of erroring every
+                // aborted response.
+                http::HeaderName::from_bytes(name.as_bytes()).map_err(|_| {
+                    ProxyError::validation_error(format!(
+                        "fault injection abort header name '{name}' is invalid"
+                    ))
+                })?;
+                let rendered = match value {
+                    serde_json::Value::String(value) => value.clone(),
+                    other => other.to_string(),
+                };
+                http::HeaderValue::from_str(&rendered).map_err(|_| {
+                    ProxyError::validation_error(format!(
+                        "fault injection abort header value for '{name}' is invalid"
+                    ))
+                })?;
+            }
+        }
+
+        if config
+            .delay
+            .as_ref()
+            .and_then(|delay| delay.vars.as_ref())
+            .is_some_and(|vars| !vars.is_empty())
+        {
+            return Err(ProxyError::validation_error(
+                "fault-injection delay.vars uses var expressions, which are not supported",
+            ));
+        }
+        if config
+            .abort
+            .as_ref()
+            .and_then(|abort| abort.vars.as_ref())
+            .is_some_and(|vars| !vars.is_empty())
+        {
+            return Err(ProxyError::validation_error(
+                "fault-injection abort.vars uses var expressions, which are not supported",
             ));
         }
 
@@ -318,5 +390,103 @@ mod tests {
         for _ in 0..100 {
             assert!(PluginFaultInjection::sample_hit(Some(100)));
         }
+    }
+
+    #[test]
+    fn nonempty_apisix_vars_are_rejected() {
+        let delay = json!({
+            "delay": {
+                "duration": 0.5,
+                "vars": [["arg_name", "==", "test"]]
+            }
+        });
+        let err = PluginConfig::try_from(delay).expect_err("delay.vars must be rejected");
+        assert!(err.to_string().contains("var expressions"), "{err}");
+
+        // APISIX vars commonly carry numbers; they must reach the friendly
+        // error rather than a raw serde type error.
+        let numeric = json!({
+            "delay": {
+                "duration": 0.5,
+                "vars": [["arg_limit", ">", 100]]
+            }
+        });
+        let err = PluginConfig::try_from(numeric).expect_err("numeric vars must be rejected");
+        assert!(err.to_string().contains("var expressions"), "{err}");
+
+        let abort = json!({
+            "abort": {
+                "http_status": 503,
+                "vars": [["http_x-custom", "!", "skip"]]
+            }
+        });
+        let err = PluginConfig::try_from(abort).expect_err("abort.vars must be rejected");
+        assert!(err.to_string().contains("var expressions"), "{err}");
+
+        // Empty vars arrays are structural no-ops and remain accepted.
+        PluginConfig::try_from(json!({
+            "delay": {"duration": 0.5, "vars": []}
+        }))
+        .expect("empty vars is a no-op");
+    }
+
+    #[test]
+    fn test_config_abort_headers_must_not_be_empty() {
+        let cfg = json!({
+            "abort": {
+                "http_status": 503,
+                "headers": {}
+            }
+        });
+        assert!(PluginConfig::try_from(cfg).is_err());
+    }
+
+    #[test]
+    fn test_config_abort_headers_accept_strings_and_numbers() {
+        let cfg = json!({
+            "abort": {
+                "http_status": 503,
+                "headers": {
+                    "X-String": "value",
+                    "X-Number": 42
+                }
+            }
+        });
+        assert!(PluginConfig::try_from(cfg).is_ok());
+    }
+
+    #[test]
+    fn test_config_abort_headers_reject_bool_null_object_array() {
+        for bad in [json!(true), json!(null), json!({}), json!([])] {
+            let cfg = json!({
+                "abort": {
+                    "http_status": 503,
+                    "headers": { "X-Bad": bad }
+                }
+            });
+            let err = PluginConfig::try_from(cfg).unwrap_err();
+            assert!(matches!(err, ProxyError::Validation(_)));
+        }
+    }
+
+    #[test]
+    fn test_config_abort_headers_reject_malformed_names_and_values_at_build() {
+        let bad_name = json!({
+            "abort": { "http_status": 503, "headers": { "X Bad": "v" } }
+        });
+        let err = PluginConfig::try_from(bad_name).unwrap_err();
+        assert!(err.to_string().contains("X Bad"), "{err}");
+
+        let bad_value = json!({
+            "abort": { "http_status": 503, "headers": { "X-Ok": "bad\r\nvalue" } }
+        });
+        let err = PluginConfig::try_from(bad_value).unwrap_err();
+        assert!(err.to_string().contains("X-Ok"), "{err}");
+
+        // Valid names and numeric values still pass.
+        assert!(PluginConfig::try_from(json!({
+            "abort": { "http_status": 503, "headers": { "X-Ok": "v", "X-Num": 42 } }
+        }))
+        .is_ok());
     }
 }

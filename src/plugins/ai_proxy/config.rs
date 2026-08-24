@@ -7,8 +7,8 @@
 //!   v1 has no `gcp`/`aws` auth, so an effectively empty auth is rejected
 //!   at config time instead of failing every request later.
 //! * `override.request_body` and `override.request_body_force_override`
-//!   (APISIX ≥ 3.12) are out of v1 scope and rejected via
-//!   `deny_unknown_fields` rather than silently ignored.
+//!   (APISIX ≥ 3.12) are out of v1 scope and are ignored for APISIX
+//!   forward compatibility, like unknown fields in other plugins.
 
 use std::collections::BTreeMap;
 
@@ -28,8 +28,6 @@ const DEFAULT_TIMEOUT_MS: u64 = 30_000;
 const DEFAULT_MAX_REQ_BODY_SIZE: u64 = 67_108_864;
 /// APISIX default: 60s (milliseconds).
 const DEFAULT_KEEPALIVE_TIMEOUT_MS: u64 = 60_000;
-/// APISIX default pool size (accepted, not enforced by Pingora 0.8).
-const DEFAULT_KEEPALIVE_POOL: u32 = 30;
 
 fn default_true() -> bool {
     true
@@ -37,7 +35,6 @@ fn default_true() -> bool {
 
 /// ai-proxy plugin configuration (`ai_proxy` schema, APISIX-compatible v1).
 #[derive(Debug, Clone, Serialize, Deserialize, Validate)]
-#[serde(deny_unknown_fields)]
 pub(crate) struct AiProxyConfig {
     pub(crate) provider: Provider,
     #[validate(nested)]
@@ -64,10 +61,6 @@ pub(crate) struct AiProxyConfig {
     #[serde(default = "default_keepalive_timeout_ms")]
     #[validate(range(min = 1000))]
     pub(crate) keepalive_timeout: u64,
-    /// Keepalive pool size (accepted, not enforced by Pingora 0.8).
-    #[serde(default = "default_keepalive_pool")]
-    #[validate(range(min = 1))]
-    pub(crate) keepalive_pool: u32,
     /// Verify the provider's TLS certificate.
     #[serde(default = "default_true")]
     pub(crate) ssl_verify: bool,
@@ -85,14 +78,9 @@ fn default_keepalive_timeout_ms() -> u64 {
     DEFAULT_KEEPALIVE_TIMEOUT_MS
 }
 
-fn default_keepalive_pool() -> u32 {
-    DEFAULT_KEEPALIVE_POOL
-}
-
 /// Provider credentials injected as headers and/or query parameters.
 /// Values are field-encrypted at rest (`SECRETS_TRANSFORM`).
 #[derive(Debug, Clone, Default, Serialize, Deserialize, Validate)]
-#[serde(deny_unknown_fields)]
 pub(crate) struct AuthConfig {
     /// Header name → value (e.g. `Authorization: Bearer sk-...`).
     #[serde(default)]
@@ -104,7 +92,6 @@ pub(crate) struct AuthConfig {
 
 /// Request overrides (APISIX `override`).
 #[derive(Debug, Clone, Default, Serialize, Deserialize, Validate)]
-#[serde(deny_unknown_fields)]
 pub(crate) struct OverrideConfig {
     /// Replace the provider's default endpoint (scheme://host[:port][/path]).
     #[validate(length(min = 1))]
@@ -116,7 +103,6 @@ pub(crate) struct OverrideConfig {
 
 /// Forced LLM options (APISIX: `max_tokens` only, minimum 1).
 #[derive(Debug, Clone, Serialize, Deserialize, Validate)]
-#[serde(deny_unknown_fields)]
 pub(crate) struct LlmOptions {
     #[validate(range(min = 1))]
     pub(crate) max_tokens: u64,
@@ -304,7 +290,6 @@ mod tests {
             assert_eq!(config.max_req_body_size, DEFAULT_MAX_REQ_BODY_SIZE);
             assert!(config.keepalive);
             assert_eq!(config.keepalive_timeout, DEFAULT_KEEPALIVE_TIMEOUT_MS);
-            assert_eq!(config.keepalive_pool, DEFAULT_KEEPALIVE_POOL);
             assert!(config.ssl_verify);
             assert!(config.options.is_none());
             assert_eq!(config.r#override.endpoint, None);
@@ -332,7 +317,6 @@ mod tests {
             "max_req_body_size": 1048576,
             "keepalive": false,
             "keepalive_timeout": 30000,
-            "keepalive_pool": 5,
             "ssl_verify": false
         }));
         assert_eq!(config.provider, Provider::Anthropic);
@@ -438,21 +422,21 @@ mod tests {
     }
 
     #[test]
-    fn unknown_fields_are_rejected() {
-        let err = parse_err(json!({
-            "provider": "openai",
-            "auth": { "header": { "Authorization": "Bearer x" } },
-            "provder": "typo"
-        }));
-        assert!(err.contains("provder"), "{err}");
-
-        // APISIX ≥ 3.12 fields stay out of v1 loudly.
-        let err = parse_err(json!({
-            "provider": "openai",
-            "auth": { "header": { "Authorization": "Bearer x" } },
-            "max_stream_duration_ms": 60000
-        }));
-        assert!(err.contains("max_stream_duration_ms"), "{err}");
+    fn unknown_fields_are_tolerated_and_ignored() {
+        // APISIX forward compatibility: fields outside the v1 subset (and
+        // typos) are ignored, never rejected by serde.
+        for extra in [
+            json!({"provder": "typo"}),
+            json!({"max_stream_duration_ms": 60000}),
+            json!({"override": { "request_body": { "model": "x" } }}),
+        ] {
+            let mut value = minimal("openai");
+            value
+                .as_object_mut()
+                .unwrap()
+                .extend(extra.as_object().unwrap().clone());
+            parse_ok(value);
+        }
     }
 
     #[test]
@@ -472,13 +456,6 @@ mod tests {
             "keepalive_timeout": 999
         }));
         assert!(err.contains("keepalive_timeout"), "{err}");
-
-        let err = parse_err(json!({
-            "provider": "openai",
-            "auth": { "header": { "Authorization": "Bearer x" } },
-            "keepalive_pool": 0
-        }));
-        assert!(err.contains("keepalive_pool"), "{err}");
 
         let err = parse_err(json!({
             "provider": "openai",

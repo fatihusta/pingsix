@@ -11,7 +11,7 @@
 //! `incoming()` so behavior matches APISIX with `policy: local`.
 
 use std::{
-    collections::HashMap,
+    collections::{hash_map::Entry, HashMap},
     sync::{Arc, Mutex},
     time::{Duration, Instant},
 };
@@ -49,11 +49,11 @@ pub fn create_limit_req_plugin(
     }))
 }
 
-/// Mutable leaky-bucket state for one key.
+/// Mutable leaky-bucket state for one key. `last` is the drain anchor: the
+/// instant from which the next request measures elapsed draining time.
 struct Bucket {
     excess: f64,
     last: Instant,
-    initialized: bool,
 }
 
 #[derive(Default)]
@@ -105,11 +105,37 @@ fn leaky_bucket_step(
     Ok((excess / rate, excess))
 }
 
+/// Apply one request to an already-tracked bucket at time `now`.
+///
+/// Mirrors `lua-resty-limit-traffic`'s `limit/req.lua` commit discipline: the
+/// drain anchor (`last`) and `excess` are written only when the request is
+/// accepted. A rejected request leaves both untouched — otherwise every
+/// rejection would re-anchor the drain clock and a client retrying just
+/// above the rate would stay locked out forever.
+fn bucket_incoming(
+    bucket: &mut Bucket,
+    now: Instant,
+    rate: f64,
+    burst: f64,
+    nodelay: bool,
+) -> Result<f64, ()> {
+    let elapsed = now.duration_since(bucket.last).as_secs_f64();
+    match leaky_bucket_step(bucket.excess, elapsed, rate, burst, nodelay) {
+        Ok((delay, new_excess)) => {
+            bucket.last = now;
+            bucket.excess = new_excess;
+            Ok(delay)
+        }
+        Err(()) => Err(()),
+    }
+}
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 enum KeyType {
     #[default]
     Var,
+    #[serde(rename = "var_combination")]
     VarCombination,
 }
 
@@ -119,20 +145,21 @@ enum Policy {
     #[default]
     Local,
     Redis,
+    #[serde(rename = "redis-cluster")]
     RedisCluster,
 }
 
 #[derive(Debug, Serialize, Deserialize, Validate)]
-#[serde(deny_unknown_fields)]
 struct PluginConfig {
     /// Maximum number of requests allowed per second (bucket drain rate).
     #[validate(custom(function = "validate_rate"))]
     rate: f64,
 
     /// Number of requests allowed to be delayed (bucket capacity above rate).
+    /// APISIX allows fractional burst values; pingsix keeps its default of 0.
     #[serde(default)]
-    #[validate(range(min = 0))]
-    burst: u32,
+    #[validate(custom(function = "validate_burst"))]
+    burst: f64,
 
     #[serde(default)]
     key_type: KeyType,
@@ -142,20 +169,17 @@ struct PluginConfig {
     key: String,
 
     #[serde(default = "PluginConfig::default_rejected_code")]
-    #[validate(range(min = 400, max = 599))]
+    #[validate(range(min = 200, max = 599))]
     rejected_code: u16,
 
     #[serde(default)]
+    #[validate(custom(function = "validate_rejected_msg"))]
     rejected_msg: Option<String>,
 
     /// If true, requests within the burst range are not delayed; the burst is
     /// consumed at full speed and further requests are rejected.
     #[serde(default)]
     nodelay: bool,
-
-    /// Accepted for APISIX schema compatibility.
-    #[serde(default)]
-    allow_degradation: bool,
 
     /// Counter backend. Only `local` is supported in this release.
     #[serde(default)]
@@ -171,6 +195,22 @@ impl PluginConfig {
 fn validate_rate(value: f64) -> Result<(), ValidationError> {
     if !value.is_finite() || value <= 0.0 {
         return Err(ValidationError::new("rate must be > 0"));
+    }
+    Ok(())
+}
+
+fn validate_burst(value: f64) -> Result<(), ValidationError> {
+    if !value.is_finite() || value < 0.0 {
+        return Err(ValidationError::new("burst must be >= 0"));
+    }
+    Ok(())
+}
+
+fn validate_rejected_msg(value: &&String) -> Result<(), ValidationError> {
+    if value.is_empty() {
+        return Err(ValidationError::new(
+            "rejected_msg must have at least 1 character",
+        ));
     }
     Ok(())
 }
@@ -246,54 +286,39 @@ impl ProxyPlugin for PluginLimitReq {
             let mut buckets = self.buckets[shard_idx(key.as_ref())]
                 .lock()
                 .unwrap_or_else(|e| e.into_inner());
-            if !buckets.entries.contains_key(key.as_ref())
-                && buckets.entries.len() >= PER_SHARD_REGULAR_MAX
-            {
+            // Preserve extant buckets. A new key gets one bounded sweep when
+            // the shard is full, then either a regular slot or the stable
+            // overflow bucket shared with other overflowed keys.
+            let new_key = !buckets.entries.contains_key(key.as_ref());
+            if new_key && buckets.entries.len() >= PER_SHARD_REGULAR_MAX {
                 // Fixed work budget; no request can scan the full map.
                 buckets.sweep_drained(now, self.config.rate);
             }
-            // Preserve extant buckets. Once regular capacity is exhausted, new
-            // keys share a stable overflow bucket rather than resetting state.
-            let storage_key = if buckets.entries.contains_key(key.as_ref())
-                || buckets.entries.len() < PER_SHARD_REGULAR_MAX
-            {
+            let storage_key = if !new_key || buckets.entries.len() < PER_SHARD_REGULAR_MAX {
                 key.into_owned()
             } else {
                 "__pingsix_limit_req_overflow__".to_string()
             };
-            buckets
-                .entries
-                .entry(storage_key.clone())
-                .or_insert(Bucket {
-                    excess: 0.0,
-                    last: now,
-                    initialized: false,
-                });
             buckets.touch(&storage_key);
-            let bucket = buckets
-                .entries
-                .get_mut(&storage_key)
-                .expect("inserted bucket exists");
-            if !bucket.initialized {
-                bucket.initialized = true;
-                bucket.last = now;
-                (Some(0.0), false)
-            } else {
-                let elapsed = now.duration_since(bucket.last).as_secs_f64();
-                bucket.last = now;
-                match leaky_bucket_step(
-                    bucket.excess,
-                    elapsed,
+            match buckets.entries.entry(storage_key) {
+                Entry::Vacant(slot) => {
+                    // First request for this bucket initializes it and passes.
+                    slot.insert(Bucket {
+                        excess: 0.0,
+                        last: now,
+                    });
+                    (Some(0.0), false)
+                }
+                Entry::Occupied(slot) => match bucket_incoming(
+                    slot.into_mut(),
+                    now,
                     self.config.rate,
-                    self.config.burst as f64,
+                    self.config.burst,
                     self.config.nodelay,
                 ) {
-                    Ok((delay, new_excess)) => {
-                        bucket.excess = new_excess;
-                        (Some(delay), false)
-                    }
+                    Ok(delay) => (Some(delay), false),
                     Err(()) => (None, true),
-                }
+                },
             }
         };
 
@@ -376,7 +401,6 @@ mod tests {
                 Bucket {
                     excess: 1.0,
                     last: now,
-                    initialized: true,
                 },
             );
             shard.touch(&key);
@@ -392,7 +416,6 @@ mod tests {
             Bucket {
                 excess: 0.0,
                 last: now,
-                initialized: false,
             },
         );
         shard.touch(storage_key);
@@ -412,7 +435,6 @@ mod tests {
                 Bucket {
                     excess: 0.0,
                     last: now - Duration::from_secs(1),
-                    initialized: true,
                 },
             );
             shard.touch(&key);
@@ -422,9 +444,91 @@ mod tests {
     }
 
     #[test]
+    fn fractional_burst_is_accepted() {
+        let config = PluginConfig::try_from(serde_json::json!({
+            "rate": 1,
+            "burst": 0.5,
+            "key": "remote_addr"
+        }))
+        .unwrap();
+        assert_eq!(config.burst, 0.5);
+        assert_eq!(
+            leaky_bucket_step(0.25, 0.0, 1.0, 1.25, false),
+            Ok((1.25, 1.25))
+        );
+    }
+
+    #[test]
+    fn rejected_request_does_not_reanchor_drain_clock() {
+        // rate=1, burst=0: accepted at t0, rejected at t0+0.5s, accepted
+        // again at t0+1.1s. Before the fix the rejection committed
+        // `last = t0+0.5`, so the retry only saw 0.6s of drain and was
+        // rejected too — a client retrying just above the rate stayed
+        // locked out forever.
+        let t0 = Instant::now();
+        // The bucket `request_filter` leaves behind after the accepted
+        // request at t0 (first request initializes and passes with excess 0).
+        let mut bucket = Bucket {
+            excess: 0.0,
+            last: t0,
+        };
+        // t0+0.5s: excess = max(0 - 0.5*1 + 1, 0) = 0.5 > burst 0 -> rejected.
+        assert_eq!(
+            bucket_incoming(
+                &mut bucket,
+                t0 + Duration::from_millis(500),
+                1.0,
+                0.0,
+                false
+            ),
+            Err(())
+        );
+        // The rejection must have left BOTH `last` and `excess` untouched.
+        assert_eq!(bucket.last, t0);
+        assert_eq!(bucket.excess, 0.0);
+        // t0+1.1s: the bucket fully drained since t0, so the retry passes.
+        assert_eq!(
+            bucket_incoming(
+                &mut bucket,
+                t0 + Duration::from_millis(1100),
+                1.0,
+                0.0,
+                false
+            ),
+            Ok(0.0)
+        );
+    }
+
+    #[test]
+    fn accepted_request_commits_drain_anchor_and_excess() {
+        let t0 = Instant::now();
+        let mut bucket = Bucket {
+            excess: 0.0,
+            last: t0,
+        };
+        // Accepted at t0+0.5s: excess = max(0 - 0.5 + 1, 0) = 0.5, delay 0.5.
+        assert_eq!(
+            bucket_incoming(
+                &mut bucket,
+                t0 + Duration::from_millis(500),
+                1.0,
+                1.0,
+                false
+            ),
+            Ok(0.5)
+        );
+        assert_eq!(bucket.excess, 0.5);
+        assert_eq!(bucket.last, t0 + Duration::from_millis(500));
+    }
+
+    #[test]
     fn config_rejects_invalid_values() {
         assert!(PluginConfig::try_from(
             serde_json::json!({ "rate": 0, "burst": 0, "key": "remote_addr" })
+        )
+        .is_err());
+        assert!(PluginConfig::try_from(
+            serde_json::json!({ "rate": 1, "burst": -0.5, "key": "remote_addr" })
         )
         .is_err());
         assert!(
@@ -435,6 +539,30 @@ mod tests {
             serde_json::json!({ "rate": 1, "burst": 0, "key": "remote_addr", "policy": "redis" })
         )
         .is_err());
+    }
+
+    #[test]
+    fn config_rejects_redis_cluster_policy_with_clear_validation_error() {
+        let err = PluginConfig::try_from(serde_json::json!({
+            "rate": 1,
+            "burst": 0,
+            "key": "remote_addr",
+            "policy": "redis-cluster"
+        }))
+        .unwrap_err();
+        assert!(err.to_string().contains("requires a distributed backend"));
+    }
+
+    #[test]
+    fn config_accepts_var_combination_key_type() {
+        let config = PluginConfig::try_from(serde_json::json!({
+            "rate": 1,
+            "burst": 0,
+            "key": "$remote_addr $http_x_user",
+            "key_type": "var_combination"
+        }))
+        .unwrap();
+        assert_eq!(config.key_type, KeyType::VarCombination);
     }
 
     #[test]
@@ -452,13 +580,35 @@ mod tests {
     }
 
     #[test]
-    fn config_rejects_unsupported_fields_and_status_outside_http_range() {
-        assert!(PluginConfig::try_from(serde_json::json!({
+    fn config_ignores_unknown_fields_and_rejects_status_outside_http_range() {
+        // Fields outside the limit-req schema (e.g. limit-count's `rules`)
+        // are tolerated and ignored.
+        let config = PluginConfig::try_from(serde_json::json!({
             "rate": 1, "burst": 0, "key": "remote_addr", "rules": []
         }))
-        .is_err());
+        .expect("unknown fields are tolerated");
+        assert_eq!(config.rate, 1.0);
         assert!(PluginConfig::try_from(serde_json::json!({
             "rate": 1, "burst": 0, "key": "remote_addr", "rejected_code": 199
+        }))
+        .is_err());
+    }
+
+    #[test]
+    fn config_accepts_rejected_code_200_and_rejects_empty_msg() {
+        let config = PluginConfig::try_from(serde_json::json!({
+            "rate": 1,
+            "burst": 0,
+            "key": "remote_addr",
+            "rejected_code": 200
+        }))
+        .unwrap();
+        assert_eq!(config.rejected_code, 200);
+        assert!(PluginConfig::try_from(serde_json::json!({
+            "rate": 1,
+            "burst": 0,
+            "key": "remote_addr",
+            "rejected_msg": ""
         }))
         .is_err());
     }

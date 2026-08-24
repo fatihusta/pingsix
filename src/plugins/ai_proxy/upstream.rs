@@ -124,8 +124,8 @@ fn milliseconds_to_seconds(ms: u64) -> u64 {
 /// `keepalive: false` maps to a zero idle timeout (connections are used once
 /// and never pooled). TLS verification cannot be expressed here (UpstreamTls
 /// carries only client certificates); `ssl_verify: false` travels on the
-/// request context instead and is applied to the selected peer by
-/// [`HttpService`](crate::service::http::HttpService).
+/// request state instead and is applied to the selected peer by this
+/// plugin's `upstream_peer_filter`.
 pub(crate) fn build_provider_upstream_config(
     cfg: &AiProxyConfig,
     endpoint: &ResolvedEndpoint,
@@ -133,7 +133,6 @@ pub(crate) fn build_provider_upstream_config(
     let seconds = milliseconds_to_seconds(cfg.timeout);
     Ok(config::Upstream {
         id: format!("ai-proxy-{}", cfg.provider.as_str()),
-        name: None,
         // No blind retries: LLM completions are expensive and non-idempotent;
         // retry policy belongs to the caller or ai-proxy-multi (v2+).
         retries: None,
@@ -158,7 +157,6 @@ pub(crate) fn build_provider_upstream_config(
         upstream_host: None,
         tls: None,
         keepalive_pool: Some(config::KeepalivePool {
-            size: cfg.keepalive_pool,
             // keepalive:false → zero idle timeout → connections are never
             // reused (Pingora expires pooled connections immediately).
             idle_timeout_ms: if cfg.keepalive {
@@ -166,7 +164,6 @@ pub(crate) fn build_provider_upstream_config(
             } else {
                 0
             },
-            requests: config::KeepalivePool::default_requests(),
         }),
     })
 }
@@ -373,9 +370,7 @@ mod tests {
         assert_eq!(
             upstream.keepalive_pool,
             Some(config::KeepalivePool {
-                size: 30,
                 idle_timeout_ms: 60_000,
-                requests: 1000,
             })
         );
     }

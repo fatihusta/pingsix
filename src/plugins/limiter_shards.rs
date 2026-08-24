@@ -36,6 +36,11 @@ pub(crate) struct TouchOrder {
 
 impl TouchOrder {
     /// Mark an entry as most recently used, replacing its former token.
+    ///
+    /// This clones the key string into both LRU indexes (`oldest` and
+    /// `touches`) on every touch. Deliberate simplicity: the two short-lived
+    /// clones per limited request were measured as acceptable next to the
+    /// limiter's own hashing, so no index-by-identity structure is warranted.
     pub(crate) fn touch(&mut self, key: &str) {
         if let Some(previous_touch) = self.touches.remove(key) {
             self.oldest.remove(&previous_touch);

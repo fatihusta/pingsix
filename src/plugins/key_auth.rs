@@ -14,7 +14,7 @@ use crate::{
         constant_time_digest_eq, secret_digest, PluginPhases, ProxyContext, ProxyError,
         ProxyPlugin, ProxyResult,
     },
-    plugins::config::parse_and_validate_plugin_config,
+    plugins::config::{parse_and_validate_plugin_config, validate_apisix_realm},
     utils::{request, response::ResponseBuilder},
 };
 
@@ -74,6 +74,12 @@ struct PluginConfig {
     /// Whether to remove the API key from headers or query parameters after validation (default: false).
     #[serde(default = "PluginConfig::default_hide_credentials")]
     hide_credentials: bool,
+
+    /// Realm advertised in the `WWW-Authenticate` challenge. APISIX's default
+    /// would be `key`, but pingsix keeps its legacy `ApiKey error="invalid_key"`
+    /// challenge unless a realm is configured explicitly.
+    #[serde(default)]
+    realm: Option<String>,
 }
 
 impl PluginConfig {
@@ -107,6 +113,9 @@ impl TryFrom<JsonValue> for PluginConfig {
     fn try_from(value: JsonValue) -> Result<Self, Self::Error> {
         let config: PluginConfig =
             parse_and_validate_plugin_config(value, "Failed to parse key auth plugin config")?;
+        if let Some(realm) = config.realm.as_deref() {
+            validate_apisix_realm(realm).map_err(ProxyError::from)?;
+        }
 
         // Custom validation: at least one of `key` or `keys` must be non-empty.
         if config.get_valid_keys().is_empty() {
@@ -169,15 +178,20 @@ impl ProxyPlugin for PluginKeyAuth {
 
         // Validate key using constant-time comparison
         if value.is_empty() || !self.is_valid_key(value) {
+            let challenge = self.build_challenge();
             ResponseBuilder::send_proxy_error(
                 session,
                 StatusCode::UNAUTHORIZED,
                 Some("Invalid user authorization"),
-                Some(&[("WWW-Authenticate", "ApiKey error=\"invalid_key\"")]),
+                Some(&[("WWW-Authenticate", challenge.as_str())]),
             )
             .await?;
             return Ok(true);
         }
+
+        // Record the verified credential for shared-cache consumer
+        // isolation before it can be stripped from the upstream request.
+        ctx.note_request_credential(value);
 
         // Hide credentials if configured
         if self.config.hide_credentials {
@@ -202,6 +216,13 @@ impl ProxyPlugin for PluginKeyAuth {
 }
 
 impl PluginKeyAuth {
+    fn build_challenge(&self) -> String {
+        match self.config.realm.as_deref() {
+            Some(realm) => format!("apikey realm=\"{realm}\""),
+            None => "ApiKey error=\"invalid_key\"".to_string(),
+        }
+    }
+
     /// Validate the provided key against configured keys using constant-time comparison
     fn is_valid_key(&self, provided_key: &str) -> bool {
         let provided_digest = secret_digest(provided_key);
@@ -277,6 +298,20 @@ mod tests {
     }
 
     #[test]
+    fn apisix_consumer_fields_are_ignored() {
+        // APISIX uses consumer objects for credentials; PingSIX keeps them in
+        // the plugin config. Unknown fields such as `anonymous_consumer` are
+        // tolerated and ignored — authentication stays enforced with the
+        // configured keys.
+        let config = PluginConfig::try_from(serde_json::json!({
+            "keys": ["secret"],
+            "anonymous_consumer": "anonymous"
+        }))
+        .expect("unknown fields are tolerated");
+        assert_eq!(config.get_valid_keys(), vec![&"secret".to_string()]);
+    }
+
+    #[test]
     fn query_auth_is_disabled_by_default() {
         let config = PluginConfig::try_from(serde_json::json!({ "keys": ["secret"] })).unwrap();
         assert!(config.query.is_empty());
@@ -288,5 +323,45 @@ mod tests {
             PluginConfig::try_from(serde_json::json!({ "keys": ["secret"], "query": "apikey" }))
                 .unwrap();
         assert_eq!(config.query, "apikey");
+    }
+
+    #[test]
+    fn realm_is_optional_and_defaults_to_legacy_challenge() {
+        let config = PluginConfig::try_from(serde_json::json!({ "keys": ["secret"] })).unwrap();
+        assert_eq!(config.realm, None);
+
+        let plugin = PluginKeyAuth {
+            config,
+            key_digests: vec![secret_digest("secret")],
+        };
+        assert_eq!(plugin.build_challenge(), "ApiKey error=\"invalid_key\"");
+    }
+
+    #[test]
+    fn custom_realm_is_used_in_challenge() {
+        let config =
+            PluginConfig::try_from(serde_json::json!({ "keys": ["secret"], "realm": "api" }))
+                .unwrap();
+        let plugin = PluginKeyAuth {
+            config,
+            key_digests: vec![secret_digest("secret")],
+        };
+        assert_eq!(plugin.build_challenge(), "apikey realm=\"api\"");
+    }
+
+    #[test]
+    fn invalid_realms_are_rejected() {
+        for invalid in ["", "a\"b", "a\\b", "caf\u{e9}"] {
+            let err =
+                PluginConfig::try_from(serde_json::json!({ "keys": ["secret"], "realm": invalid }))
+                    .expect_err("invalid realm must be rejected");
+            assert!(err.to_string().contains("realm"), "{err}");
+        }
+
+        let long_realm = "a".repeat(129);
+        let err =
+            PluginConfig::try_from(serde_json::json!({ "keys": ["secret"], "realm": long_realm }))
+                .expect_err("overlong realm must be rejected");
+        assert!(err.to_string().contains("realm"), "{err}");
     }
 }

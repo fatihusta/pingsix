@@ -32,12 +32,13 @@ use crate::{
     },
     plugins::cache::{
         http::{
-            cache_key, cache_vary, error_status, headers_indicate_shared_cache_credentials,
-            response_cacheability, should_enable_purge, should_enable_request_cache,
+            cache_key, cache_vary, credential_cache_key_component, error_status,
+            headers_indicate_shared_cache_credentials, response_cacheability, should_enable_purge,
+            should_enable_request_cache,
         },
         CacheSettings, CTX_KEY_CACHE_SETTINGS,
     },
-    proxy::runtime::RuntimeStore,
+    proxy::{route::apply_route_timeout, runtime::RuntimeStore},
 };
 
 /// A WebSocket upgrade is trusted only when both RFC 7230/6455 handshake
@@ -56,51 +57,6 @@ fn is_websocket_upgrade(headers: &http::HeaderMap) -> bool {
         .filter_map(|value| value.to_str().ok())
         .any(|value| value.trim().eq_ignore_ascii_case("websocket"));
     connection_has_upgrade && upgrade_is_websocket
-}
-
-/// Apply ai-proxy request-scoped peer adjustments after upstream selection.
-///
-/// Both settings travel on the ai-proxy request state (written once by the
-/// owning plugin instance) because peer options cannot be expressed on the
-/// upstream resource (its TLS block carries only client certificates) and
-/// must reflect the owning instance's configuration:
-///
-/// * read-timeout floor (every ai-proxy request): LLM upstreams legitimately
-///   go silent between reads — non-streaming completions before their first
-///   byte ("thinking"), SSE streams between chunks — and pingora's
-///   `read_timeout` bounds the gap *between* reads, so the configured value
-///   is lifted to a generous finite floor instead of being removed: a
-///   stalled provider can no longer hold a connection forever. The write
-///   timeout stays untouched as client-side abuse protection (same reasoning
-///   as the WebSocket branch above). A total-duration bound
-///   (`max_stream_duration_ms`) is planned for v2.
-/// * `ssl_verify: false`: disable certificate verification for the selected
-///   provider peer.
-fn apply_ai_proxy_peer_options(ctx: &ProxyContext, peer: &mut HttpPeer) {
-    let Some(state) = ctx.get::<crate::plugins::ai_proxy::AiProxyRequestState>(
-        crate::plugins::ai_proxy::CTX_KEY_STATE,
-    ) else {
-        return;
-    };
-    let floor = Duration::from_secs(crate::plugins::ai_proxy::PROVIDER_READ_TIMEOUT_FLOOR_SECS);
-    if peer
-        .options
-        .read_timeout
-        .is_none_or(|current| current < floor)
-    {
-        peer.options.read_timeout = Some(floor);
-        log::debug!(
-            "ai-proxy request: upstream read_timeout floored at {}s",
-            floor.as_secs()
-        );
-    }
-    if state.insecure_tls {
-        peer.options.verify_cert = false;
-        peer.options.verify_hostname = false;
-        log::debug!(
-            "ai-proxy request: disabled upstream certificate verification (ssl_verify=false)"
-        );
-    }
 }
 
 static CACHE_REQUESTS: Lazy<IntCounterVec> = Lazy::new(|| {
@@ -192,30 +148,25 @@ impl ProxyHttp for HttpService {
             headers_indicate_shared_cache_credentials(original_headers);
         if ctx.original_request_had_credentials {
             ctx.request_has_credentials = true;
+            // Capture the credential digest from the ORIGINAL headers before
+            // any plugin (auth plugin `hide_credentials`, proxy-rewrite header
+            // removal) can strip them; shared-cache consumer isolation reads
+            // it later when the cache key is built.
+            ctx.original_credential_digest =
+                Some(credential_cache_key_component(session.req_header()));
         }
 
         // Load one immutable runtime snapshot for all data-plane configuration used here.
         let runtime = self.runtime.load();
         let global_plugins = runtime.global_plugins.clone();
-        let (route_match, is_fallback_preflight) =
-            match runtime.route_matcher.match_request(session) {
-                Some(route_match) => (Some(route_match), false),
-                None => (
-                    runtime
-                        .route_matcher
-                        .match_preflight(session, global_plugins.has_plugin("cors")),
-                    true,
-                ),
-            };
+        // Preflight fallback eligibility (route/service/global CORS) is
+        // compiled into the route matcher at snapshot build time.
+        let route_match = match runtime.route_matcher.match_request(session) {
+            Some(route_match) => Some(route_match),
+            None => runtime.route_matcher.match_preflight(session),
+        };
         if let Some((route_params, route)) = route_match {
-            // The preflight matcher itself filters fallback candidates to routes
-            // whose effective route/service/global configuration contains CORS.
             let executor = route.build_plugin_executor();
-            debug_assert!(
-                !is_fallback_preflight
-                    || executor.has_plugin("cors")
-                    || global_plugins.has_plugin("cors")
-            );
             ctx.route_params = Some(route_params);
             ctx.pipeline = CompiledPluginPipeline::new(global_plugins, executor);
             ctx.route = Some(route);
@@ -250,26 +201,34 @@ impl ProxyHttp for HttpService {
         pipeline.request_filter(session, ctx).await
     }
 
-    /// Selects an upstream peer for the request
+    /// Selects an upstream peer for the request.
+    ///
+    /// Peer-option precedence — this is the single home of the chain:
+    /// 1. upstream defaults (compiled upstream / provider configuration,
+    ///    including upstream-level timeouts),
+    /// 2. route timeout override (`route.timeout`, applied to traffic-split
+    ///    override selections too),
+    /// 3. WebSocket relaxation (route-enabled plus a complete, trusted
+    ///    upgrade handshake) — after the route timeout so long-lived streams
+    ///    may idle,
+    /// 4. plugin `upstream_peer_filter` phase (e.g. ai-proxy read-timeout
+    ///    floor, `ssl_verify`) — plugin policy runs last.
     async fn upstream_peer(
         &self,
         session: &mut Session,
         ctx: &mut Self::CTX,
     ) -> Result<Box<HttpPeer>> {
         // Both selection paths compile the same artifact: peer + owning
-        // selector. Route timeouts apply to override selections too.
+        // selector.
         let selection = if let Some(upstream) = ctx.upstream_override.clone() {
             let mut backend = upstream.select_backend(session).ok_or_else(|| {
                 ProxyError::UpstreamSelection("Traffic-split selected no backend".to_string())
             })?;
-            let mut peer = backend
+            let peer = backend
                 .ext
                 .get_mut::<HttpPeer>()
                 .ok_or_else(|| ProxyError::Internal("Peer missing".into()))?
                 .clone();
-            if let Some(route) = ctx.route.as_ref() {
-                crate::proxy::route::apply_route_timeout(route.timeout(), &mut peer);
-            }
             let selected_backend = backend.clone();
             UpstreamSelection {
                 peer: Box::new(peer),
@@ -287,9 +246,14 @@ impl ProxyHttp for HttpService {
         let (mut peer, selected) = selection.into_peer();
         ctx.selected = Some(selected);
 
-        // Long-lived WebSocket streams may legitimately be idle. Only relax
-        // upstream timeouts for an explicitly enabled route and a complete,
-        // trusted WebSocket upgrade handshake.
+        // (2) Route timeout applies to every selection path.
+        if let Some(route) = ctx.route.as_ref() {
+            apply_route_timeout(route.timeout(), &mut peer);
+        }
+
+        // (3) Long-lived WebSocket streams may legitimately be idle. Only
+        // relax upstream timeouts for an explicitly enabled route and a
+        // complete, trusted WebSocket upgrade handshake.
         let websocket_enabled = ctx
             .route
             .as_ref()
@@ -301,7 +265,9 @@ impl ProxyHttp for HttpService {
             log::debug!("WebSocket request: disabled upstream read/write timeouts");
         }
 
-        apply_ai_proxy_peer_options(ctx, &mut peer);
+        // (4) Plugin-owned peer policy.
+        let pipeline = ctx.pipeline.clone();
+        pipeline.upstream_peer_filter(session, &mut peer, ctx)?;
 
         Ok(peer)
     }
@@ -632,83 +598,5 @@ mod tests {
 
         headers.insert(http::header::UPGRADE, "h2c".parse().unwrap());
         assert!(!is_websocket_upgrade(&headers));
-    }
-
-    fn configured_peer(read_secs: u64) -> HttpPeer {
-        let mut peer = HttpPeer::new("127.0.0.1:9443", true, "provider.internal".to_string());
-        peer.options.read_timeout = Some(Duration::from_secs(read_secs));
-        peer.options.write_timeout = Some(Duration::from_secs(60));
-        peer.options.verify_cert = true;
-        peer.options.verify_hostname = true;
-        peer
-    }
-
-    fn ai_proxy_state(insecure_tls: bool) -> crate::plugins::ai_proxy::AiProxyRequestState {
-        crate::plugins::ai_proxy::AiProxyRequestState {
-            token: 1,
-            insecure_tls,
-            streaming: false,
-            body: bytes::BytesMut::new(),
-        }
-    }
-
-    #[test]
-    fn ai_proxy_state_floors_read_timeout_without_touching_write_or_tls() {
-        let floor = Duration::from_secs(crate::plugins::ai_proxy::PROVIDER_READ_TIMEOUT_FLOOR_SECS);
-
-        // Without ai-proxy state the peer is untouched.
-        let mut ctx = ProxyContext::default();
-        let mut peer = configured_peer(60);
-        apply_ai_proxy_peer_options(&ctx, &mut peer);
-        assert_eq!(peer.options.read_timeout, Some(Duration::from_secs(60)));
-        assert_eq!(peer.options.write_timeout, Some(Duration::from_secs(60)));
-        assert!(peer.options.verify_cert);
-
-        // With state, a short read timeout is lifted to the generous floor:
-        // ai-proxy requests must not be killed between upstream reads, but a
-        // stalled provider is still dropped after the floor.
-        ctx.set(
-            crate::plugins::ai_proxy::CTX_KEY_STATE,
-            ai_proxy_state(false),
-        );
-        apply_ai_proxy_peer_options(&ctx, &mut peer);
-        assert_eq!(peer.options.read_timeout, Some(floor));
-        assert_eq!(
-            peer.options.write_timeout,
-            Some(Duration::from_secs(60)),
-            "write timeout stays as abuse protection"
-        );
-        assert!(
-            peer.options.verify_cert,
-            "the read floor alone must not touch TLS"
-        );
-
-        // A configured read timeout above the floor is preserved.
-        let mut peer = configured_peer(3600);
-        apply_ai_proxy_peer_options(&ctx, &mut peer);
-        assert_eq!(peer.options.read_timeout, Some(Duration::from_secs(3600)));
-    }
-
-    #[test]
-    fn ai_proxy_insecure_state_disables_cert_verification_only() {
-        let mut ctx = ProxyContext::default();
-        ctx.set(
-            crate::plugins::ai_proxy::CTX_KEY_STATE,
-            ai_proxy_state(true),
-        );
-        let mut peer = configured_peer(3600);
-        apply_ai_proxy_peer_options(&ctx, &mut peer);
-        assert!(!peer.options.verify_cert);
-        assert!(!peer.options.verify_hostname);
-        assert_eq!(
-            peer.options.read_timeout,
-            Some(Duration::from_secs(3600)),
-            "insecure TLS alone must not touch timeouts"
-        );
-        assert_eq!(
-            peer.options.write_timeout,
-            Some(Duration::from_secs(60)),
-            "insecure TLS alone must not touch the write timeout"
-        );
     }
 }

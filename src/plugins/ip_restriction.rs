@@ -1,7 +1,6 @@
 use std::{net::IpAddr, sync::Arc};
 
 use async_trait::async_trait;
-use http::StatusCode;
 use ipnetwork::IpNetwork;
 use pingora_error::Result;
 use pingora_proxy::Session;
@@ -11,20 +10,23 @@ use serde_json::Value as JsonValue;
 use crate::core::{PluginPhases, ProxyContext, ProxyError, ProxyPlugin, ProxyResult};
 use crate::utils::{
     request::{get_direct_client_ip, get_req_header_value},
-    response::ResponseBuilder,
+    response::{content_type, send_exit_response},
 };
 
 pub const PLUGIN_NAME: &str = "ip-restriction";
 const PRIORITY: i32 = 3000;
 
 /// Raw configuration for IP restriction plugin (before parsing networks).
-#[derive(Deserialize)]
+#[derive(Debug, Deserialize)]
 struct RawConfig {
     #[serde(default)]
     whitelist: Vec<String>,
     #[serde(default)]
     blacklist: Vec<String>,
-    message: Option<String>,
+    #[serde(default = "RawConfig::default_message")]
+    message: String,
+    #[serde(default = "RawConfig::default_response_code")]
+    response_code: u16,
     #[serde(default)]
     trusted_proxies: Vec<String>,
     #[serde(default = "RawConfig::default_use_forwarded_headers")]
@@ -35,6 +37,14 @@ struct RawConfig {
 }
 
 impl RawConfig {
+    fn default_message() -> String {
+        "Your IP address is not allowed".into()
+    }
+
+    fn default_response_code() -> u16 {
+        403
+    }
+
     fn default_use_forwarded_headers() -> bool {
         false
     }
@@ -48,9 +58,31 @@ impl TryFrom<JsonValue> for RawConfig {
     type Error = ProxyError;
 
     fn try_from(value: JsonValue) -> Result<Self, Self::Error> {
-        serde_json::from_value(value).map_err(|e| {
+        let config: RawConfig = serde_json::from_value(value).map_err(|e| {
             ProxyError::serialization_error("Failed to parse IP restriction plugin config", e)
-        })
+        })?;
+
+        if config.whitelist.is_empty() && config.blacklist.is_empty() {
+            return Err(ProxyError::validation_error(
+                "At least one of 'whitelist' or 'blacklist' must be non-empty",
+            ));
+        }
+
+        let message_len = config.message.chars().count();
+        if !(1..=1024).contains(&message_len) {
+            return Err(ProxyError::validation_error(format!(
+                "message must be between 1 and 1024 characters, got {message_len}"
+            )));
+        }
+
+        if !matches!(config.response_code, 403 | 404) {
+            return Err(ProxyError::validation_error(format!(
+                "response_code must be 403 or 404, got {}",
+                config.response_code
+            )));
+        }
+
+        Ok(config)
     }
 }
 
@@ -117,6 +149,7 @@ pub fn create_ip_restriction_plugin(
         whitelist,
         blacklist,
         message: raw_config.message,
+        response_code: raw_config.response_code,
         trusted_proxies,
         use_forwarded_headers: raw_config.use_forwarded_headers,
         forwarded_header_error_policy: policy,
@@ -145,7 +178,10 @@ struct PluginConfig {
     blacklist: Vec<IpNetwork>,
 
     /// Custom rejection message for blocked requests.
-    message: Option<String>,
+    message: String,
+
+    /// HTTP status code for blocked requests. APISIX allows 403 or 404.
+    response_code: u16,
 
     /// Trusted proxy networks allowed to set forwarded headers.
     /// Used for proxy chain validation when use_forwarded_headers is true.
@@ -179,11 +215,11 @@ impl ProxyPlugin for PluginIPRestriction {
         PluginPhases::REQUEST
     }
 
-    async fn request_filter(&self, session: &mut Session, _ctx: &mut ProxyContext) -> Result<bool> {
+    async fn request_filter(&self, session: &mut Session, ctx: &mut ProxyContext) -> Result<bool> {
         let client_ip = match self.get_real_client_ip(session) {
             Ok(ip) => ip,
             Err(ClientIpError::InvalidForwardedHeader) => {
-                return self.reject_request(session).await;
+                return self.reject_request(session, ctx).await;
             }
             Err(ClientIpError::Other(err)) => return Err(err),
         };
@@ -196,7 +232,7 @@ impl ProxyPlugin for PluginIPRestriction {
                 .iter()
                 .any(|network| network.contains(client_ip))
         {
-            return self.reject_request(session).await;
+            return self.reject_request(session, ctx).await;
         }
 
         // Check blacklist
@@ -206,7 +242,7 @@ impl ProxyPlugin for PluginIPRestriction {
             .iter()
             .any(|network| network.contains(client_ip))
         {
-            return self.reject_request(session).await;
+            return self.reject_request(session, ctx).await;
         }
 
         Ok(false)
@@ -300,18 +336,27 @@ impl PluginIPRestriction {
             .or_else(|| hops.first().copied())
     }
 
-    /// Rejects the request with a `403 Forbidden` response.
-    async fn reject_request(&self, session: &mut Session) -> Result<bool> {
-        ResponseBuilder::send_proxy_error(
+    /// Rejects the request with the configured response code and an
+    /// APISIX-style JSON body (`{"message":"..."}`).
+    async fn reject_request(&self, session: &mut Session, ctx: &ProxyContext) -> Result<bool> {
+        let body = build_rejection_body(&self.config.message);
+        send_exit_response(
             session,
-            StatusCode::FORBIDDEN,
-            self.config.message.as_deref(),
-            None,
+            self.config.response_code,
+            Some(&body),
+            Some(content_type::APPLICATION_JSON),
+            &[],
+            ctx,
         )
         .await?;
 
         Ok(true)
     }
+}
+
+/// Build the APISIX-style JSON rejection body.
+fn build_rejection_body(message: &str) -> String {
+    serde_json::json!({ "message": message }).to_string()
 }
 
 #[cfg(test)]
@@ -383,5 +428,78 @@ mod tests {
         });
 
         assert_eq!(client, Some("203.0.113.8".parse().unwrap()));
+    }
+
+    fn valid_raw(list_field: &str, entries: &[&str]) -> serde_json::Value {
+        serde_json::json!({ list_field: entries })
+    }
+
+    #[test]
+    fn config_requires_whitelist_or_blacklist() {
+        let err = RawConfig::try_from(serde_json::json!({})).unwrap_err();
+        assert!(err.to_string().contains("whitelist"));
+        assert!(RawConfig::try_from(valid_raw("whitelist", &["127.0.0.1"])).is_ok());
+        assert!(RawConfig::try_from(valid_raw("blacklist", &["127.0.0.1"])).is_ok());
+    }
+
+    #[test]
+    fn config_defaults_match_apisix() {
+        let raw = RawConfig::try_from(valid_raw("whitelist", &["127.0.0.1"])).unwrap();
+        assert_eq!(raw.message, "Your IP address is not allowed");
+        assert_eq!(raw.response_code, 403);
+    }
+
+    #[test]
+    fn response_code_only_accepts_403_and_404() {
+        for code in [403, 404] {
+            assert!(RawConfig::try_from(serde_json::json!({
+                "whitelist": ["127.0.0.1"],
+                "response_code": code
+            }))
+            .is_ok());
+        }
+        for code in [200, 401, 500, 0, 9999] {
+            assert!(RawConfig::try_from(serde_json::json!({
+                "whitelist": ["127.0.0.1"],
+                "response_code": code
+            }))
+            .is_err());
+        }
+    }
+
+    #[test]
+    fn message_length_is_bounded() {
+        assert!(RawConfig::try_from(serde_json::json!({
+            "whitelist": ["127.0.0.1"],
+            "message": ""
+        }))
+        .is_err());
+        assert!(RawConfig::try_from(serde_json::json!({
+            "whitelist": ["127.0.0.1"],
+            "message": "a".repeat(1025)
+        }))
+        .is_err());
+        assert!(RawConfig::try_from(serde_json::json!({
+            "whitelist": ["127.0.0.1"],
+            "message": "a".repeat(1024)
+        }))
+        .is_ok());
+    }
+
+    #[test]
+    fn rejection_body_is_apisix_json_shape() {
+        assert_eq!(
+            build_rejection_body("Your IP address is not allowed"),
+            "{\"message\":\"Your IP address is not allowed\"}"
+        );
+    }
+
+    #[test]
+    fn invalid_network_is_rejected() {
+        assert!(create_ip_restriction_plugin(
+            serde_json::json!({ "whitelist": ["not-a-network"] }),
+            &crate::config::EffectiveDefaults::default(),
+        )
+        .is_err());
     }
 }

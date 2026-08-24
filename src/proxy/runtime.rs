@@ -66,8 +66,10 @@ impl RuntimeSnapshot {
         let services = Arc::new(candidate.services);
         let global_rules = Arc::new(candidate.global_rules);
         let ssls = Arc::new(candidate.ssls);
-        let route_matcher = Arc::new(RouteMatcher::build(&routes)?);
         let global_plugins = build_global_plugin_executor(&global_rules);
+        // Preflight fallback eligibility (global CORS) is compiled into the
+        // matcher so the request path never inspects plugin names.
+        let route_matcher = Arc::new(RouteMatcher::build(&routes, &global_plugins)?);
         let ssl_matcher = Arc::new(SslMatcher::build(&ssls)?);
 
         Ok(Self {
@@ -356,7 +358,6 @@ mod tests {
         }
         Upstream {
             id: id.to_string(),
-            name: None,
             retries: None,
             retry_timeout: None,
             timeout: None,

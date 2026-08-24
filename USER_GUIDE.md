@@ -90,7 +90,7 @@ Routes define how incoming requests are matched and processed. Each route specif
 
 > **Upstream requirement:** PingSIX currently requires every route to bind an
 > upstream, `upstream_id`, or `service_id` — even when a locally short-circuiting
-> plugin such as `redirect`, `echo`, or `fault-injection(abort)` would respond
+> plugin such as `redirect` or `fault-injection(abort)` would respond
 > without a backend. Use a placeholder upstream for such route-scoped plugins,
 > or configure the plugin on a **global rule** to avoid a dummy upstream.
 > This differs from APISIX, which allows upstream-less routes; the constraint is
@@ -1308,7 +1308,7 @@ upstreams:
 
 ### Keepalive Connection Pool (keepalive_pool)
 
-APISIX `keepalive_pool` schema compatible, per upstream:
+APISIX `keepalive_pool.idle_timeout` compatible, per upstream:
 
 ```yaml
 upstreams:
@@ -1316,20 +1316,16 @@ upstreams:
     nodes:
       "backend.local:8080": 1
     keepalive_pool:
-      size: 320                    # Idle connections to keep (APISIX compat, see note)
       idle_timeout: 60             # Seconds before an idle connection is closed
-      requests: 1000               # Requests per connection (APISIX compat, see note)
 ```
 
 - **`idle_timeout`** (seconds, fractional values allowed, default `60`, minimum `0`)
   maps onto Pingora's per-peer idle timeout: how long an idle upstream
   connection stays reusable before it is closed. Lower it for fast-churning
   backends, raise it to maximize connection reuse behind slow handshakes.
-- **`size`** (default `320`) and **`requests`** (default `1000`) are accepted
-  for APISIX configuration compatibility. Pingora 0.8 does not expose
-  per-upstream pool size or per-connection request caps, so non-default
-  values log a build-time warning and the process-global
-  `pingora.upstream_keepalive_pool_size` applies instead.
+- APISIX `size`/`requests` are not part of the schema: Pingora 0.8 does not
+  expose per-upstream pool size or per-connection request caps, and the
+  process-global `pingora.upstream_keepalive_pool_size` applies instead.
 
 Route-level `timeout` overrides still apply to `connect`/`read`/`write` on
 the same connections; `idle_timeout` is independent and survives route
@@ -1398,11 +1394,11 @@ PingSIX runs plugins in two layers, mirroring APISIX's phase model:
 A plugin short-circuits the request when its `request_filter` returns
 `true`. **A global-rule plugin that short-circuits prevents every route
 plugin from running — including authentication plugins.** This is intentional:
-it lets global redirect/echo rules respond before any upstream work, but it
+it lets global redirect/fault-injection rules respond before any upstream work, but it
 also means a global short-circuit can bypass route-level authentication.
 
 > **Warning:** Do not combine a global short-circuit plugin (e.g. redirect or
-> echo) that needs authentication protection with route-level auth plugins.
+> fault-injection abort) that needs authentication protection with route-level auth plugins.
 > The global plugin will respond before the route auth plugin ever runs, so
 > the request is never authenticated. Put such protective logic at the global
 > layer instead, or avoid short-circuiting globally.
@@ -1428,10 +1424,12 @@ plugins:
       -----BEGIN PUBLIC KEY-----
       ...
       -----END PUBLIC KEY-----
-    algorithm: HS256            # Supported: HS256, HS512, RS256, ES256
+    algorithm: HS256            # HS256/384/512, RS256/384/512, PS256/384/512, ES256/384, EdDSA
     lifetime_grace_period: 60   # Optional: 60 seconds grace period for token expiration
     hide_credentials: true      # Remove JWT from request
     store_in_ctx: true         # Store payload in context
+    realm: jwt                  # Optional: APISIX-style realm; omit for legacy pingsix challenge
+    claims_to_verify: ["exp", "nbf"]  # Optional: verify the listed claims (nbf value checked when listed)
 ```
 
 #### API Key Authentication
@@ -1447,6 +1445,7 @@ plugins:
       - "key2"
       - "key3"
     hide_credentials: true         # Remove credentials before proxying upstream
+    realm: key                     # Optional: APISIX-style realm; omit for legacy pingsix challenge
 ```
 
 #### Basic Authentication
@@ -1456,11 +1455,12 @@ plugins:
     username: "admin"              # Username for authentication
     password: "secret"             # Password for authentication
     hide_credentials: true         # Remove Authorization header from upstream request
+    realm: basic                   # Optional: APISIX-style realm; omit for legacy pingsix challenge
 ```
 
 **Basic Authentication Features:**
 - **Simple Credentials**: Username and password-based authentication
-- **HTTP 401 Response**: Returns 401 Unauthorized with `WWW-Authenticate: Basic realm="pingsix"` header on invalid credentials
+- **HTTP 401 Response**: Returns 401 Unauthorized with `WWW-Authenticate: Basic realm="<realm>"` header on invalid credentials
 - **Constant-Time Comparison**: Uses constant-time string comparison to prevent timing attacks
 - **Credential Hiding**: Optionally removes Authorization header before forwarding to upstream services
 - **Standard Compliance**: Follows RFC 7617 HTTP Basic Authentication specification
@@ -1482,7 +1482,8 @@ plugins:
     blacklist:                     # Block these IPs/networks
       - "192.168.1.100"
       - "172.16.0.0/12"
-    message: "Access denied"       # Custom rejection message
+    message: "Access denied"       # Custom rejection message (default APISIX message; JSON body)
+    response_code: 403             # 403 or 404 (default: 403)
     use_forwarded_headers: true    # Parse forwarded headers only from a trusted direct proxy
     trusted_proxies:               # Trusted proxy networks; X-Forwarded-For is walked right-to-left
       - "10.0.0.0/8"
@@ -1527,6 +1528,9 @@ plugins:
     max_age: 86400                 # Preflight cache time
     allow_credential: true         # Allow credentials
     allow_origins_by_regex:        # Regex patterns for origins
+      - "https://.*\\.example\\.com"
+    timing_allow_origins: "https://example.com"  # Timing-Allow-Origin list
+    timing_allow_origins_by_regex:                # Or regex list
       - "https://.*\\.example\\.com"
 ```
 
@@ -1573,15 +1577,25 @@ plugins:
 ```yaml
 plugins:
   limit-count:
-    key_type: vars                 # vars, head, cookie
+    key_type: vars                 # var, var_combination, constant, head, cookie
     key: remote_addr              # Key to rate limit on
     time_window: 60               # Time window in seconds
     count: 100                    # Max requests per window
+    window_type: fixed            # fixed, sliding
     rejected_code: 429            # HTTP status for rejected requests
     rejected_msg: "Rate limit exceeded"
     show_limit_quota_header: true # Include rate limit headers
+                                  # Success: X-RateLimit-Limit/-Remaining/-Reset + X-RateLimit-Scope;
+                                  # rejection additionally X-RateLimit-Used + Retry-After
     key_missing_policy: allow     # allow, deny, default
     scope: local                  # Only process-local scope is supported
+    group: tenant-a               # Optional local counter namespace (not with rules)
+    # rules (mutually exclusive with count/time_window):
+    # rules:
+    #   - key: "$http_x-user"
+    #     count: 10
+    #     time_window: 10
+    #     header_prefix: user
 ```
 
 #### Leaky Bucket Rate Limiting (limit-req)
@@ -1616,6 +1630,11 @@ plugins:
     rejected_code: 503            # HTTP status for rejected requests
     rejected_msg: "Too many concurrent requests"
     policy: local                 # Only process-local is supported
+    # rules (mutually exclusive with conn/burst/key):
+    # rules:
+    #   - key: "$http_x-user"
+    #     conn: 5
+    #     burst: 2
 ```
 
 Requests up to `conn` pass immediately; requests between `conn` and
@@ -1671,10 +1690,10 @@ plugins:
 ```yaml
 plugins:
   proxy-rewrite:
-    uri: /new/path                # Rewrite request URI
-    method: POST                  # Change HTTP method
+    uri: /new/path                # Rewrite request URI (must start with '/', ≤ 4096 chars)
+    method: POST                  # GET/POST/PUT/DELETE/PATCH/HEAD/OPTIONS/CONNECT/TRACE
     host: new-host.example.com    # Change Host header
-    headers:                      # Add/modify/remove headers
+    headers:                      # Add/modify/remove headers (pingsix entry shape)
       set:
         - name: "X-Header-To-Set"
           value: "new-value"
@@ -1688,6 +1707,24 @@ plugins:
       - "/new/$1"                 # Replacement
 ```
 
+**APISIX-compatible `headers` map shape** (also accepted):
+```yaml
+plugins:
+  proxy-rewrite:
+    headers:
+      X-Api-Version: "2"          # Plain keys map to `set`
+      X-Count: 42                 # Numeric values are accepted
+      X-Multi: ["a", "b"]        # Arrays expand to multiple values (add/set only)
+      set:
+        X-Other: "replaces-all-existing-values"
+      remove:
+        - "X-Old"
+```
+Operations run in APISIX order — `add` (append), then `set` (remove-then-append
+all values), then `remove`. Mixing plain keys with `add`/`set`/`remove` in one
+map is rejected (APISIX `additionalProperties: false`); header names and
+values are validated at config time.
+
 #### Response Modification (Response Rewrite)
 ```yaml
 plugins:
@@ -1695,7 +1732,14 @@ plugins:
     status_code: 200              # Rewrite response status code
     headers:                      # Modify response headers (simple mode)
       X-Custom-Header: "value"
-      X-Another-Header: "value2"
+      X-Another-Header: 42       # Numeric values are accepted
+    body: '{"error": false}'      # Replace the response body
+    body_base64: false            # Decode body from base64 first
+    filters:                      # Regex replacements on the response body
+      - regex: "old"
+        replace: "new"
+        scope: global             # once (default), global
+    max_resp_body_size: 67108864  # Body buffer cap for filters (default)
     # OR structured mode for add/set/remove
     headers:
       set:
@@ -1713,6 +1757,8 @@ plugins:
 **Response Rewrite Features:**
 - **Status Code Modification**: Change response HTTP status codes conditionally
 - **Header Manipulation**: Set, add, or remove response headers
+- **Body Replacement**: Replace the whole response body (`body`, optional `body_base64`)
+- **Body Filters**: Ordered regex substitutions (`once`/`global`) applied to the buffered body; compressed upstream bodies pass through unchanged (no gzip/brotli decode)
 - **Variable Substitution**: Support for variables like `$remote_addr`, `$upstream_addr`, `$request_id` in header values
 - **Conditional Rewriting**: Apply rewrites only when request conditions match
 - **Flexible Configuration**: Both simple (key-value) and structured (add/set/remove) header modes
@@ -1741,12 +1787,21 @@ plugins:
     # trusted_proxies:            # Optional: only then honor X-Forwarded-Proto
     #   - 10.0.0.0/8
     ret_code: 301                 # Redirect status code
-    uri: /new-location            # Static redirect
+    uri: "/new/$request_uri"      # Static redirect; templates expand (see below)
+    encode_uri: true              # Percent-encode the rewritten path
     append_query_string: true     # Preserve query parameters
     regex_uri:                    # Regex-based redirects
       - "^/old/(.*)"
       - "/new/$1"
 ```
+
+**URI templates**: `$host`, `$request_uri`, `$uri`, `$scheme`,
+`$request_method`, and `${name}` forms expand to the corresponding request
+values; escape a literal `$` with `\$`. The variable set is closed — an
+unknown variable expands to an empty string (config validation does not
+reject it). `encode_uri` percent-encodes the rewritten path but, unlike APISIX's
+`ngx_escape_uri`, preserves existing `%XX` sequences and unreserved characters
+instead of double-encoding `%` and reserved characters.
 
 #### Fault Injection (Testing & Chaos Engineering)
 ```yaml
@@ -1976,7 +2031,6 @@ routes:
         max_req_body_size: 67108864 # request body cap, larger → 413
         keepalive: true
         keepalive_timeout: 60000    # ms, >= 1000
-        keepalive_pool: 30          # accepted (Pingora uses a process-global pool)
         ssl_verify: true
 ```
 
@@ -1995,7 +2049,6 @@ routes:
 | `max_req_body_size` | bytes | 67108864 | request body cap; larger bodies → 413 |
 | `keepalive` | bool | true | `false` disables connection reuse |
 | `keepalive_timeout` | ms | 60000 | idle timeout, ≥ 1000 |
-| `keepalive_pool` | int | 30 | accepted for APISIX compatibility (not enforced by Pingora 0.8) |
 | `ssl_verify` | bool | true | `false` disables provider certificate verification |
 
 **Provider defaults:**
@@ -2084,7 +2137,7 @@ which every HTTP/1.1 provider accepts.
 
 | Capability | Status |
 |---|---|
-| `provider`/`auth`/`options`/`override.llm_options`/`timeout`/`max_req_body_size`/`keepalive*`/`ssl_verify` | ✅ identical semantics and bounds |
+| `provider`/`auth`/`options`/`override.llm_options`/`timeout`/`max_req_body_size`/`keepalive`/`ssl_verify` | ✅ identical semantics and bounds |
 | openai / openai-compatible / deepseek / anthropic providers | ✅ |
 | SSE streaming passthrough | ✅ (read timeout floored at 600s instead of removed) |
 | global-rule + route configuration of ai-proxy | ✅ route/service overrides global (single instance owns a request) |
@@ -2092,7 +2145,7 @@ which every HTTP/1.1 provider accepts.
 | `anthropic-version` header | ⚠️ auto-injected `2023-06-01` (APISIX ≥ 3.17 expects the client or `auth.header`) |
 | `options` merge | ⚠️ deep merge; APISIX overwrites top-level keys wholesale (identical for scalar options) |
 | error bodies | ⚠️ JSON `{"error": ...}` (APISIX returns plain text messages) |
-| `override.request_body` / `request_body_force_override` | ❌ rejected (v2+) |
+| `override.request_body` / `request_body_force_override` | ❌ not supported; ignored (v2+) |
 | protocol auto-detection (`/v1/responses`, embeddings, anthropic-native clients, converters) | ❌ v1 accepts OpenAI Chat-format clients only |
 | response transforms, `max_response_bytes`, `max_stream_duration_ms`, token-usage vars | ❌ v2/v3 |
 | `auth.gcp` / `auth.aws` (SigV4), azure/gemini/openrouter/aimlapi/vertex-ai/bedrock | ❌ out of v1 scope |
@@ -2119,27 +2172,56 @@ plugins:
 ### Caching
 
 #### Response Caching
+
+> **Breaking rename:** the plugin is `proxy-cache`; the old pingsix key `cache`
+> is not accepted as an alias. **Migrate before upgrading**: rewrite every
+> `cache:` plugin key in static configs AND in etcd route/global-rule data to
+> `proxy-cache:` first — a single stale `cache` key fails the whole config
+> snapshot build (initial load never becomes ready; subsequent hot reloads
+> are rejected) until every key is rewritten.
+
 ```yaml
 plugins:
-  cache:
-    ttl: 3600                     # Cache TTL in seconds
+  proxy-cache:                  # APISIX-compatible plugin name
+    ttl: 3600                   # Cache TTL in seconds (default: 300 when omitted)
     cache_http_methods: ["GET", "HEAD"]  # Default: ["GET", "HEAD"]
     cache_http_statuses: [200, 301, 404] # Default: [200]
-    no_cache_str:                 # Regex patterns to skip caching
+    no_cache_str:               # Regex patterns to skip caching
       - ".*private.*"
       - ".*no-cache.*"
-    vary: ["Accept-Encoding"]     # Vary headers for cache keys
-    hide_cache_headers: false     # Hide cache-related headers (default: false)
-    enable_purge: false           # Accept PURGE requests (default: false; no built-in auth)
-    scope: local                  # Entries, locks and SWR state are process-local
+    vary: ["Accept-Encoding"]   # Vary headers for cache keys
+    hide_cache_headers: false   # Hide cache-related headers (default: false)
+    enable_purge: false         # Accept PURGE requests (default: false; no built-in auth)
+    scope: local                # Entries, locks and SWR state are process-local
     max_file_size_bytes: 1048576  # Max cacheable response size (bytes, 0 = no limit)
     stale_while_revalidate_secs: 60  # Serve stale content while revalidating (optional)
-    respect_s_maxage: true        # Respect Cache-Control s-maxage directive (default: true)
+    respect_s_maxage: true      # Respect Cache-Control s-maxage directive (default: true)
     # Disabled by default: shared caching skips requests with Authorization/Cookie
     # headers and responses with Set-Cookie to prevent cross-user reuse.
     cache_authenticated_requests: false
     # Separate high-risk opt-in; remains false even when authenticated caching is enabled.
     cache_set_cookie_responses: false
+    # --- APISIX proxy-cache aliases (also accepted) ---
+    cache_ttl: 300              # Alias for ttl; overrides ttl when present
+    cache_method: ["GET", "HEAD"]      # Alias for cache_http_methods
+    cache_http_status: [200, 301, 404] # Alias for cache_http_statuses
+    cache_key: ["$host", "$request_uri"] # Optional APISIX cache key templates (explicit opt-in;
+                                    # `$request_method` is rejected like APISIX)
+    cache_bypass: ["$arg_nocache"]     # Skip cache LOOKUP when a template renders truthy
+    no_cache: ["$http_x_private"]      # Suppress STORING the response (hits are still served)
+    # APISIX `cache_control` — only meaningful when written explicitly:
+    #   true  -> honor request Cache-Control (no-cache/no-store bypass) and let
+    #            origin max-age/s-maxage override ttl
+    #   false -> the configured ttl governs; request Cache-Control is ignored
+    #   (absent keeps pingsix legacy behavior: request no-cache bypasses and
+    #    origin freshness is honored per respect_s_maxage)
+    cache_control: false
+    consumer_isolation: true           # Add credential digest when caching authenticated requests
+    cache_set_cookie: false            # Alias for cache_set_cookie_responses
+    # APISIX alias for max_file_size_bytes — applies ONLY when the pingsix
+    # field above is absent (use one or the other):
+    max_resp_body_size: 67108864
+    cache_strategy: memory             # Explicit `disk` is rejected
 ```
 
 **Cache Plugin Features:**
@@ -2148,12 +2230,24 @@ plugins:
 - **s-maxage Support**: When enabled (default), respects `Cache-Control: s-maxage` directive from origin, overriding configured TTL for shared cache scenarios
 - **Selective Caching**: Control which HTTP methods and status codes are cacheable
 - **Pattern-Based Exclusion**: Use regex patterns to exclude specific URIs from caching
+- **APISIX aliases**: `cache_ttl`/`cache_method`/`cache_http_status` map onto the
+  pingsix fields above when present; `cache_key` templates support `$host`,
+  `$request_uri`, `$uri`, `$args`, `$arg_*`, `$http_*` (`$request_method` is
+  rejected — the method is not part of the cache identity and would break the
+  PURGE→GET key alias); an explicit `cache_key` containing `$http_authorization`
+  opts out of `consumer_isolation` (the operator owns the identity scheme).
+  `cache_bypass` skips cache lookup and `no_cache` suppresses storing for a
+  request when the **concatenated** rendering of the templates is non-empty
+  and not `"0"` (so `["0", "0"]` renders `"00"` and counts as truthy, like APISIX).
 - **Size Limits**: Prevent memory exhaustion by limiting cacheable response size
 - **Credential Safety**: Requests with `Authorization`, `Proxy-Authorization`, or `Cookie`, and any
   request where `basic-auth` / `key-auth` / `jwt-auth` observed credentials (custom header, query,
   or cookie carriers), bypass the shared cache by default—even if plugins later strip those
-  headers. Set `cache_authenticated_requests: true` only when responses are safely partitioned by
-  an explicit cache key.
+  headers. With `cache_authenticated_requests: true`, `consumer_isolation` partitions the cache
+  by a SHA-256 digest of the ORIGINAL standard credential headers (captured before any plugin
+  can strip them) combined with the digest of the credential each auth plugin verified — custom
+  header/query/cookie carriers included. Note the authenticated path additionally requires the
+  origin to mark responses `public` (or `must-revalidate`/`s-maxage`) before pingora stores them.
 - **Cookie Safety**: Responses with `Set-Cookie` bypass caching independently. Enabling authenticated request caching does not enable cookie-response caching; `cache_set_cookie_responses: true` is a separate high-risk opt-in that can replay cookies across shared-cache clients.
 - **Vary Support**: Generate cache keys based on specified request headers
 - **PURGE (opt-in)**: `enable_purge: true` makes the cache plugin intercept
@@ -2164,9 +2258,10 @@ plugins:
   `PURGE` request is treated as an ordinary client request and is forwarded
   upstream.
 - **Client Bypass Header**: A request carrying `X-ByPass-Cache` (any value)
-  skips the shared cache for that request; `Cache-Control: no-cache` has the
-  same effect. This header is honored on every request and is not
-  authenticated — treat it as a cache-bypass capability available to all
+  skips the shared cache for that request; `Cache-Control: no-cache` (or
+  `no-store`) has the same effect unless `cache_control: false` is set
+  explicitly. These headers are honored on every request and are not
+  authenticated — treat them as a cache-bypass capability available to all
   clients.
 
 **Common Use Cases:**
@@ -2247,8 +2342,14 @@ accumulate for the lifetime of the process rather than being reset per runtime.
 ```yaml
 plugins:
   file-logger:
-    # NOTE: The log file path must be configured globally under `pingsix.log.path`.
-    log_format: '$remote_addr - $remote_user [$time_local] "$request" $status $body_bytes_sent "$http_referer" "$http_user_agent"'
+    # Legacy behavior (no path): render the custom string below via the log crate.
+    log_format: '$remote_addr "$request_method $uri" $status'
+    # APISIX-compatible file mode: append one JSON line per request.
+    # path: /var/log/pingsix/access.log
+    include_req_body: false       # Include base64 request body in JSON entries
+    include_resp_body: false      # Include base64 response body in JSON entries
+    max_req_body_bytes: 524288    # Request body collection cap
+    max_resp_body_bytes: 524288   # Response body collection cap
 ```
 
 #### Request ID
@@ -2257,7 +2358,7 @@ plugins:
   request-id:
     header_name: X-Request-ID     # Header name for request ID
     include_in_response: true     # Include in response headers
-    algorithm: uuid               # 'uuid' or 'range_id'
+    algorithm: uuid               # uuid, nanoid, range_id, ksuid, uuidv7
     # Optional: configuration for 'range_id' algorithm
     range_id:
       char_set: "ABCDEF0123456789"
@@ -2267,19 +2368,35 @@ plugins:
 ### Utility Plugins
 
 #### Echo (Testing)
+
+APISIX semantics: the upstream response is proxied and its body is wrapped or
+replaced in the response phase (`before_body` prefix, `body` replacement at end
+of stream, `after_body` suffix). Compressed upstream bodies pass through
+unmodified.
+
 ```yaml
 plugins:
   echo:
-    body: "Hello, World!"         # Response body
+    before_body: "["             # Optional prefix (any one of the three is required)
+    body: "Hello, World!"         # Replace the upstream response body
+    after_body: "]"              # Optional suffix
     headers:                      # Response headers
       Content-Type: "text/plain"
       X-Echo: "true"
 ```
 
 #### gRPC Web
+
+Like APISIX, the plugin is strict: `OPTIONS` is answered locally as a CORS
+preflight (204, `Access-Control-Allow-Methods: POST`), only `POST` with a
+`application/grpc-web*` content type is proxied, and the body limit applies
+only to gRPC-Web requests.
+
 ```yaml
 plugins:
-  grpc-web: {}                    # Enable gRPC-Web support (zero-configuration)
+  grpc-web:
+    max_req_body_size: 67108864  # Request body cap (default)
+    cors_allow_headers: content-type,x-grpc-web,x-user-agent  # CORS allow headers
 ```
 
 ## Plugin Development
@@ -2972,7 +3089,7 @@ routes:
     uri: /static/{*filepath}        # Catch-all for /static/* requests
     upstream_id: "cdn-origin"
     plugins:
-      cache:
+      proxy-cache:
         ttl: 86400  # 24 hours
         cache_http_methods: ["GET", "HEAD"]
         cache_http_statuses: [200, 301, 404]
@@ -2987,7 +3104,7 @@ routes:
     uri: /api/{*path}               # Catch-all for /api/* requests
     upstream_id: "cdn-origin"
     plugins:
-      cache:
+      proxy-cache:
         ttl: 300  # 5 minutes
         cache_http_methods: ["GET"]
         cache_http_statuses: [200]

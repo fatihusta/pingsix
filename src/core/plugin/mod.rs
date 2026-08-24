@@ -10,6 +10,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use bytes::Bytes;
+use pingora_core::upstreams::peer::HttpPeer;
 use pingora_error::{Error, Result};
 use pingora_http::{RequestHeader, ResponseHeader};
 use pingora_proxy::Session;
@@ -73,6 +74,7 @@ impl PluginPhases {
     pub const RESPONSE: Self = Self(1 << 4);
     pub const RESPONSE_BODY: Self = Self(1 << 5);
     pub const LOGGING: Self = Self(1 << 6);
+    pub const UPSTREAM_PEER: Self = Self(1 << 7);
 
     pub const ALL: Self = Self(
         Self::EARLY_REQUEST.0
@@ -81,7 +83,8 @@ impl PluginPhases {
             | Self::REQUEST_BODY.0
             | Self::RESPONSE.0
             | Self::RESPONSE_BODY.0
-            | Self::LOGGING.0,
+            | Self::LOGGING.0
+            | Self::UPSTREAM_PEER.0,
     );
 
     pub const fn empty() -> Self {
@@ -229,6 +232,24 @@ pub trait ProxyPlugin: Send + Sync {
         _session: &mut Session,
         _body: &mut Option<Bytes>,
         _end_of_stream: bool,
+        _ctx: &mut ProxyContext,
+    ) -> Result<()> {
+        Ok(())
+    }
+
+    /// Adjust the selected upstream peer after route/upstream selection and
+    /// before the peer is handed to Pingora.
+    ///
+    /// Use this for request-scoped peer policy the plugin owns (timeout
+    /// floors, TLS verification overrides). Route-scoped policy (route
+    /// timeout, WebSocket relaxation) has already been applied by the
+    /// caller, so plugin adjustments run last in the precedence chain.
+    /// Invoked only when [`Self::phases`] declares
+    /// [`PluginPhases::UPSTREAM_PEER`].
+    fn upstream_peer_filter(
+        &self,
+        _session: &mut Session,
+        _peer: &mut HttpPeer,
         _ctx: &mut ProxyContext,
     ) -> Result<()> {
         Ok(())

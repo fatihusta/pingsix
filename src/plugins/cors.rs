@@ -60,6 +60,17 @@ pub struct PluginConfig {
 
     #[serde(skip_serializing_if = "Option::is_none")]
     pub allow_origins_by_regex: Option<Vec<String>>,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub timing_allow_origins: Option<String>,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub timing_allow_origins_by_regex: Option<Vec<String>>,
+
+    /// Accepted for APISIX schema compatibility. PingSIX has no plugin
+    /// metadata store, so a non-empty list is rejected during validation.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub allow_origins_by_metadata: Option<Vec<String>>,
 }
 
 impl PluginConfig {
@@ -83,17 +94,77 @@ impl PluginConfig {
                 "allow_credential cannot be used with allow_headers='*'; use '**' to reflect request headers",
             ));
         }
+        if self.allow_credential && self.allow_methods == "*" {
+            return Err(ValidationError::new(
+                "allow_credential cannot be used with allow_methods='*'",
+            ));
+        }
+        if self.allow_credential && self.expose_headers.as_deref() == Some("*") {
+            return Err(ValidationError::new(
+                "allow_credential cannot be used with expose_headers='*'",
+            ));
+        }
+        if self.allow_credential && self.timing_allow_origins.as_deref() == Some("*") {
+            return Err(ValidationError::new(
+                "allow_credential cannot be used with timing_allow_origins='*'",
+            ));
+        }
+        if let Some(timing_origins) = &self.timing_allow_origins {
+            Self::validate_origin_list(timing_origins, "timing_allow_origins")?;
+        }
+        if let Some(regexes) = &self.timing_allow_origins_by_regex {
+            if regexes.is_empty() {
+                return Err(ValidationError::new(
+                    "timing_allow_origins_by_regex must not be empty",
+                ));
+            }
+            let mut seen = HashSet::new();
+            for regex in regexes {
+                if regex.is_empty() {
+                    return Err(ValidationError::new(
+                        "timing_allow_origins_by_regex entries must not be empty",
+                    ));
+                }
+                if regex.chars().count() > 4096 {
+                    return Err(ValidationError::new(
+                        "timing_allow_origins_by_regex entries must be at most 4096 characters",
+                    ));
+                }
+                if !seen.insert(regex.as_str()) {
+                    return Err(ValidationError::new(
+                        "timing_allow_origins_by_regex entries must be unique",
+                    ));
+                }
+            }
+        }
+        if let Some(metadata) = &self.allow_origins_by_metadata {
+            if !metadata.is_empty() {
+                return Err(ValidationError::new("plugin metadata is not supported"));
+            }
+        }
         Ok(())
     }
 
     fn validate_origins(origins: &str) -> Result<(), ValidationError> {
-        if origins.is_empty() {
-            return Err(ValidationError::new("allow_origins cannot be empty"));
+        Self::validate_origin_list(origins, "allow_origins")
+    }
+
+    fn validate_origin_list(value: &str, field: &str) -> Result<(), ValidationError> {
+        if value.is_empty() {
+            let message = match field {
+                "timing_allow_origins" => "timing_allow_origins cannot be empty",
+                _ => "allow_origins cannot be empty",
+            };
+            return Err(ValidationError::new(message));
         }
-        if origins != "*" && origins != "**" {
-            for origin in origins.split(',').map(str::trim) {
+        if value != "*" && value != "**" {
+            for origin in value.split(',').map(str::trim) {
                 if origin.is_empty() {
-                    return Err(ValidationError::new("allow_origins contains empty origin"));
+                    let message = match field {
+                        "timing_allow_origins" => "timing_allow_origins contains empty origin",
+                        _ => "allow_origins contains empty origin",
+                    };
+                    return Err(ValidationError::new(message));
                 }
             }
         }
@@ -125,6 +196,16 @@ impl PluginConfig {
     }
 
     fn compile_and_optimize(self) -> ProxyResult<OptimizedPluginConfig> {
+        if self
+            .allow_origins_by_metadata
+            .as_ref()
+            .is_some_and(|metadata| !metadata.is_empty())
+        {
+            return Err(ProxyError::validation_error(
+                "plugin metadata is not supported",
+            ));
+        }
+
         // Pre-compile regex patterns
         let compiled_regexes = if let Some(regex_list) = &self.allow_origins_by_regex {
             let compiled: Vec<Arc<Regex>> = regex_list
@@ -145,19 +226,32 @@ impl PluginConfig {
             None
         };
 
-        // Pre-compile allowed origins set for faster lookup
-        let allow_origins_set = if self.allow_origins != "*" && self.allow_origins != "**" {
-            Some(
-                self.allow_origins
-                    .split(',')
-                    .map(str::trim)
-                    .filter(|s| !s.is_empty())
-                    .map(|s| s.to_string())
-                    .collect::<HashSet<String>>(),
-            )
+        let compiled_timing_regexes = if let Some(regex_list) = &self.timing_allow_origins_by_regex
+        {
+            let compiled: Vec<Arc<Regex>> = regex_list
+                .iter()
+                .map(|re| {
+                    Regex::new(re)
+                        .map(Arc::new)
+                        .map_err(|e| -> Box<pingora_error::Error> {
+                            ProxyError::validation_error(format!(
+                                "Invalid timing regex pattern '{re}': {e}"
+                            ))
+                            .into()
+                        })
+                })
+                .collect::<Result<Vec<_>>>()?;
+            Some(compiled)
         } else {
             None
         };
+
+        // Pre-compile allowed origins set for faster lookup
+        let allow_origins_set = compile_origins_set(&self.allow_origins);
+        let timing_allow_origins_set = self
+            .timing_allow_origins
+            .as_deref()
+            .and_then(compile_origins_set);
 
         Ok(OptimizedPluginConfig {
             allow_origins: self.allow_origins,
@@ -168,6 +262,9 @@ impl PluginConfig {
             allow_credential: self.allow_credential,
             allow_origins_by_regex: compiled_regexes,
             allow_origins_set,
+            timing_allow_origins: self.timing_allow_origins,
+            timing_allow_origins_by_regex: compiled_timing_regexes,
+            timing_allow_origins_set,
         })
     }
 }
@@ -183,6 +280,22 @@ impl TryFrom<JsonValue> for PluginConfig {
     }
 }
 
+/// Compile a comma-separated origin list into a lookup set. Wildcards and
+/// empty values produce `None`/are skipped; callers pre-validate the list.
+fn compile_origins_set(origins: &str) -> Option<HashSet<String>> {
+    if origins.is_empty() || origins == "*" || origins == "**" {
+        return None;
+    }
+    Some(
+        origins
+            .split(',')
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(|s| s.to_string())
+            .collect(),
+    )
+}
+
 #[derive(Debug)]
 pub struct OptimizedPluginConfig {
     pub allow_origins: String,
@@ -193,6 +306,9 @@ pub struct OptimizedPluginConfig {
     pub allow_credential: bool,
     pub allow_origins_by_regex: Option<Vec<Arc<Regex>>>,
     pub allow_origins_set: Option<HashSet<String>>, // Pre-compiled for faster lookup
+    pub timing_allow_origins: Option<String>,
+    pub timing_allow_origins_by_regex: Option<Vec<Arc<Regex>>>,
+    pub timing_allow_origins_set: Option<HashSet<String>>,
 }
 
 impl OptimizedPluginConfig {
@@ -224,6 +340,29 @@ impl OptimizedPluginConfig {
 
         false
     }
+
+    /// Value for `Timing-Allow-Origin` when the timing configuration matches
+    /// the request origin; `None` means the header stays unset. APISIX: `*` is
+    /// a literal wildcard (emitted even without an Origin header), `**`
+    /// reflects the request origin, and the regex list takes precedence over
+    /// the plain list.
+    fn timing_allow_origin_value<'a>(&self, origin: Option<&'a str>) -> Option<&'a str> {
+        if let Some(regex_list) = &self.timing_allow_origins_by_regex {
+            return origin.filter(|origin| regex_list.iter().any(|re| re.is_match(origin)));
+        }
+        let configured = self.timing_allow_origins.as_deref()?;
+        if configured == "*" {
+            return Some("*");
+        }
+        let origin = origin?;
+        if configured == "**" {
+            return Some(origin);
+        }
+        self.timing_allow_origins_set
+            .as_ref()
+            .filter(|set| set.contains(origin))
+            .map(|_| origin)
+    }
 }
 
 pub struct PluginCors {
@@ -235,10 +374,25 @@ impl PluginCors {
         let origin = request::get_req_header_value(session.req_header(), header::ORIGIN.as_str())
             .map(|s| s.to_string());
 
-        if let Some(origin) = origin {
-            if self.config.is_origin_allowed(&origin) {
-                self.apply_cors_headers_with_origin(session, resp, &origin)?;
+        if let Some(origin) = &origin {
+            if self.config.is_origin_allowed(origin) {
+                self.apply_cors_headers_with_origin(session, resp, origin)?;
             }
+        }
+        // `Timing-Allow-Origin` is computed from the raw Origin independently
+        // of the CORS allow outcome — APISIX emits it in header_filter for
+        // every response, and a browser needs it even when the origin is not
+        // allowed to read CORS-protected resources.
+        self.apply_timing_allow_origin(resp, origin.as_deref())
+    }
+
+    fn apply_timing_allow_origin(
+        &self,
+        resp: &mut ResponseHeader,
+        origin: Option<&str>,
+    ) -> Result<()> {
+        if let Some(timing_origin) = self.config.timing_allow_origin_value(origin) {
+            resp.insert_header("Timing-Allow-Origin", timing_origin)?;
         }
         Ok(())
     }
@@ -326,6 +480,8 @@ impl PluginCors {
         let origin = origin.expect("allowed implies origin is Some");
         let mut resp = ResponseHeader::build(StatusCode::NO_CONTENT, None)?;
         self.apply_cors_headers_with_origin(session, &mut resp, &origin)?;
+        // APISIX's header_filter runs for preflight responses too.
+        self.apply_timing_allow_origin(&mut resp, Some(&origin))?;
         Ok(Some(resp))
     }
 }
@@ -449,6 +605,29 @@ mod tests {
     }
 
     #[test]
+    fn credentials_reject_all_remaining_wildcards() {
+        let base = || PluginConfig {
+            allow_origins: "https://example.com".into(),
+            allow_headers: "Content-Type".into(),
+            allow_methods: "GET".into(),
+            allow_credential: true,
+            ..Default::default()
+        };
+
+        let mut wildcard_methods = base();
+        wildcard_methods.allow_methods = "*".into();
+        assert!(wildcard_methods.validate().is_err());
+
+        let mut wildcard_expose = base();
+        wildcard_expose.expose_headers = Some("*".into());
+        assert!(wildcard_expose.validate().is_err());
+
+        let mut wildcard_timing = base();
+        wildcard_timing.timing_allow_origins = Some("*".into());
+        assert!(wildcard_timing.validate().is_err());
+    }
+
+    #[test]
     fn wildcard_methods_only_allow_advertised_methods() {
         assert!(method_is_allowed("**", "GET"));
         assert!(!method_is_allowed("**", "CONNECT"));
@@ -482,5 +661,231 @@ mod tests {
         assert!(vary
             .to_ascii_lowercase()
             .contains("access-control-request-headers"));
+    }
+
+    fn optimized(cfg: PluginConfig) -> OptimizedPluginConfig {
+        cfg.compile_and_optimize().expect("config compiles")
+    }
+
+    #[test]
+    fn timing_allow_origins_parses_and_validates() {
+        let cfg: PluginConfig =
+            PluginConfig::try_from(serde_json::json!({ "timing_allow_origins": "*" })).unwrap();
+        assert_eq!(cfg.timing_allow_origins.as_deref(), Some("*"));
+
+        assert!(PluginConfig::try_from(serde_json::json!({ "timing_allow_origins": "" })).is_err());
+        assert!(PluginConfig::try_from(serde_json::json!({
+            "timing_allow_origins": "a.example, ,b.example"
+        }))
+        .is_err());
+    }
+
+    #[test]
+    fn timing_regexes_must_be_nonempty_unique() {
+        assert!(PluginConfig::try_from(serde_json::json!({
+            "timing_allow_origins_by_regex": []
+        }))
+        .is_err());
+        assert!(PluginConfig::try_from(serde_json::json!({
+            "timing_allow_origins_by_regex": ["^https://a$", "^https://a$"]
+        }))
+        .is_err());
+        assert!(PluginConfig::try_from(serde_json::json!({
+            "timing_allow_origins_by_regex": [""]
+        }))
+        .is_err());
+        assert!(PluginConfig::try_from(serde_json::json!({
+            "timing_allow_origins_by_regex": ["^https://a$", "^https://b$"]
+        }))
+        .is_ok());
+    }
+
+    #[test]
+    fn timing_regex_invalid_pattern_is_rejected_at_compile() {
+        let cfg = PluginConfig::try_from(serde_json::json!({
+            "timing_allow_origins_by_regex": ["("]
+        }))
+        .unwrap();
+        assert!(cfg.compile_and_optimize().is_err());
+    }
+
+    #[test]
+    fn timing_allow_origin_matches_configuration() {
+        let wildcard = optimized(PluginConfig {
+            allow_origins: "*".into(),
+            timing_allow_origins: Some("*".into()),
+            ..Default::default()
+        });
+        assert_eq!(
+            wildcard.timing_allow_origin_value(Some("https://x.example")),
+            Some("*")
+        );
+        // APISIX emits the literal wildcard even without an Origin header.
+        assert_eq!(wildcard.timing_allow_origin_value(None), Some("*"));
+
+        let reflected = optimized(PluginConfig {
+            allow_origins: "*".into(),
+            timing_allow_origins: Some("**".into()),
+            ..Default::default()
+        });
+        assert_eq!(
+            reflected.timing_allow_origin_value(Some("https://x.example")),
+            Some("https://x.example")
+        );
+        assert_eq!(reflected.timing_allow_origin_value(None), None);
+
+        let listed = optimized(PluginConfig {
+            allow_origins: "*".into(),
+            timing_allow_origins: Some("https://a.example,https://b.example".into()),
+            ..Default::default()
+        });
+        assert_eq!(
+            listed.timing_allow_origin_value(Some("https://a.example")),
+            Some("https://a.example")
+        );
+        assert_eq!(
+            listed.timing_allow_origin_value(Some("https://c.example")),
+            None
+        );
+
+        let regex = optimized(PluginConfig {
+            allow_origins: "*".into(),
+            timing_allow_origins_by_regex: Some(vec!["^https://[a-z]+\\.example$".into()]),
+            ..Default::default()
+        });
+        assert_eq!(
+            regex.timing_allow_origin_value(Some("https://api.example")),
+            Some("https://api.example")
+        );
+        assert_eq!(
+            regex.timing_allow_origin_value(Some("https://other.test")),
+            None
+        );
+
+        // APISIX gives the regex list precedence: the plain list is ignored
+        // when both are configured.
+        let regex_precedence = optimized(PluginConfig {
+            allow_origins: "*".into(),
+            timing_allow_origins: Some("https://plain.example".into()),
+            timing_allow_origins_by_regex: Some(vec!["^https://api\\.example$".into()]),
+            ..Default::default()
+        });
+        assert_eq!(
+            regex_precedence.timing_allow_origin_value(Some("https://api.example")),
+            Some("https://api.example")
+        );
+        assert_eq!(
+            regex_precedence.timing_allow_origin_value(Some("https://plain.example")),
+            None,
+            "plain-list match must be ignored when the regex list is configured"
+        );
+
+        let unconfigured = optimized(PluginConfig::default());
+        assert_eq!(
+            unconfigured.timing_allow_origin_value(Some("https://x.example")),
+            None
+        );
+    }
+
+    #[test]
+    fn timing_regex_entries_are_capped_at_4096_characters() {
+        let long = "a".repeat(4097);
+        assert!(PluginConfig::try_from(serde_json::json!({
+            "timing_allow_origins_by_regex": [long]
+        }))
+        .is_err());
+        let ok = "a".repeat(4096);
+        assert!(PluginConfig::try_from(serde_json::json!({
+            "timing_allow_origins_by_regex": [ok]
+        }))
+        .is_ok());
+    }
+
+    async fn cors_session(method: &str, headers: &[&str]) -> Session {
+        use tokio::io::AsyncWriteExt;
+
+        let (client, mut server) = tokio::io::duplex(1024);
+        let mut request = format!("{method} / HTTP/1.1\r\nHost: t\r\n");
+        for header in headers {
+            request.push_str(&format!("{header}\r\n"));
+        }
+        request.push_str("\r\n");
+        server.write_all(request.as_bytes()).await.unwrap();
+        drop(server);
+        let mut session = Session::new_h1(Box::new(client));
+        session.downstream_session.read_request().await.unwrap();
+        session
+    }
+
+    #[tokio::test]
+    async fn timing_allow_origin_is_emitted_independently_of_cors_allow() {
+        // The timing match is computed from the raw Origin even when the
+        // origin is NOT allowed for CORS (and even with no Origin at all
+        // when the wildcard is configured).
+        let cfg = optimized(PluginConfig {
+            allow_origins: "https://app.example".into(),
+            timing_allow_origins: Some("*".into()),
+            ..Default::default()
+        });
+        let plugin = PluginCors { config: cfg };
+
+        let mut session = cors_session("GET", &["Origin: https://other.example"]).await;
+        let mut resp = ResponseHeader::build(200, None).unwrap();
+        plugin.apply_cors_headers(&mut session, &mut resp).unwrap();
+        assert!(
+            resp.headers.get("Access-Control-Allow-Origin").is_none(),
+            "not-allowed origin must not get ACAO"
+        );
+        assert_eq!(
+            resp.headers.get("Timing-Allow-Origin").unwrap(),
+            "*",
+            "TAO must be emitted independently of the CORS allow outcome"
+        );
+
+        // No Origin header at all: the literal wildcard is still emitted.
+        let mut session = cors_session("GET", &[]).await;
+        let mut resp = ResponseHeader::build(200, None).unwrap();
+        plugin.apply_cors_headers(&mut session, &mut resp).unwrap();
+        assert_eq!(resp.headers.get("Timing-Allow-Origin").unwrap(), "*");
+    }
+
+    #[tokio::test]
+    async fn preflight_response_carries_timing_allow_origin() {
+        let cfg = optimized(PluginConfig {
+            allow_origins: "*".into(),
+            allow_methods: "GET".into(),
+            timing_allow_origins: Some("**".into()),
+            ..Default::default()
+        });
+        let plugin = PluginCors { config: cfg };
+        let mut session = cors_session(
+            "OPTIONS",
+            &[
+                "Origin: https://app.example",
+                "Access-Control-Request-Method: GET",
+            ],
+        )
+        .await;
+        let resp = plugin
+            .handle_options_request(&mut session)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            resp.headers.get("Timing-Allow-Origin").unwrap(),
+            "https://app.example"
+        );
+    }
+
+    #[test]
+    fn allow_origins_by_metadata_is_rejected_when_nonempty() {
+        let err =
+            PluginConfig::try_from(serde_json::json!({ "allow_origins_by_metadata": ["foo"] }))
+                .unwrap_err();
+        assert!(err.to_string().contains("plugin metadata is not supported"));
+
+        // An empty metadata list is accepted for schema compatibility.
+        assert!(
+            PluginConfig::try_from(serde_json::json!({ "allow_origins_by_metadata": [] })).is_ok()
+        );
     }
 }

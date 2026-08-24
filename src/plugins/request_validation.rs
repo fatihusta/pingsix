@@ -61,7 +61,6 @@ pub fn create_request_validation_plugin(
 
 /// APISIX `request-validation` schema.
 #[derive(Debug, Serialize, Deserialize, Validate)]
-#[serde(deny_unknown_fields)]
 struct PluginConfig {
     /// JSON Schema validated against the request headers.
     header_schema: Option<JsonValue>,
@@ -468,11 +467,11 @@ mod tests {
     }
 
     #[test]
-    fn config_rejects_unknown_fields() {
+    fn config_tolerates_unknown_fields() {
         assert!(PluginConfig::try_from(serde_json::json!({
             "header_schema": {"type": "object"}, "typo": true
         }))
-        .is_err());
+        .is_ok());
     }
 
     #[test]

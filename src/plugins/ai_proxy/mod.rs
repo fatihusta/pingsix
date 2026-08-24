@@ -18,6 +18,8 @@
 //! request_body_filter     buffer client chunks (bounded), transform at end
 //!                         of stream, inject the transformed body as one
 //!                         chunk, mark the body as gateway-replaced
+//! upstream_peer_filter    owning-instance peer policy (read-timeout floor,
+//!                         `ssl_verify`) applied to the selected peer
 //! ```
 //!
 //! The response side is pure passthrough (APISIX ai-proxy semantics).
@@ -64,11 +66,13 @@ mod upstream;
 use async_trait::async_trait;
 use bytes::{Bytes, BytesMut};
 use http::HeaderMap;
+use pingora_core::upstreams::peer::HttpPeer;
 use pingora_error::{Error, ErrorType, Result};
 use pingora_http::RequestHeader;
 use pingora_proxy::Session;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
 
 use crate::core::{PluginPhases, ProxyContext, ProxyError, ProxyPlugin, UpstreamSelector};
 use crate::utils::response::send_exit_response;
@@ -94,7 +98,7 @@ const PRIORITY: i32 = 2900;
 
 /// ctx key holding the per-request [`AiProxyRequestState`]; written exactly
 /// once by the owning instance in `request_filter` and read by every later
-/// hook (including [`HttpService::upstream_peer`](crate::service::http::HttpService)).
+/// hook (including this plugin's `upstream_peer_filter`).
 pub(crate) const CTX_KEY_STATE: &str = "ai_proxy::state";
 
 /// Floor for the upstream read timeout on ai-proxy requests (seconds).
@@ -108,6 +112,44 @@ pub(crate) const CTX_KEY_STATE: &str = "ai_proxy::state";
 /// `timeout` keeps bounding connect and write. A total-duration bound
 /// (`max_stream_duration_ms`) is v2.
 pub(crate) const PROVIDER_READ_TIMEOUT_FLOOR_SECS: u64 = 600;
+
+/// Apply this plugin's request-scoped peer policy onto the selected peer.
+///
+/// Both settings travel on the ai-proxy request state (written once by the
+/// owning plugin instance) because peer options cannot be expressed on the
+/// upstream resource (its TLS block carries only client certificates) and
+/// must reflect the owning instance's configuration:
+///
+/// * read-timeout floor (every ai-proxy request): the configured value is
+///   lifted to [`PROVIDER_READ_TIMEOUT_FLOOR_SECS`] instead of being removed —
+///   a stalled provider can no longer hold a connection forever. The write
+///   timeout stays untouched as client-side abuse protection.
+/// * `ssl_verify: false`: disable certificate verification for the selected
+///   provider peer.
+fn apply_request_peer_options(ctx: &ProxyContext, peer: &mut HttpPeer) {
+    let Some(state) = ctx.get::<AiProxyRequestState>(CTX_KEY_STATE) else {
+        return;
+    };
+    let floor = Duration::from_secs(PROVIDER_READ_TIMEOUT_FLOOR_SECS);
+    if peer
+        .options
+        .read_timeout
+        .is_none_or(|current| current < floor)
+    {
+        peer.options.read_timeout = Some(floor);
+        log::debug!(
+            "ai-proxy request: upstream read_timeout floored at {}s",
+            floor.as_secs()
+        );
+    }
+    if state.insecure_tls {
+        peer.options.verify_cert = false;
+        peer.options.verify_hostname = false;
+        log::debug!(
+            "ai-proxy request: disabled upstream certificate verification (ssl_verify=false)"
+        );
+    }
+}
 
 /// Identity tokens for plugin instances (see [`AiProxyRequestState::token`]).
 fn next_instance_token() -> u64 {
@@ -320,7 +362,10 @@ impl ProxyPlugin for PluginAiProxy {
     }
 
     fn phases(&self) -> PluginPhases {
-        PluginPhases::REQUEST | PluginPhases::UPSTREAM_REQUEST | PluginPhases::REQUEST_BODY
+        PluginPhases::REQUEST
+            | PluginPhases::UPSTREAM_REQUEST
+            | PluginPhases::REQUEST_BODY
+            | PluginPhases::UPSTREAM_PEER
     }
 
     async fn request_filter(&self, session: &mut Session, ctx: &mut ProxyContext) -> Result<bool> {
@@ -517,6 +562,21 @@ impl ProxyPlugin for PluginAiProxy {
         ctx.mark_request_body_replaced();
 
         *body = Some(transformed.body);
+        Ok(())
+    }
+
+    fn upstream_peer_filter(
+        &self,
+        _session: &mut Session,
+        peer: &mut HttpPeer,
+        ctx: &mut ProxyContext,
+    ) -> Result<()> {
+        // Only the instance that claimed this request applies its peer
+        // policy; yielded or duplicate instances never touch the peer.
+        if !self.owns_request(ctx) {
+            return Ok(());
+        }
+        apply_request_peer_options(ctx, peer);
         Ok(())
     }
 }
@@ -774,12 +834,14 @@ mod tests {
 
     #[tokio::test]
     async fn first_instance_claims_and_later_instances_noop() {
+        // The claiming instance disables provider TLS verification
+        // (ssl_verify=false); the later instance keeps it on.
         let first = build_with_scope(
-            instance_config(19099, "first-key", true),
+            instance_config(19099, "first-key", false),
             PluginScope::Route,
         );
         let second = build_with_scope(
-            instance_config(19098, "second-key", false),
+            instance_config(19098, "second-key", true),
             PluginScope::Route,
         );
 
@@ -816,6 +878,30 @@ mod tests {
             .unwrap();
         assert_eq!(upstream_request.uri.path(), "/llm");
         assert!(upstream_request.headers.get("Authorization").is_none());
+
+        // ...and does not apply its peer policy onto the selected peer
+        // (only the owning instance may; a non-owner's stricter or looser
+        // TLS/timeout settings must never leak onto the peer).
+        let mut peer = configured_peer(60);
+        second
+            .upstream_peer_filter(&mut session, &mut peer, &mut ctx)
+            .unwrap();
+        assert_eq!(peer.options.read_timeout, Some(Duration::from_secs(60)));
+        assert!(
+            peer.options.verify_cert,
+            "non-owner must not touch the peer"
+        );
+
+        // The owning instance does apply its policy: read-timeout floor and
+        // ssl_verify=false disabling provider certificate verification.
+        first
+            .upstream_peer_filter(&mut session, &mut peer, &mut ctx)
+            .unwrap();
+        assert_eq!(
+            peer.options.read_timeout,
+            Some(Duration::from_secs(PROVIDER_READ_TIMEOUT_FLOOR_SECS))
+        );
+        assert!(!peer.options.verify_cert);
 
         first
             .upstream_request_filter(&mut session, &mut upstream_request, &mut ctx)
@@ -917,6 +1003,86 @@ mod tests {
             ctx.get::<AiProxyRequestState>(CTX_KEY_STATE)
                 .unwrap()
                 .insecure_tls
+        );
+    }
+
+    fn configured_peer(read_secs: u64) -> HttpPeer {
+        let mut peer = HttpPeer::new("127.0.0.1:9443", true, "provider.internal".to_string());
+        peer.options.read_timeout = Some(Duration::from_secs(read_secs));
+        peer.options.write_timeout = Some(Duration::from_secs(60));
+        peer.options.verify_cert = true;
+        peer.options.verify_hostname = true;
+        peer
+    }
+
+    fn request_state(insecure_tls: bool) -> AiProxyRequestState {
+        AiProxyRequestState {
+            token: 1,
+            insecure_tls,
+            streaming: false,
+            body: BytesMut::new(),
+        }
+    }
+
+    #[test]
+    fn peer_options_floor_read_timeout_without_touching_write_or_tls() {
+        let floor = Duration::from_secs(PROVIDER_READ_TIMEOUT_FLOOR_SECS);
+
+        // Without ai-proxy state the peer is untouched.
+        let mut ctx = ProxyContext::default();
+        let mut peer = configured_peer(60);
+        apply_request_peer_options(&ctx, &mut peer);
+        assert_eq!(peer.options.read_timeout, Some(Duration::from_secs(60)));
+        assert_eq!(peer.options.write_timeout, Some(Duration::from_secs(60)));
+        assert!(peer.options.verify_cert);
+
+        // With state, a short read timeout is lifted to the generous floor:
+        // ai-proxy requests must not be killed between upstream reads, but a
+        // stalled provider is still dropped after the floor.
+        ctx.set(CTX_KEY_STATE, request_state(false));
+        apply_request_peer_options(&ctx, &mut peer);
+        assert_eq!(peer.options.read_timeout, Some(floor));
+        assert_eq!(
+            peer.options.write_timeout,
+            Some(Duration::from_secs(60)),
+            "write timeout stays as abuse protection"
+        );
+        assert!(
+            peer.options.verify_cert,
+            "the read floor alone must not touch TLS"
+        );
+
+        // A peer with no configured read timeout is floored too (the
+        // `is_none_or` None branch): an ai-proxy request never inherits an
+        // unbounded read.
+        let mut peer = configured_peer(60);
+        peer.options.read_timeout = None;
+        apply_request_peer_options(&ctx, &mut peer);
+        assert_eq!(peer.options.read_timeout, Some(floor));
+
+        // A configured read timeout above the floor is preserved.
+        let mut peer = configured_peer(3600);
+        apply_request_peer_options(&ctx, &mut peer);
+        assert_eq!(peer.options.read_timeout, Some(Duration::from_secs(3600)));
+    }
+
+    #[test]
+    fn peer_options_insecure_state_disables_cert_verification_only() {
+        let mut ctx = ProxyContext::default();
+        ctx.set(CTX_KEY_STATE, request_state(true));
+        let mut peer = configured_peer(3600);
+        apply_request_peer_options(&ctx, &mut peer);
+        assert!(!peer.options.verify_cert);
+        assert!(!peer.options.verify_hostname);
+        assert_eq!(
+            peer.options.read_timeout,
+            Some(Duration::from_secs(3600)),
+            "insecure TLS alone must not touch timeouts"
+        );
+        assert_eq!(
+            peer.options.write_timeout,
+            Some(Duration::from_secs(60)),
+            "insecure TLS alone must not touch the write timeout"
         );
     }
 

@@ -161,11 +161,40 @@ pub fn http_exchange(
             resp_headers.push((k.trim().to_string(), v.trim().to_string()));
         }
     }
+    let chunked = resp_headers.iter().any(|(name, value)| {
+        name.eq_ignore_ascii_case("transfer-encoding")
+            && value
+                .split(',')
+                .any(|encoding| encoding.trim().eq_ignore_ascii_case("chunked"))
+    });
+    let body = if chunked {
+        decode_chunked_body(body_part.as_bytes())?
+    } else {
+        body_part.as_bytes().to_vec()
+    };
     Some(HttpResponse {
         status,
         headers: resp_headers,
-        body: body_part.to_string(),
+        body: String::from_utf8_lossy(&body).into_owned(),
     })
+}
+
+fn decode_chunked_body(mut input: &[u8]) -> Option<Vec<u8>> {
+    let mut output = Vec::new();
+    loop {
+        let line_end = input.windows(2).position(|window| window == b"\r\n")?;
+        let size_text = std::str::from_utf8(&input[..line_end]).ok()?;
+        let size = usize::from_str_radix(size_text.split(';').next()?.trim(), 16).ok()?;
+        input = &input[line_end + 2..];
+        if size == 0 {
+            return Some(output);
+        }
+        if input.len() < size + 2 || &input[size..size + 2] != b"\r\n" {
+            return None;
+        }
+        output.extend_from_slice(&input[..size]);
+        input = &input[size + 2..];
+    }
 }
 
 pub fn http_status(addr: &str, path: &str) -> Option<u16> {

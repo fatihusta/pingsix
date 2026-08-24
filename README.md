@@ -87,6 +87,11 @@ curl http://localhost:8080/get
 
 PingSIX includes 29 built-in plugins organized by category:
 
+> **Upgrading from an earlier build:** the `cache` plugin was renamed to
+> `proxy-cache` (breaking, no alias). Rewrite every `cache:` plugin key in
+> static configs and etcd route/global-rule data to `proxy-cache:` **before**
+> deploying — a single stale key fails the whole config snapshot build.
+
 ### 🔐 Authentication & Security
 - **`jwt-auth`** - JWT token validation with multiple algorithms
 - **`key-auth`** - API key authentication with rotation support
@@ -108,7 +113,7 @@ PingSIX includes 29 built-in plugins organized by category:
 - **`proxy-rewrite`** - Request modification
 - **`response-rewrite`** - Response headers modification
 - **`redirect`** - HTTP redirects with regex support
-- **`cache`** - Response caching with TTL, opt-in PURGE, and conditions
+- **`proxy-cache`** - Response caching with TTL, opt-in PURGE, and conditions
 - **`client-control`** - Request body size limiting (413 enforcement)
 
 ### 🤖 AI / LLM
@@ -126,7 +131,7 @@ PingSIX includes 29 built-in plugins organized by category:
 - **`grpc-web`** - gRPC-Web protocol support
 
 ### 🛠️ Utilities & Testing
-- **`echo`** - Testing and debugging responses
+- **`echo`** - Wrap or replace upstream response bodies for testing
 - **`fault-injection`** - Chaos engineering with delay and abort injection
 
 > 📖 For detailed plugin configuration, see the [Plugin Documentation](USER_GUIDE.md#plugins)

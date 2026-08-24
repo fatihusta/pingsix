@@ -15,7 +15,7 @@ use crate::{
         constant_time_digest_eq, secret_digest, PluginPhases, ProxyContext, ProxyError,
         ProxyPlugin, ProxyResult,
     },
-    plugins::config::parse_and_validate_plugin_config,
+    plugins::config::{parse_and_validate_plugin_config, validate_apisix_realm},
     utils::{request, response::ResponseBuilder},
 };
 
@@ -47,6 +47,11 @@ struct PluginConfig {
     password: String,
     #[serde(default)]
     hide_credentials: bool,
+    /// Realm advertised in the `WWW-Authenticate` challenge. APISIX's default
+    /// would be `basic`, but pingsix keeps its legacy `realm="pingsix"`
+    /// challenge unless a realm is configured explicitly.
+    #[serde(default)]
+    realm: Option<String>,
 }
 
 impl TryFrom<JsonValue> for PluginConfig {
@@ -55,6 +60,9 @@ impl TryFrom<JsonValue> for PluginConfig {
     fn try_from(value: JsonValue) -> Result<Self, Self::Error> {
         let config: PluginConfig =
             parse_and_validate_plugin_config(value, "Failed to parse basic auth plugin config")?;
+        if let Some(realm) = config.realm.as_deref() {
+            validate_apisix_realm(realm).map_err(ProxyError::from)?;
+        }
         Ok(config)
     }
 }
@@ -66,6 +74,13 @@ pub struct PluginBasicAuth {
 }
 
 impl PluginBasicAuth {
+    fn build_challenge(&self) -> String {
+        match self.config.realm.as_deref() {
+            Some(realm) => format!("Basic realm=\"{realm}\""),
+            None => "Basic realm=\"pingsix\"".to_string(),
+        }
+    }
+
     /// Validates Basic Authentication credentials using constant-time comparison.
     ///
     /// This method:
@@ -129,14 +144,21 @@ impl ProxyPlugin for PluginBasicAuth {
 
         if !is_valid {
             // Return 401 and include the standard Basic challenge header
+            let challenge = self.build_challenge();
             ResponseBuilder::send_proxy_error(
                 session,
                 StatusCode::UNAUTHORIZED,
                 Some("Invalid user authorization"),
-                Some(&[("WWW-Authenticate", "Basic realm=\"pingsix\"")]),
+                Some(&[("WWW-Authenticate", challenge.as_str())]),
             )
             .await?;
             return Ok(true);
+        }
+
+        // Record the verified credential for shared-cache consumer
+        // isolation before it can be stripped from the upstream request.
+        if let Some(credential) = auth_header {
+            ctx.note_request_credential(credential);
         }
 
         // Hide credentials by removing the Authorization header before forwarding upstream
@@ -162,6 +184,7 @@ mod tests {
                 username: username.to_string(),
                 password: password.to_string(),
                 hide_credentials: false,
+                realm: None,
             },
             username_digest: secret_digest(username),
             password_digest: secret_digest(password),
@@ -186,6 +209,72 @@ mod tests {
         let plugin = build_plugin("demo", "s3cret");
         let header = format!("Basic {}", general_purpose::STANDARD.encode("demo:s3cret"));
         assert!(plugin.validate_credentials(&header));
+    }
+
+    #[test]
+    fn realm_is_optional_and_defaults_to_legacy_challenge() {
+        let config = PluginConfig::try_from(serde_json::json!({
+            "username": "demo",
+            "password": "s3cret",
+        }))
+        .unwrap();
+        assert_eq!(config.realm, None);
+
+        let plugin = build_plugin("demo", "s3cret");
+        assert_eq!(plugin.build_challenge(), "Basic realm=\"pingsix\"");
+    }
+
+    #[test]
+    fn custom_realm_is_used_in_challenge() {
+        let plugin = PluginBasicAuth {
+            config: PluginConfig {
+                username: "demo".to_string(),
+                password: "s3cret".to_string(),
+                hide_credentials: false,
+                realm: Some("secure-area".to_string()),
+            },
+            username_digest: secret_digest("demo"),
+            password_digest: secret_digest("s3cret"),
+        };
+        assert_eq!(plugin.build_challenge(), "Basic realm=\"secure-area\"");
+    }
+
+    #[test]
+    fn invalid_realms_are_rejected() {
+        for invalid in ["", "a\"b", "a\\b", "caf\u{e9}"] {
+            let err = PluginConfig::try_from(serde_json::json!({
+                "username": "demo",
+                "password": "s3cret",
+                "realm": invalid,
+            }))
+            .expect_err("invalid realm must be rejected");
+            assert!(err.to_string().contains("realm"), "{err}");
+        }
+
+        let long_realm = "a".repeat(129);
+        let err = PluginConfig::try_from(serde_json::json!({
+            "username": "demo",
+            "password": "s3cret",
+            "realm": long_realm,
+        }))
+        .expect_err("overlong realm must be rejected");
+        assert!(err.to_string().contains("realm"), "{err}");
+    }
+
+    #[test]
+    fn apisix_consumer_fields_are_ignored() {
+        // APISIX uses consumer objects for credentials; PingSIX keeps them in
+        // the plugin config. Unknown fields such as `anonymous_consumer` are
+        // tolerated and ignored — authentication stays enforced with the
+        // configured credentials.
+        let config = PluginConfig::try_from(serde_json::json!({
+            "username": "demo",
+            "password": "s3cret",
+            "anonymous_consumer": "anonymous"
+        }))
+        .expect("unknown fields are tolerated");
+        assert_eq!(config.username, "demo");
+        assert_eq!(config.password, "s3cret");
     }
 
     #[test]

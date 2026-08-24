@@ -345,7 +345,6 @@ mod tests {
         nodes.insert("127.0.0.1:8080".into(), 1);
         Upstream {
             id: id.into(),
-            name: None,
             retries: None,
             retry_timeout: None,
             timeout: None,
