@@ -50,6 +50,17 @@ pub fn create_jwt_auth_plugin(
     }))
 }
 
+/// `PLUGIN_META::validate` capability: parse the typed config and run its
+/// validators (including the decoding-key derivation) WITHOUT constructing
+/// the plugin.
+pub fn validate_jwt_auth_config(cfg: &JsonValue) -> ProxyResult<()> {
+    let config = PluginConfig::try_from(cfg.clone())?;
+    config.get_decoding_key().map_err(|e| {
+        ProxyError::Configuration(format!("Failed to create JWT decoding key: {e}"))
+    })?;
+    Ok(())
+}
+
 /// Configuration for the JWT Auth plugin.
 #[derive(Debug, Clone, Serialize, Deserialize, EncryptFields, Validate)]
 #[encrypt_fields(export)]

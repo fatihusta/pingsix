@@ -178,6 +178,17 @@ pub fn create_prometheus_plugin(
     }))
 }
 
+/// `PLUGIN_META::validate` capability: parse the config WITHOUT constructing
+/// the plugin (no metric-label state allocated).
+pub fn validate_prometheus_config(cfg: &JsonValue) -> ProxyResult<()> {
+    if !cfg.is_null() {
+        serde_json::from_value::<PrometheusConfig>(cfg.clone()).map_err(|e| {
+            ProxyError::serialization_error("Failed to parse prometheus plugin config", e)
+        })?;
+    }
+    Ok(())
+}
+
 pub struct PluginPrometheus {
     config: PrometheusConfig,
     /// Set of unique normalized paths seen so far

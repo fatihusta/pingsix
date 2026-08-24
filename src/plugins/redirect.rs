@@ -60,6 +60,27 @@ pub fn create_redirect_plugin(
     }))
 }
 
+/// `PLUGIN_META::validate` capability: parse the typed config and run its
+/// validators (the `regex_uri` compile and `trusted_proxies` network parse)
+/// WITHOUT constructing the plugin.
+pub fn validate_redirect_config(cfg: &JsonValue) -> ProxyResult<()> {
+    let config = PluginConfig::try_from(cfg.clone())?;
+    for i in (0..config.regex_uri.len()).step_by(2) {
+        let pattern = &config.regex_uri[i];
+        Regex::new(pattern).map_err(|e| {
+            ProxyError::Plugin(format!("Invalid redirect regex pattern '{pattern}': {e}"))
+        })?;
+    }
+    for network in &config.trusted_proxies {
+        network.parse::<IpNetwork>().map_err(|e| {
+            ProxyError::validation_error(format!(
+                "Invalid trusted_proxies network '{network}': {e}"
+            ))
+        })?;
+    }
+    Ok(())
+}
+
 #[derive(Default, Debug, Serialize, Deserialize, Validate)]
 struct PluginConfig {
     /// If true, redirects HTTP requests to HTTPS. Takes precedence over `uri` and `regex_uri`.

@@ -1,5 +1,4 @@
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -21,26 +20,12 @@ use crate::{
     config::UpstreamHashOn,
     core::{ProxyContext, ProxyError, ProxyPlugin, ProxyResult},
     plugins::config::{parse_and_validate_plugin_config, HeaderValue},
+    plugins::ctx_keys::next_instance_ctx_key,
     utils::{apisix_vars::match_apisix_vars, request::request_selector_key},
 };
 
 pub const PLUGIN_NAME: &str = "response-rewrite";
 const PRIORITY: i32 = 899;
-
-/// Uniquely names every response-rewrite instance's context markers. A
-/// request can carry both a global and a route instance, and their buffers
-/// must never share keys.
-static NEXT_INSTANCE_ID: AtomicU64 = AtomicU64::new(1);
-
-/// Per-request context markers and buffers owned by this plugin.
-fn context_keys(instance_id: u64) -> ContextKeys {
-    ContextKeys {
-        matched: format!("pingsix_response_rewrite_matched_{instance_id}"),
-        body_buffer: format!("pingsix_response_rewrite_body_buffer_{instance_id}"),
-        body_too_large: format!("pingsix_response_rewrite_body_too_large_{instance_id}"),
-        skip_body_rewrite: format!("pingsix_response_rewrite_skip_body_{instance_id}"),
-    }
-}
 
 /// APISIX master default: 64 MiB.
 const DEFAULT_MAX_RESP_BODY_SIZE: u64 = 64 * 1024 * 1024;
@@ -52,6 +37,14 @@ pub fn create_response_rewrite_plugin(
 ) -> ProxyResult<Arc<dyn ProxyPlugin>> {
     let (config, compiled) = PluginConfig::build(cfg)?;
     Ok(Arc::new(PluginResponseRewrite { config, compiled }))
+}
+
+/// `PLUGIN_META::validate` capability: `PluginConfig::build` (also reachable
+/// through `TryFrom`) performs every parse/compile check; validation runs it
+/// and discards the artifact WITHOUT constructing the plugin.
+pub fn validate_response_rewrite_config(cfg: &JsonValue) -> ProxyResult<()> {
+    PluginConfig::try_from(cfg.clone())?;
+    Ok(())
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -196,7 +189,12 @@ impl PluginConfig {
             replacement_body,
             filters,
             max_resp_body_size: self.max_resp_body_size,
-            keys: context_keys(NEXT_INSTANCE_ID.fetch_add(1, Ordering::Relaxed)),
+            keys: ContextKeys {
+                matched: next_instance_ctx_key("pingsix_response_rewrite_matched_"),
+                body_buffer: next_instance_ctx_key("pingsix_response_rewrite_body_buffer_"),
+                body_too_large: next_instance_ctx_key("pingsix_response_rewrite_body_too_large_"),
+                skip_body_rewrite: next_instance_ctx_key("pingsix_response_rewrite_skip_body_"),
+            },
         })
     }
 }

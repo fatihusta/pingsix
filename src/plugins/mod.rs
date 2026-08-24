@@ -8,6 +8,7 @@ pub mod compression;
 pub(crate) mod config;
 pub mod cors;
 pub mod csrf;
+pub(crate) mod ctx_keys;
 pub mod echo;
 pub mod exit_transformer;
 pub mod fault_injection;
@@ -94,8 +95,12 @@ pub(crate) struct PluginMeta {
     pub phases: PluginPhases,
     pub factory: PluginFactory,
     pub secrets_transform: Option<crate::utils::encryption::PluginSecretsTransform>,
-    /// Deterministic structural validation (Admin pre-check, no graph context).
-    pub validate: Option<ValidatePluginFn>,
+    /// Deterministic structural validation (Admin pre-check, no graph
+    /// context). Mandatory for every builtin: the plain-plugin validate
+    /// functions parse the typed config and run its compile/validate checks
+    /// WITHOUT constructing the plugin, so validating a config never opens a
+    /// log file, registers shared limiter state, or spins up a resolver.
+    pub validate: ValidatePluginFn,
     /// Named upstream ids referenced by the config (whole-graph reference check).
     pub upstream_refs: Option<PluginUpstreamRefsFn>,
     /// Inline upstream occurrences to prepare when the owning scope is rebuilt.
@@ -110,7 +115,7 @@ static PLUGIN_META: &[PluginMeta] = &[
         phases: PluginPhases::REQUEST.union(PluginPhases::REQUEST_BODY),
         factory: PluginFactory::Plain(client_control::create_client_control_plugin),
         secrets_transform: None,
-        validate: None,
+        validate: client_control::validate_client_control_config,
         upstream_refs: None,
         upstream_jobs: None,
     },
@@ -119,7 +124,7 @@ static PLUGIN_META: &[PluginMeta] = &[
         phases: PluginPhases::empty(),
         factory: PluginFactory::Plain(exit_transformer::create_exit_transformer_plugin),
         secrets_transform: None,
-        validate: None,
+        validate: exit_transformer::validate_exit_transformer_config,
         upstream_refs: None,
         upstream_jobs: None,
     },
@@ -128,7 +133,7 @@ static PLUGIN_META: &[PluginMeta] = &[
         phases: PluginPhases::REQUEST.union(PluginPhases::RESPONSE),
         factory: PluginFactory::Plain(request_id::create_request_id_plugin),
         secrets_transform: None,
-        validate: None,
+        validate: request_id::validate_request_id_config,
         upstream_refs: None,
         upstream_jobs: None,
     },
@@ -137,7 +142,7 @@ static PLUGIN_META: &[PluginMeta] = &[
         phases: PluginPhases::REQUEST,
         factory: PluginFactory::Plain(fault_injection::create_fault_injection_plugin),
         secrets_transform: None,
-        validate: None,
+        validate: fault_injection::validate_fault_injection_config,
         upstream_refs: None,
         upstream_jobs: None,
     },
@@ -146,7 +151,7 @@ static PLUGIN_META: &[PluginMeta] = &[
         phases: PluginPhases::REQUEST.union(PluginPhases::RESPONSE),
         factory: PluginFactory::Plain(cors::create_cors_plugin),
         secrets_transform: None,
-        validate: None,
+        validate: cors::validate_cors_config,
         upstream_refs: None,
         upstream_jobs: None,
     },
@@ -155,7 +160,7 @@ static PLUGIN_META: &[PluginMeta] = &[
         phases: PluginPhases::REQUEST,
         factory: PluginFactory::Plain(ip_restriction::create_ip_restriction_plugin),
         secrets_transform: None,
-        validate: None,
+        validate: ip_restriction::validate_ip_restriction_config,
         upstream_refs: None,
         upstream_jobs: None,
     },
@@ -164,7 +169,7 @@ static PLUGIN_META: &[PluginMeta] = &[
         phases: PluginPhases::REQUEST,
         factory: PluginFactory::Plain(uri_blocker::create_uri_blocker_plugin),
         secrets_transform: None,
-        validate: None,
+        validate: uri_blocker::validate_uri_blocker_config,
         upstream_refs: None,
         upstream_jobs: None,
     },
@@ -176,7 +181,7 @@ static PLUGIN_META: &[PluginMeta] = &[
             .union(PluginPhases::UPSTREAM_PEER),
         factory: PluginFactory::WithUpstreams(ai_proxy::create_ai_proxy_plugin_with_context),
         secrets_transform: Some(ai_proxy::SECRETS_TRANSFORM),
-        validate: Some(ai_proxy::validate_ai_proxy_config),
+        validate: ai_proxy::validate_ai_proxy_config,
         upstream_refs: None,
         upstream_jobs: Some(ai_proxy::inline_upstream_jobs),
     },
@@ -185,7 +190,7 @@ static PLUGIN_META: &[PluginMeta] = &[
         phases: PluginPhases::REQUEST.union(PluginPhases::REQUEST_BODY),
         factory: PluginFactory::Plain(request_validation::create_request_validation_plugin),
         secrets_transform: None,
-        validate: None,
+        validate: request_validation::validate_request_validation_config,
         upstream_refs: None,
         upstream_jobs: None,
     },
@@ -194,7 +199,7 @@ static PLUGIN_META: &[PluginMeta] = &[
         phases: PluginPhases::REQUEST.union(PluginPhases::RESPONSE),
         factory: PluginFactory::Plain(csrf::create_csrf_plugin),
         secrets_transform: Some(csrf::SECRETS_TRANSFORM),
-        validate: None,
+        validate: csrf::validate_csrf_config,
         upstream_refs: None,
         upstream_jobs: None,
     },
@@ -203,7 +208,7 @@ static PLUGIN_META: &[PluginMeta] = &[
         phases: PluginPhases::REQUEST,
         factory: PluginFactory::Plain(basic_auth::create_basic_auth_plugin),
         secrets_transform: Some(basic_auth::SECRETS_TRANSFORM),
-        validate: None,
+        validate: basic_auth::validate_basic_auth_config,
         upstream_refs: None,
         upstream_jobs: None,
     },
@@ -212,7 +217,7 @@ static PLUGIN_META: &[PluginMeta] = &[
         phases: PluginPhases::REQUEST.union(PluginPhases::RESPONSE),
         factory: PluginFactory::Plain(jwt_auth::create_jwt_auth_plugin),
         secrets_transform: Some(jwt_auth::SECRETS_TRANSFORM),
-        validate: None,
+        validate: jwt_auth::validate_jwt_auth_config,
         upstream_refs: None,
         upstream_jobs: None,
     },
@@ -221,7 +226,7 @@ static PLUGIN_META: &[PluginMeta] = &[
         phases: PluginPhases::REQUEST,
         factory: PluginFactory::Plain(key_auth::create_key_auth_plugin),
         secrets_transform: Some(key_auth::SECRETS_TRANSFORM),
-        validate: None,
+        validate: key_auth::validate_key_auth_config,
         upstream_refs: None,
         upstream_jobs: None,
     },
@@ -230,7 +235,7 @@ static PLUGIN_META: &[PluginMeta] = &[
         phases: PluginPhases::REQUEST,
         factory: PluginFactory::Plain(cache::create_cache_plugin),
         secrets_transform: None,
-        validate: None,
+        validate: cache::validate_cache_config,
         upstream_refs: None,
         upstream_jobs: None,
     },
@@ -239,7 +244,7 @@ static PLUGIN_META: &[PluginMeta] = &[
         phases: PluginPhases::UPSTREAM_REQUEST,
         factory: PluginFactory::Plain(proxy_rewrite::create_proxy_rewrite_plugin),
         secrets_transform: None,
-        validate: None,
+        validate: proxy_rewrite::validate_proxy_rewrite_config,
         upstream_refs: None,
         upstream_jobs: None,
     },
@@ -248,7 +253,7 @@ static PLUGIN_META: &[PluginMeta] = &[
         phases: PluginPhases::REQUEST.union(PluginPhases::RESPONSE),
         factory: PluginFactory::Plain(api_breaker::create_api_breaker_plugin),
         secrets_transform: None,
-        validate: None,
+        validate: api_breaker::validate_api_breaker_config,
         upstream_refs: None,
         upstream_jobs: None,
     },
@@ -259,7 +264,7 @@ static PLUGIN_META: &[PluginMeta] = &[
             .union(PluginPhases::REQUEST_BODY),
         factory: PluginFactory::Plain(proxy_mirror::create_proxy_mirror_plugin),
         secrets_transform: None,
-        validate: None,
+        validate: proxy_mirror::validate_proxy_mirror_config,
         upstream_refs: None,
         upstream_jobs: None,
     },
@@ -268,7 +273,7 @@ static PLUGIN_META: &[PluginMeta] = &[
         phases: PluginPhases::REQUEST.union(PluginPhases::LOGGING),
         factory: PluginFactory::Plain(limit_conn::create_limit_conn_plugin),
         secrets_transform: None,
-        validate: None,
+        validate: limit_conn::validate_limit_conn_config,
         upstream_refs: None,
         upstream_jobs: None,
     },
@@ -277,7 +282,7 @@ static PLUGIN_META: &[PluginMeta] = &[
         phases: PluginPhases::REQUEST.union(PluginPhases::RESPONSE),
         factory: PluginFactory::Plain(limit_count::create_limit_count_plugin),
         secrets_transform: None,
-        validate: None,
+        validate: limit_count::validate_limit_count_config,
         upstream_refs: None,
         upstream_jobs: None,
     },
@@ -286,7 +291,7 @@ static PLUGIN_META: &[PluginMeta] = &[
         phases: PluginPhases::REQUEST,
         factory: PluginFactory::Plain(limit_req::create_limit_req_plugin),
         secrets_transform: None,
-        validate: None,
+        validate: limit_req::validate_limit_req_config,
         upstream_refs: None,
         upstream_jobs: None,
     },
@@ -295,7 +300,7 @@ static PLUGIN_META: &[PluginMeta] = &[
         phases: PluginPhases::EARLY_REQUEST,
         factory: PluginFactory::Plain(brotli::create_brotli_plugin),
         secrets_transform: None,
-        validate: None,
+        validate: brotli::validate_brotli_config,
         upstream_refs: None,
         upstream_jobs: None,
     },
@@ -304,7 +309,7 @@ static PLUGIN_META: &[PluginMeta] = &[
         phases: PluginPhases::EARLY_REQUEST,
         factory: PluginFactory::Plain(gzip::create_gzip_plugin),
         secrets_transform: None,
-        validate: None,
+        validate: gzip::validate_gzip_config,
         upstream_refs: None,
         upstream_jobs: None,
     },
@@ -313,7 +318,7 @@ static PLUGIN_META: &[PluginMeta] = &[
         phases: PluginPhases::REQUEST,
         factory: PluginFactory::Plain(redirect::create_redirect_plugin),
         secrets_transform: None,
-        validate: None,
+        validate: redirect::validate_redirect_config,
         upstream_refs: None,
         upstream_jobs: None,
     },
@@ -322,7 +327,7 @@ static PLUGIN_META: &[PluginMeta] = &[
         phases: PluginPhases::RESPONSE.union(PluginPhases::RESPONSE_BODY),
         factory: PluginFactory::Plain(response_rewrite::create_response_rewrite_plugin),
         secrets_transform: None,
-        validate: None,
+        validate: response_rewrite::validate_response_rewrite_config,
         upstream_refs: None,
         upstream_jobs: None,
     },
@@ -334,7 +339,7 @@ static PLUGIN_META: &[PluginMeta] = &[
             .union(PluginPhases::RESPONSE),
         factory: PluginFactory::Plain(grpc_web::create_grpc_web_plugin),
         secrets_transform: None,
-        validate: None,
+        validate: grpc_web::validate_grpc_web_config,
         upstream_refs: None,
         upstream_jobs: None,
     },
@@ -343,7 +348,7 @@ static PLUGIN_META: &[PluginMeta] = &[
         phases: PluginPhases::LOGGING,
         factory: PluginFactory::Plain(prometheus::create_prometheus_plugin),
         secrets_transform: None,
-        validate: None,
+        validate: prometheus::validate_prometheus_config,
         upstream_refs: None,
         upstream_jobs: None,
     },
@@ -352,7 +357,7 @@ static PLUGIN_META: &[PluginMeta] = &[
         phases: PluginPhases::RESPONSE.union(PluginPhases::RESPONSE_BODY),
         factory: PluginFactory::Plain(echo::create_echo_plugin),
         secrets_transform: None,
-        validate: None,
+        validate: echo::validate_echo_config,
         upstream_refs: None,
         upstream_jobs: None,
     },
@@ -363,7 +368,7 @@ static PLUGIN_META: &[PluginMeta] = &[
             .union(PluginPhases::RESPONSE_BODY),
         factory: PluginFactory::Plain(file_logger::create_file_logger_plugin),
         secrets_transform: None,
-        validate: None,
+        validate: file_logger::validate_file_logger_config,
         upstream_refs: None,
         upstream_jobs: None,
     },
@@ -374,7 +379,7 @@ static PLUGIN_META: &[PluginMeta] = &[
             traffic_split::create_traffic_split_plugin_with_context,
         ),
         secrets_transform: None,
-        validate: Some(traffic_split::validate_traffic_split_config),
+        validate: traffic_split::validate_traffic_split_config,
         upstream_refs: Some(traffic_split::named_upstream_ids),
         upstream_jobs: Some(traffic_split::inline_upstream_jobs),
     },
@@ -386,29 +391,18 @@ fn plugin_meta(name: &str) -> Option<&'static PluginMeta> {
 
 /// Deterministic Admin pre-check for one plugin config.
 ///
-/// Plain plugins validate by construction: building parses the typed config
-/// and surfaces errors. Dependency-aware plugins (`WithUpstreams`) cannot be
-/// built without upstream context, so they validate structurally through their
-/// declared `validate` capability. Defaults only affect fallback resolution
-/// (identical validation outcome), and the Admin path always uses a neutral
-/// default so it never inherits another gateway instance's state.
-///
-/// Validation by construction also runs plain builders' side effects on the
-/// config write path: for file-logger, validating a config opens (or creates)
-/// the log file — accepted behavior.
+/// Every builtin declares a mandatory `validate` capability in `PLUGIN_META`:
+/// for plain plugins it parses the typed config and runs its compile/validate
+/// checks WITHOUT constructing the plugin, so validation never runs builder
+/// side effects (file-logger does not open or create its log file, limiters
+/// register no shared state). Dependency-aware plugins (`WithUpstreams`)
+/// expose the same structural check they always did. Defaults only affect
+/// fallback resolution (identical validation outcome), so validation needs no
+/// gateway-instance context at all.
 pub(crate) fn validate_plugin_config(name: &str, cfg: &JsonValue) -> ProxyResult<()> {
     let meta = plugin_meta(name)
         .ok_or_else(|| ProxyError::Plugin(format!("Unknown plugin type: {name}")))?;
-    match meta.factory {
-        PluginFactory::Plain(factory) => {
-            factory(cfg.clone(), &crate::config::EffectiveDefaults::default())?;
-            Ok(())
-        }
-        PluginFactory::WithUpstreams(_) => match meta.validate {
-            Some(validate) => validate(cfg),
-            None => Ok(()),
-        },
-    }
+    (meta.validate)(cfg)
 }
 
 /// Named upstream ids referenced by a plugin config, when the plugin declares
@@ -639,7 +633,6 @@ mod builtin_phases_tests {
             traffic_split.factory,
             PluginFactory::WithUpstreams(_)
         ));
-        assert!(traffic_split.validate.is_some());
         assert!(traffic_split.upstream_refs.is_some());
         assert!(traffic_split.upstream_jobs.is_some());
 
@@ -648,7 +641,6 @@ mod builtin_phases_tests {
             ai_proxy_meta.factory,
             PluginFactory::WithUpstreams(_)
         ));
-        assert!(ai_proxy_meta.validate.is_some());
         assert!(ai_proxy_meta.upstream_jobs.is_some());
         assert!(ai_proxy_meta.secrets_transform.is_some());
 
@@ -705,6 +697,54 @@ mod builtin_phases_tests {
         let ai = ai_proxy::build_ai_proxy_plugin(minimal_config("ai-proxy")).expect("ai-proxy");
         let phases = plugin_meta(ai_proxy::PLUGIN_NAME).unwrap().phases;
         assert_partition_matches_phases(&PluginEntry::new(ai, phases), phases, "ai-proxy");
+    }
+
+    /// The mandatory `validate` capability must accept every builtin's
+    /// minimal config (plain plugins only — the `WithUpstreams` pair needs
+    /// graph context that a bare JSON value cannot carry).
+    #[test]
+    fn every_plain_plugin_validate_accepts_minimal_config() {
+        for meta in PLUGIN_META {
+            if matches!(meta.factory, PluginFactory::WithUpstreams(_)) {
+                continue;
+            }
+            (meta.validate)(&minimal_config(meta.name))
+                .unwrap_or_else(|err| panic!("validate {}: {err}", meta.name));
+        }
+    }
+
+    /// Validation must not construct the plugin: file-logger's historical
+    /// wart was that Admin validation opened (and created) the configured log
+    /// file. The validate capability parses the config only, so even a path
+    /// that could never be opened passes validation while leaving no file.
+    #[test]
+    fn plain_validation_does_not_touch_the_file_logger_file() {
+        let dir = std::env::temp_dir().join(format!(
+            "pingsix-validate-no-create-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let path = dir.join("access.log");
+        let cfg = json!({"path": path.to_str().unwrap()});
+
+        validate_plugin_config(file_logger::PLUGIN_NAME, &cfg)
+            .expect("validation must not require the log file to be openable");
+        assert!(
+            !path.exists(),
+            "validation must not create the configured log file"
+        );
+
+        // Construction still wires (and thereby surfaces) the file: building
+        // the same config fails fast on the missing directory.
+        assert!(build_plugin_entry(
+            file_logger::PLUGIN_NAME,
+            cfg,
+            &crate::config::EffectiveDefaults::default(),
+        )
+        .is_err());
     }
 
     /// An executor built from `entry` must partition the plugin into exactly

@@ -40,7 +40,7 @@ const PRIORITY: i32 = 1002;
 /// global and a route limit-count instance never overwrite each other's quota.
 #[cfg(test)]
 fn rate_limit_quota_key(instance_id: u64) -> String {
-    crate::plugins::limiting::instance_ctx_key("pingsix_rate_limit_quota_", instance_id)
+    crate::plugins::ctx_keys::instance_ctx_key("pingsix_rate_limit_quota_", instance_id)
 }
 
 /// Hard cap on timestamp history per sliding-window key. Older entries are
@@ -124,6 +124,14 @@ pub fn create_limit_count_plugin(
         quota_key: next_instance_ctx_key("pingsix_rate_limit_quota_"),
         group_state,
     }))
+}
+
+/// `PLUGIN_META::validate` capability: parse the typed config and run its
+/// validators WITHOUT constructing the plugin. In particular no `group_state`
+/// is registered: validation must leave no shared counter state behind.
+pub fn validate_limit_count_config(cfg: &JsonValue) -> ProxyResult<()> {
+    PluginConfig::try_from(cfg.clone())?;
+    Ok(())
 }
 
 /// Process-wide registry of shared counters for APISIX `group` semantics.

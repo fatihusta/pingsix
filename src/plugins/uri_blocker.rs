@@ -43,6 +43,15 @@ pub fn create_uri_blocker_plugin(
     Ok(Arc::new(PluginUriBlocker { config, matcher }))
 }
 
+/// `PLUGIN_META::validate` capability: parse the typed config and run its
+/// validators (including the block-rules regex compile) WITHOUT constructing
+/// the plugin.
+pub fn validate_uri_blocker_config(cfg: &JsonValue) -> ProxyResult<()> {
+    let config = PluginConfig::try_from(cfg.clone())?;
+    config.compile_matcher()?;
+    Ok(())
+}
+
 /// APISIX `uri-blocker` schema: `block_rules` (required, unique regex
 /// strings), `rejected_code` (>=200, default 403), `rejected_msg`,
 /// `case_insensitive` (default false).

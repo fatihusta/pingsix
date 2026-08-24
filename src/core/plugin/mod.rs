@@ -118,21 +118,6 @@ impl Rejection {
         self.close_connection = true;
         self
     }
-
-    /// Adapt an already-assembled, bodyless [`ResponseHeader`] into a
-    /// rejection. Bridge for plugins whose rejection header sets are built by
-    /// shared helpers operating on a `ResponseHeader` (e.g. CORS preflight);
-    /// new code should construct `Rejection` values directly.
-    pub fn from_response_header(resp: &ResponseHeader) -> Self {
-        let mut rejection = Self::new(resp.status);
-        for (name, value) in resp.headers.iter() {
-            rejection.headers.push((
-                name.as_str().to_string(),
-                String::from_utf8_lossy(value.as_bytes()).into_owned(),
-            ));
-        }
-        rejection
-    }
 }
 
 /// A plugin instance paired with the lifecycle phases it declares (T10 frozen

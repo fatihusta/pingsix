@@ -96,6 +96,21 @@ pub fn create_ip_restriction_plugin(
     cfg: JsonValue,
     _defaults: &crate::config::EffectiveDefaults,
 ) -> ProxyResult<Arc<dyn ProxyPlugin>> {
+    Ok(Arc::new(PluginIPRestriction {
+        config: compile_config(cfg)?,
+    }))
+}
+
+/// `PLUGIN_META::validate` capability: parse the typed config and run its
+/// validators (CIDR parsing, policy mapping) WITHOUT constructing the plugin.
+pub fn validate_ip_restriction_config(cfg: &JsonValue) -> ProxyResult<()> {
+    compile_config(cfg.clone())?;
+    Ok(())
+}
+
+/// Parse and compile the raw config into the plugin's typed config. Shared by
+/// construction and structural validation so both expose the same errors.
+fn compile_config(cfg: JsonValue) -> ProxyResult<PluginConfig> {
     let raw_config = RawConfig::try_from(cfg)?;
 
     let whitelist = raw_config
@@ -146,7 +161,7 @@ pub fn create_ip_restriction_plugin(
         }
     };
 
-    let config = PluginConfig {
+    Ok(PluginConfig {
         whitelist,
         blacklist,
         message: raw_config.message,
@@ -154,9 +169,7 @@ pub fn create_ip_restriction_plugin(
         trusted_proxies,
         use_forwarded_headers: raw_config.use_forwarded_headers,
         forwarded_header_error_policy: policy,
-    };
-
-    Ok(Arc::new(PluginIPRestriction { config }))
+    })
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]

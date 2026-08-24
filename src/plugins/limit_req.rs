@@ -55,6 +55,13 @@ pub fn create_limit_req_plugin(
     }))
 }
 
+/// `PLUGIN_META::validate` capability: parse the typed config and run its
+/// validators WITHOUT constructing the plugin (no buckets allocated).
+pub fn validate_limit_req_config(cfg: &JsonValue) -> ProxyResult<()> {
+    PluginConfig::try_from(cfg.clone())?;
+    Ok(())
+}
+
 /// Mutable leaky-bucket state for one key. `last` is the drain anchor: the
 /// instant from which the next request measures elapsed draining time.
 struct Bucket {

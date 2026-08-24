@@ -1,4 +1,3 @@
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -14,7 +13,7 @@ use validator::Validate;
 
 use crate::{
     core::{FilterVerdict, ProxyContext, ProxyError, ProxyPlugin, ProxyResult, Rejection},
-    plugins::config::parse_and_validate_plugin_config,
+    plugins::{config::parse_and_validate_plugin_config, ctx_keys::next_instance_ctx_key},
     utils::response::content_type,
 };
 
@@ -39,13 +38,19 @@ pub fn create_grpc_web_plugin(
     _defaults: &crate::config::EffectiveDefaults,
 ) -> ProxyResult<Arc<dyn ProxyPlugin>> {
     let config = PluginConfig::try_from(cfg)?;
-    let instance_id = NEXT_INSTANCE_ID.fetch_add(1, Ordering::Relaxed);
     Ok(Arc::new(PluginGrpcWeb {
         config,
-        body_bytes_key: body_bytes_key(instance_id),
-        request_marker_key: request_marker_key(instance_id),
-        request_marker_text_key: request_marker_text_key(instance_id),
+        body_bytes_key: next_instance_ctx_key("pingsix_grpc_web_body_bytes_"),
+        request_marker_key: next_instance_ctx_key("pingsix_grpc_web_request_"),
+        request_marker_text_key: next_instance_ctx_key("pingsix_grpc_web_request_text_"),
     }))
+}
+
+/// `PLUGIN_META::validate` capability: parse the typed config and run its
+/// validators WITHOUT constructing the plugin.
+pub fn validate_grpc_web_config(cfg: &JsonValue) -> ProxyResult<()> {
+    PluginConfig::try_from(cfg.clone())?;
+    Ok(())
 }
 
 #[derive(Debug, Serialize, Deserialize, Validate)]
@@ -92,21 +97,19 @@ pub struct PluginGrpcWeb {
     request_marker_text_key: String,
 }
 
-/// Uniquely names every grpc-web instance's context counter. A request can
-/// carry both a global and a route instance, and their counters must never
-/// share keys.
-static NEXT_INSTANCE_ID: AtomicU64 = AtomicU64::new(1);
-
+#[cfg(test)]
 fn body_bytes_key(instance_id: u64) -> String {
-    format!("pingsix_grpc_web_body_bytes_{instance_id}")
+    crate::plugins::ctx_keys::instance_ctx_key("pingsix_grpc_web_body_bytes_", instance_id)
 }
 
+#[cfg(test)]
 fn request_marker_key(instance_id: u64) -> String {
-    format!("pingsix_grpc_web_request_{instance_id}")
+    crate::plugins::ctx_keys::instance_ctx_key("pingsix_grpc_web_request_", instance_id)
 }
 
+#[cfg(test)]
 fn request_marker_text_key(instance_id: u64) -> String {
-    format!("pingsix_grpc_web_request_text_{instance_id}")
+    crate::plugins::ctx_keys::instance_ctx_key("pingsix_grpc_web_request_text_", instance_id)
 }
 
 fn has_grpc_web_content_type(session: &Session) -> bool {

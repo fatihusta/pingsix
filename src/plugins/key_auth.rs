@@ -43,6 +43,14 @@ pub fn create_key_auth_plugin(
     }))
 }
 
+/// `PLUGIN_META::validate` capability: parse the typed config and run its
+/// validators WITHOUT constructing the plugin. `get_valid_keys` is infallible,
+/// so parsing covers the full construction error surface.
+pub fn validate_key_auth_config(cfg: &JsonValue) -> ProxyResult<()> {
+    PluginConfig::try_from(cfg.clone())?;
+    Ok(())
+}
+
 /// Configuration for the Key Auth plugin.
 #[derive(Default, Debug, Serialize, Deserialize, Validate, EncryptFields)]
 #[encrypt_fields(export)]

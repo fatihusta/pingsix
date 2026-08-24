@@ -41,6 +41,13 @@ pub fn create_client_control_plugin(
     Ok(Arc::new(PluginClientControl { config }))
 }
 
+/// `PLUGIN_META::validate` capability: parse the typed config and run its
+/// validators WITHOUT constructing the plugin.
+pub fn validate_client_control_config(cfg: &JsonValue) -> ProxyResult<()> {
+    PluginConfig::try_from(cfg.clone())?;
+    Ok(())
+}
+
 #[derive(Debug, Default, Serialize, Deserialize, Validate)]
 struct PluginConfig {
     /// Maximum request body size in bytes. `0` disables the check.

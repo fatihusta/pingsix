@@ -58,6 +58,13 @@ pub fn create_request_id_plugin(
     Ok(Arc::new(PluginRequestID { config }))
 }
 
+/// `PLUGIN_META::validate` capability: parse the typed config and run its
+/// validators WITHOUT constructing the plugin.
+pub fn validate_request_id_config(cfg: &JsonValue) -> ProxyResult<()> {
+    PluginConfig::try_from(cfg.clone())?;
+    Ok(())
+}
+
 /// Configuration for the Request ID plugin.
 #[derive(Default, Debug, Serialize, Deserialize, Validate)]
 struct PluginConfig {

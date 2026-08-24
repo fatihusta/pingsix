@@ -20,3 +20,9 @@ pub fn create_gzip_plugin(
 ) -> ProxyResult<Arc<dyn ProxyPlugin>> {
     CompressionPlugin::build(PLUGIN_NAME, PRIORITY, Algorithm::Gzip, cfg, "gzip", 0, 9)
 }
+
+/// `PLUGIN_META::validate` capability: parse and validate the shared
+/// compression config WITHOUT constructing the plugin.
+pub fn validate_gzip_config(cfg: &JsonValue) -> ProxyResult<()> {
+    super::compression::validate_config(cfg, "gzip", Algorithm::Gzip, 0, 9)
+}

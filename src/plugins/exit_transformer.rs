@@ -56,6 +56,14 @@ pub fn create_exit_transformer_plugin(
     }))
 }
 
+/// `PLUGIN_META::validate` capability: parse the typed config and run its
+/// validators WITHOUT constructing the plugin. `compile` is infallible, so
+/// parsing covers the full construction error surface.
+pub fn validate_exit_transformer_config(cfg: &JsonValue) -> ProxyResult<()> {
+    PluginConfig::try_from(cfg.clone())?;
+    Ok(())
+}
+
 #[derive(Debug, Default, Serialize, Deserialize, Validate)]
 struct PluginConfig {
     /// Ordered rewrite rules, evaluated first-match-wins.

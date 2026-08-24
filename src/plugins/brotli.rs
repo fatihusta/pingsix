@@ -28,3 +28,9 @@ pub fn create_brotli_plugin(
         11,
     )
 }
+
+/// `PLUGIN_META::validate` capability: parse and validate the shared
+/// compression config WITHOUT constructing the plugin.
+pub fn validate_brotli_config(cfg: &JsonValue) -> ProxyResult<()> {
+    super::compression::validate_config(cfg, "brotli", Algorithm::Brotli, 0, 11)
+}

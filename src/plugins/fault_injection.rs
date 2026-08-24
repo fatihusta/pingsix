@@ -27,6 +27,13 @@ pub fn create_fault_injection_plugin(
     Ok(Arc::new(PluginFaultInjection { config }))
 }
 
+/// `PLUGIN_META::validate` capability: parse the typed config and run its
+/// validators WITHOUT constructing the plugin.
+pub fn validate_fault_injection_config(cfg: &JsonValue) -> ProxyResult<()> {
+    PluginConfig::try_from(cfg.clone())?;
+    Ok(())
+}
+
 /// Configuration for injecting delays into requests
 #[derive(Debug, Clone, Serialize, Deserialize, Validate)]
 struct DelayConfig {

@@ -75,8 +75,6 @@ struct PassiveHealthState {
     /// global mutex: every ready-backend check during selection only locks
     /// the shard of that one backend.
     counters: DashMap<selection::BackendId, PassiveCounters>,
-    #[cfg(test)]
-    on_transition: Option<Box<dyn Fn(bool) + Send + Sync>>,
 }
 
 /// A half-open probe reservation expires if no observation arrives within this
@@ -117,10 +115,6 @@ impl PassiveHealthState {
                 node.successes = 0;
                 if unhealthy.tcp_failures > 0 && node.tcp_failures >= unhealthy.tcp_failures {
                     node.tripped = true;
-                    #[cfg(test)]
-                    if let Some(callback) = &self.on_transition {
-                        callback(false);
-                    }
                 }
             }
             PassiveOutcome::Timeout => {
@@ -130,10 +124,6 @@ impl PassiveHealthState {
                 node.successes = 0;
                 if unhealthy.timeouts > 0 && node.timeouts >= unhealthy.timeouts {
                     node.tripped = true;
-                    #[cfg(test)]
-                    if let Some(callback) = &self.on_transition {
-                        callback(false);
-                    }
                 }
             }
             PassiveOutcome::Http(status) => {
@@ -145,10 +135,6 @@ impl PassiveHealthState {
                     if unhealthy.http_failures > 0 && node.http_failures >= unhealthy.http_failures
                     {
                         node.tripped = true;
-                        #[cfg(test)]
-                        if let Some(callback) = &self.on_transition {
-                            callback(false);
-                        }
                     }
                 } else if healthy_statuses.contains(&(status as u32)) {
                     node.http_failures = 0;
@@ -161,10 +147,6 @@ impl PassiveHealthState {
                         {
                             node.tripped = false;
                             node.successes = 0;
-                            #[cfg(test)]
-                            if let Some(callback) = &self.on_transition {
-                                callback(true);
-                            }
                         }
                     }
                 }
@@ -249,8 +231,6 @@ impl ProxyUpstream {
             .map(|config| PassiveHealthState {
                 config,
                 counters: DashMap::new(),
-                #[cfg(test)]
-                on_transition: None,
             });
 
         Ok(ProxyUpstream {
@@ -333,6 +313,14 @@ impl ProxyUpstream {
 
     /// Sets the finite upstream/global/built-in timeout for an `HttpPeer`,
     /// plus the per-upstream keepalive idle timeout when configured.
+    ///
+    /// These values are the upstream-defaults layer (step 1) of the
+    /// peer-timeout precedence chain, NOT the final word: after selection the
+    /// peer passes through route `apply_route_timeout` (2), WebSocket
+    /// relaxation (3), and finally the plugin `upstream_peer_filter` phase
+    /// (4), any of which may override what is set here. The full ordering is
+    /// documented at `HttpService::upstream_peer` in `service/http.rs`, which
+    /// owns the chain.
     fn set_timeout(&self, p: &mut HttpPeer) {
         let config::Timeout {
             connect,
@@ -1129,21 +1117,17 @@ mod passive_tests {
     use super::*;
     use crate::config::{PassiveCheck, PassiveHealthy, PassiveUnhealthy};
 
+    /// Passive-health assertions observe the state the selector acts on
+    /// (`has_tripped`, probe admission) rather than tickling internal
+    /// transition callbacks: the observable behavior is what changes
+    /// selection outcomes.
     fn test_state(
         http_failures: u32,
         tcp_failures: u32,
         timeouts: u32,
         successes: u32,
-    ) -> (
-        PassiveHealthState,
-        Arc<std::sync::atomic::AtomicUsize>,
-        Arc<std::sync::atomic::AtomicUsize>,
-    ) {
-        let trips = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let restores = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let trips_clone = trips.clone();
-        let restores_clone = restores.clone();
-        let state = PassiveHealthState {
+    ) -> PassiveHealthState {
+        PassiveHealthState {
             config: PassiveCheck {
                 healthy: PassiveHealthy {
                     http_statuses: vec![200],
@@ -1157,15 +1141,7 @@ mod passive_tests {
                 },
             },
             counters: DashMap::new(),
-            on_transition: Some(Box::new(move |enabled| {
-                if enabled {
-                    restores_clone.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                } else {
-                    trips_clone.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                }
-            })),
-        };
-        (state, trips, restores)
+        }
     }
 
     fn backend() -> Backend {
@@ -1174,86 +1150,85 @@ mod passive_tests {
 
     #[test]
     fn trips_after_http_failure_threshold() {
-        let (state, trips, _) = test_state(3, 2, 7, 5);
+        let state = test_state(3, 2, 7, 5);
         let b = backend();
         for _ in 0..2 {
             state.observe(&b, PassiveOutcome::Http(500));
         }
-        assert_eq!(trips.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert!(!state.has_tripped());
         state.observe(&b, PassiveOutcome::Http(500));
-        assert_eq!(trips.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert!(state.has_tripped());
     }
 
     #[test]
     fn trips_after_tcp_failure_threshold() {
-        let (state, trips, _) = test_state(5, 2, 7, 5);
+        let state = test_state(5, 2, 7, 5);
         let b = backend();
         state.observe(&b, PassiveOutcome::TcpFailure);
-        assert_eq!(trips.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert!(!state.has_tripped());
         state.observe(&b, PassiveOutcome::TcpFailure);
-        assert_eq!(trips.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert!(state.has_tripped());
     }
 
     #[test]
     fn trips_after_timeout_threshold() {
-        let (state, trips, _) = test_state(5, 2, 3, 5);
+        let state = test_state(5, 2, 3, 5);
         let b = backend();
         for _ in 0..2 {
             state.observe(&b, PassiveOutcome::Timeout);
         }
-        assert_eq!(trips.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert!(!state.has_tripped());
         state.observe(&b, PassiveOutcome::Timeout);
-        assert_eq!(trips.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert!(state.has_tripped());
     }
 
     #[test]
     fn mixed_failures_do_not_accumulate_across_categories() {
-        let (state, trips, _) = test_state(3, 2, 7, 5);
+        let state = test_state(3, 2, 7, 5);
         let b = backend();
         state.observe(&b, PassiveOutcome::Http(500));
         state.observe(&b, PassiveOutcome::Http(500));
         // A TCP failure resets the http failure counter.
         state.observe(&b, PassiveOutcome::TcpFailure);
         state.observe(&b, PassiveOutcome::Http(500));
-        assert_eq!(trips.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert!(!state.has_tripped());
         state.observe(&b, PassiveOutcome::Http(500));
         state.observe(&b, PassiveOutcome::Http(500));
-        assert_eq!(trips.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert!(state.has_tripped());
     }
 
     #[test]
     fn restores_after_healthy_successes() {
-        let (state, trips, restores) = test_state(3, 2, 7, 2);
+        let state = test_state(3, 2, 7, 2);
         let b = backend();
         for _ in 0..3 {
             state.observe(&b, PassiveOutcome::Http(500));
         }
-        assert_eq!(trips.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert!(state.has_tripped());
         state.observe(&b, PassiveOutcome::Http(200));
-        assert_eq!(restores.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert!(state.has_tripped());
         state.observe(&b, PassiveOutcome::Http(200));
-        assert_eq!(restores.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert!(!state.has_tripped());
     }
 
     #[test]
     fn zero_threshold_disables_its_failure_category() {
-        let (state, trips, _) = test_state(0, 0, 0, 1);
+        let state = test_state(0, 0, 0, 1);
         let b = backend();
         for _ in 0..10 {
             state.observe(&b, PassiveOutcome::TcpFailure);
             state.observe(&b, PassiveOutcome::Timeout);
             state.observe(&b, PassiveOutcome::Http(500));
         }
-        assert_eq!(trips.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert!(!state.has_tripped());
     }
 
     #[test]
     fn half_open_probe_is_single_flight_and_recovers() {
-        let (state, trips, _) = test_state(1, 2, 7, 1);
+        let state = test_state(1, 2, 7, 1);
         let b = backend();
         let now = Instant::now();
         state.observe(&b, PassiveOutcome::Http(500));
-        assert_eq!(trips.load(std::sync::atomic::Ordering::SeqCst), 1);
         assert!(state.has_tripped());
         assert!(state.take_probe(&b, now));
         // A second probe within the lease window is refused.
@@ -1266,11 +1241,10 @@ mod passive_tests {
     fn half_open_probe_allows_exactly_one_concurrent_winner() {
         use std::sync::{Arc, Barrier};
 
-        let (state, trips, _) = test_state(1, 2, 7, 1);
-        let state = Arc::new(state);
+        let state = Arc::new(test_state(1, 2, 7, 1));
         let b = backend();
         state.observe(&b, PassiveOutcome::Http(500));
-        assert_eq!(trips.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert!(state.has_tripped());
 
         let workers = 32;
         let barrier = Arc::new(Barrier::new(workers));
@@ -1300,11 +1274,11 @@ mod passive_tests {
         // A request selected as a probe but cancelled before observe() must
         // not pin the node forever: the lease expires and another probe is
         // admitted after PROBE_LEASE.
-        let (state, trips, _) = test_state(1, 2, 7, 1);
+        let state = test_state(1, 2, 7, 1);
         let b = backend();
         let now = Instant::now();
         state.observe(&b, PassiveOutcome::Http(500));
-        assert_eq!(trips.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert!(state.has_tripped());
         assert!(state.take_probe(&b, now));
         // Still tripped, lease held.
         assert!(!state.take_probe(&b, now));
@@ -1313,22 +1287,21 @@ mod passive_tests {
     }
 
     #[test]
-    fn successful_outcomes_do_not_trip_or_restore_when_not_tripped() {
-        let (state, trips, restores) = test_state(3, 2, 7, 5);
+    fn successful_outcomes_do_not_trip_when_not_tripped() {
+        let state = test_state(3, 2, 7, 5);
         let b = backend();
         state.observe(&b, PassiveOutcome::Http(200));
         state.observe(&b, PassiveOutcome::Http(200));
-        assert_eq!(trips.load(std::sync::atomic::Ordering::SeqCst), 0);
-        assert_eq!(restores.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert!(!state.has_tripped());
     }
 
     #[test]
     fn out_of_set_statuses_are_ignored() {
-        let (state, trips, _) = test_state(3, 2, 7, 5);
+        let state = test_state(3, 2, 7, 5);
         let b = backend();
         for _ in 0..10 {
             state.observe(&b, PassiveOutcome::Http(404));
         }
-        assert_eq!(trips.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert!(!state.has_tripped());
     }
 }

@@ -38,6 +38,13 @@ pub fn create_csrf_plugin(
     Ok(Arc::new(PluginCsrf { config }))
 }
 
+/// `PLUGIN_META::validate` capability: parse the typed config and run its
+/// validators WITHOUT constructing the plugin.
+pub fn validate_csrf_config(cfg: &JsonValue) -> ProxyResult<()> {
+    PluginConfig::try_from(cfg.clone())?;
+    Ok(())
+}
+
 #[derive(Debug, Serialize, Deserialize, Validate, EncryptFields)]
 #[encrypt_fields(export)]
 struct PluginConfig {

@@ -1,5 +1,4 @@
 use std::collections::HashSet;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -14,7 +13,7 @@ use validator::{Validate, ValidationError};
 
 use crate::{
     core::{FilterVerdict, ProxyContext, ProxyError, ProxyPlugin, ProxyResult},
-    plugins::config::parse_and_validate_plugin_config,
+    plugins::{config::parse_and_validate_plugin_config, ctx_keys::next_instance_ctx_key},
 };
 
 pub(crate) mod http;
@@ -59,9 +58,6 @@ fn resolve_max_file_size(configured: Option<usize>, global_default: usize) -> us
 
 // Context key for sharing cache settings between plugin and HttpService
 pub const CTX_KEY_CACHE_SETTINGS: &str = "pingsix_cache_settings";
-
-/// Uniquely names each proxy-cache instance's per-request no-cache decision.
-static NEXT_INSTANCE_ID: AtomicU64 = AtomicU64::new(1);
 
 /// Lightweight cache configuration passed to HttpService.
 ///
@@ -530,10 +526,7 @@ pub fn create_cache_plugin(
     };
 
     // Pre-build cache settings at plugin creation to avoid per-request overhead
-    let no_cache_flag_key = format!(
-        "pingsix_proxy_cache_no_cache_{}",
-        NEXT_INSTANCE_ID.fetch_add(1, Ordering::Relaxed)
-    );
+    let no_cache_flag_key = next_instance_ctx_key("pingsix_proxy_cache_no_cache_");
     let cache_settings = Arc::new(CacheSettings {
         ttl: Duration::from_secs(config.ttl),
         statuses,
@@ -567,6 +560,20 @@ pub(crate) fn should_bypass_authenticated_request(
 ) -> bool {
     !settings.cache_authenticated_requests
         && (ctx.original_request_had_credentials || ctx.request_has_credentials)
+}
+
+/// `PLUGIN_META::validate` capability: parse the typed config and run its
+/// validators (including the `no_cache_str` regex compile) WITHOUT
+/// constructing the plugin.
+pub fn validate_cache_config(cfg: &JsonValue) -> ProxyResult<()> {
+    let config = PluginConfig::try_from(cfg.clone())?;
+    for pattern in &config.no_cache_str {
+        Regex::new(pattern).map_err(|e| -> Box<pingora_error::Error> {
+            ProxyError::validation_error(format!("Invalid regex in no_cache_str '{pattern}': {e}"))
+                .into()
+        })?;
+    }
+    Ok(())
 }
 
 #[cfg(test)]

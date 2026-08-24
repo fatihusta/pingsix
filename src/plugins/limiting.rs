@@ -25,10 +25,7 @@
 use std::{
     borrow::Cow,
     collections::{hash_map::Entry, HashMap},
-    sync::{
-        atomic::{AtomicU64, Ordering},
-        Mutex, MutexGuard,
-    },
+    sync::{Mutex, MutexGuard},
 };
 
 use http::StatusCode;
@@ -231,18 +228,9 @@ pub(crate) fn select_rules<'a, R, S>(
     }
 }
 
-static NEXT_INSTANCE_ID: AtomicU64 = AtomicU64::new(1);
-
-/// Allocate a unique per-instance context key with the given prefix, so a
-/// global and a route instance of the same plugin never share ctx slots.
-pub(crate) fn next_instance_ctx_key(prefix: &str) -> String {
-    instance_ctx_key(prefix, NEXT_INSTANCE_ID.fetch_add(1, Ordering::Relaxed))
-}
-
-/// Format the context key for a concrete instance id (test-stable).
-pub(crate) fn instance_ctx_key(prefix: &str, instance_id: u64) -> String {
-    format!("{prefix}{instance_id}")
-}
+/// Per-instance context keys moved to the crate-wide [`super::ctx_keys`]
+/// module (T12); re-exported so existing limiter call sites stay put.
+pub(crate) use super::ctx_keys::next_instance_ctx_key;
 
 /// What [`Shard::sweep`] does with an entry that fails the eviction
 /// predicate.
@@ -541,18 +529,6 @@ mod tests {
         let err = validate_rejected_msg(&&String::new()).unwrap_err();
         assert_eq!(err.code, "rejected_msg must have at least 1 character");
         assert_eq!(default_rejected_code(), 503);
-    }
-
-    #[test]
-    fn instance_ctx_keys_keep_the_prefix_and_share_one_counter() {
-        assert_eq!(
-            instance_ctx_key("pingsix_limit_conn_guard_", 99),
-            "pingsix_limit_conn_guard_99"
-        );
-        let first = next_instance_ctx_key("pingsix_test_");
-        let second = next_instance_ctx_key("pingsix_test_");
-        assert!(first.starts_with("pingsix_test_"));
-        assert_ne!(first, second);
     }
 
     #[tokio::test]

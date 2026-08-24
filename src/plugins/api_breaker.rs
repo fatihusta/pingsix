@@ -81,6 +81,13 @@ pub fn create_api_breaker_plugin(
     }))
 }
 
+/// `PLUGIN_META::validate` capability: parse the typed config and run its
+/// validators WITHOUT constructing the plugin (no breaker state allocated).
+pub fn validate_api_breaker_config(cfg: &JsonValue) -> ProxyResult<()> {
+    PluginConfig::try_from(cfg.clone())?;
+    Ok(())
+}
+
 /// Bounded breaker state keyed by stable route identity (or one fixed key for
 /// a global-rule instance). Client-controlled Host/path values are excluded so
 /// high-cardinality inputs cannot bypass the breaker or evict hot state.

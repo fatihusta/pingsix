@@ -115,6 +115,19 @@ fn parse_config(
     })
 }
 
+/// Validate a compression plugin config without building the plugin
+/// (`PLUGIN_META::validate` capability for brotli/gzip).
+pub(crate) fn validate_config(
+    cfg: &JsonValue,
+    plugin_label: &str,
+    algorithm: Algorithm,
+    min_level: u32,
+    max_level: u32,
+) -> ProxyResult<()> {
+    parse_config(cfg.clone(), plugin_label, algorithm, min_level, max_level)?;
+    Ok(())
+}
+
 #[async_trait]
 impl ProxyPlugin for CompressionPlugin {
     fn name(&self) -> &str {

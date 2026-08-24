@@ -58,6 +58,14 @@ pub fn create_request_validation_plugin(
     Ok(Arc::new(PluginRequestValidation { compiled }))
 }
 
+/// `PLUGIN_META::validate` capability: parse the typed config and run its
+/// validators (including schema compilation) WITHOUT constructing the plugin.
+pub fn validate_request_validation_config(cfg: &JsonValue) -> ProxyResult<()> {
+    let config = PluginConfig::try_from(cfg.clone())?;
+    config.compile()?;
+    Ok(())
+}
+
 /// APISIX `request-validation` schema.
 #[derive(Debug, Serialize, Deserialize, Validate)]
 struct PluginConfig {

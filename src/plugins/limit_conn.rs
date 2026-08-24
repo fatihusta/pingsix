@@ -52,7 +52,7 @@ const PRIORITY: i32 = 1003;
 /// overwrite each other's guard slot.
 #[cfg(test)]
 fn conn_guard_key(instance_id: u64) -> String {
-    crate::plugins::limiting::instance_ctx_key("pingsix_limit_conn_guard_", instance_id)
+    crate::plugins::ctx_keys::instance_ctx_key("pingsix_limit_conn_guard_", instance_id)
 }
 
 /// Creates a `limit-conn` plugin instance from JSON configuration.
@@ -67,6 +67,13 @@ pub fn create_limit_conn_plugin(
         counters: BoundedShardMap::new(),
         guard_key: next_instance_ctx_key("pingsix_limit_conn_guard_"),
     }))
+}
+
+/// `PLUGIN_META::validate` capability: parse the typed config and run its
+/// validators WITHOUT constructing the plugin (no counters allocated).
+pub fn validate_limit_conn_config(cfg: &JsonValue) -> ProxyResult<()> {
+    PluginConfig::try_from(cfg.clone())?;
+    Ok(())
 }
 
 /// Outcome of the concurrency decision for one request.

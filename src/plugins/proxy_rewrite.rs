@@ -46,6 +46,24 @@ pub fn create_proxy_rewrite_plugin(
     }))
 }
 
+/// `PLUGIN_META::validate` capability: parse the typed config and run its
+/// validators (header entries and the `regex_uri` compile) WITHOUT
+/// constructing the plugin.
+pub fn validate_proxy_rewrite_config(cfg: &JsonValue) -> ProxyResult<()> {
+    let config = PluginConfig::try_from(cfg.clone())?;
+    validate_configured_header_entries(config.headers.as_ref())?;
+    let regex_uri = config.regex_uri.as_deref().unwrap_or(&[]);
+    for i in (0..regex_uri.len()).step_by(2) {
+        let pattern = &regex_uri[i];
+        Regex::new(pattern).map_err(|e| {
+            ProxyError::Plugin(format!(
+                "Invalid proxy-rewrite regex pattern '{pattern}': {e}"
+            ))
+        })?;
+    }
+    Ok(())
+}
+
 /// One header entry in `headers.set` / `headers.add`.
 ///
 /// APISIX accepts a scalar string/number or an array of strings/numbers as

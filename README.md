@@ -260,8 +260,14 @@ cargo run -- -c config.yaml
 ### Creating Custom Plugins
 
 ```rust
+use std::sync::Arc;
+
 use async_trait::async_trait;
-use crate::core::{PluginPhases, ProxyPlugin};
+use http::StatusCode;
+use pingsix::core::{
+    FilterVerdict, PluginEntry, PluginPhases, ProxyContext, ProxyPlugin,
+    ProxyPluginExecutor, Rejection,
+};
 
 pub struct MyCustomPlugin {
     config: MyPluginConfig,
@@ -277,25 +283,46 @@ impl ProxyPlugin for MyCustomPlugin {
         1000
     }
 
-    // Required: hooks whose phase is not declared are never executed.
-    fn phases(&self) -> PluginPhases {
-        PluginPhases::REQUEST
-    }
-
+    // There is no `phases()` method: phases are construction data (see the
+    // `PluginEntry::new` call below). A hook whose phase is not declared is
+    // never executed.
     async fn request_filter(
         &self,
         session: &mut Session,
         ctx: &mut ProxyContext,
-    ) -> Result<bool> {
-        // Custom plugin logic here
-        Ok(false)
+    ) -> pingora_error::Result<FilterVerdict> {
+        if should_reject(&self.config, session) {
+            // Return the rejection; the pipeline writes it through the shared
+            // exit-response path (so exit-transformer rules apply). A plugin
+            // never writes a rejection response itself.
+            return Ok(FilterVerdict::Reject(
+                Rejection::new(StatusCode::FORBIDDEN).with_body("request denied"),
+            ));
+        }
+        Ok(FilterVerdict::Continue)
     }
 }
+
+// Embedders pair each plugin with its declared lifecycle phases when
+// building the executor; builtin plugins get theirs from `PLUGIN_META`.
+let executor = ProxyPluginExecutor::new(vec![PluginEntry::new(
+    Arc::new(MyCustomPlugin { config }),
+    PluginPhases::REQUEST,
+)]);
 ```
 
-> **Breaking plugin contract:** `ProxyPlugin::phases()` is fail-closed. A hook
-> is invoked only when its corresponding `PluginPhases` bit is returned. Existing
-> source plugins must declare every hook they implement before upgrading.
+> **Breaking plugin contract:** `ProxyPlugin::request_filter` now returns
+> `FilterVerdict` — `Continue` to proceed, or `Reject(Rejection)` to
+> short-circuit. Rejection responses are no longer written by the plugin (the
+> former `ResponseBuilder::send_proxy_error` is gone): the plugin returns a
+> `Rejection` value (`Rejection::new(status).with_body(..)` plus optional
+> `with_content_type`, `with_header(s)`, `with_close_connection`) and the
+> pipeline writes it once through `utils::response::send_rejection`, so
+> `exit-transformer` rules apply uniformly to every gateway rejection. The
+> `phases()` method is gone too: hook phases are declared as construction
+> data — builtin plugins declare them once in `PLUGIN_META`, and embedders pass
+> them to `PluginEntry::new(plugin, PHASES)` when building a
+> `ProxyPluginExecutor`. A hook whose phase is not declared is never executed.
 > `ProxyContext::selected` is now `Option<SelectedUpstream>` after Pingora takes
 > ownership of the peer; use its `upstream`, `backend`, `sni`, and `node` fields
 > rather than accessing `HttpPeer`.

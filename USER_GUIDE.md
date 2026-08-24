@@ -1392,7 +1392,8 @@ PingSIX runs plugins in two layers, mirroring APISIX's phase model:
    skipped.
 
 A plugin short-circuits the request when its `request_filter` returns
-`true`. **A global-rule plugin that short-circuits prevents every route
+`FilterVerdict::Reject(..)` (see [Plugin Development](#plugin-development)).
+**A global-rule plugin that short-circuits prevents every route
 plugin from running — including authentication plugins.** This is intentional:
 it lets global redirect/fault-injection rules respond before any upstream work, but it
 also means a global short-circuit can bypass route-level authentication.
@@ -2415,17 +2416,30 @@ plugins:
 New plugins live under `src/plugins/`. Add a `PluginMeta` entry to the
 `PLUGIN_META` inventory in `src/plugins/mod.rs` and implement `ProxyPlugin`.
 
-### Required Phase Declaration (Breaking Change)
+### Phase Declaration and Rejections (Breaking Change)
 
 `ProxyPlugin` execution is fail-closed: the executor invokes a hook **only** if
-`phases()` includes its corresponding `PluginPhases` bit. The default is an
-empty set, so a hook implementation without an explicit declaration is never
-called. Existing source plugins must add declarations for every hook they
-implement before upgrading.
+its `PluginPhases` bit was declared. Phases are **construction data**, not a
+trait method — there is deliberately no `phases()` on `ProxyPlugin`, so the
+declaration can never silently disagree with the implemented hooks. Builtin
+plugins declare phases once in their `PLUGIN_META` entry; embedders pass them
+to `PluginEntry::new(plugin, PHASES)` when building a `ProxyPluginExecutor`.
+
+`request_filter` returns a `FilterVerdict` instead of a bool. A plugin never
+writes a rejection response itself: it returns
+`FilterVerdict::Reject(Rejection)` and the pipeline writes the response exactly
+once through the shared exit-response path, so `exit-transformer` rules apply
+to every gateway-generated rejection uniformly.
 
 ```rust
+use std::sync::Arc;
+
 use async_trait::async_trait;
-use pingsix::core::{PluginPhases, ProxyContext, ProxyPlugin};
+use http::StatusCode;
+use pingsix::core::{
+    FilterVerdict, PluginEntry, PluginPhases, ProxyContext, ProxyPlugin,
+    ProxyPluginExecutor, Rejection,
+};
 
 struct MyPlugin;
 
@@ -2434,23 +2448,39 @@ impl ProxyPlugin for MyPlugin {
     fn name(&self) -> &str { "my-plugin" }
     fn priority(&self) -> i32 { 1000 }
 
-    fn phases(&self) -> PluginPhases {
-        PluginPhases::REQUEST | PluginPhases::RESPONSE
-    }
-
     async fn request_filter(
         &self,
         _session: &mut Session,
         _ctx: &mut ProxyContext,
-    ) -> pingora_error::Result<bool> {
-        Ok(false)
+    ) -> pingora_error::Result<FilterVerdict> {
+        if forbidden() {
+            return Ok(FilterVerdict::Reject(
+                Rejection::new(StatusCode::FORBIDDEN).with_body("request denied"),
+            ));
+        }
+        Ok(FilterVerdict::Continue)
     }
 }
+
+// Embedders declare the plugin's phases when building the executor.
+let executor = ProxyPluginExecutor::new(vec![PluginEntry::new(
+    Arc::new(MyPlugin),
+    PluginPhases::REQUEST | PluginPhases::RESPONSE,
+)]);
 ```
 
-The valid bits are `EARLY_REQUEST`, `REQUEST`, `UPSTREAM_REQUEST`,
-`REQUEST_BODY`, `RESPONSE`, `RESPONSE_BODY`, and `LOGGING`. The builtin phase
-registry test enforces this contract for every bundled plugin.
+A `Rejection` is a plain value: `Rejection::new(status)` plus builder
+methods `with_body(..)`, `with_content_type(..)`, `with_header(k, v)` /
+`with_headers(..)`, and `with_close_connection()` (drop downstream keep-alive
+after the response, e.g. for rate-limit 429s).
+
+The valid phase bits are `EARLY_REQUEST`, `REQUEST`, `UPSTREAM_REQUEST`,
+`REQUEST_BODY`, `RESPONSE`, `RESPONSE_BODY`, `LOGGING`, and `UPSTREAM_PEER`.
+The builtin phase registry test enforces this contract for every bundled
+plugin. Admin-side config validation goes through the mandatory
+`PLUGIN_META::validate` capability: it parses the typed config and runs its
+checks **without constructing the plugin**, so validation never runs builder
+side effects (e.g. file-logger does not open its log file during validation).
 
 `ProxyContext::selected` is now `Option<SelectedUpstream>`. Pingora owns the
 `HttpPeer` after upstream selection, so custom plugins must use the remaining
@@ -2501,13 +2531,18 @@ struct PluginConfig {
 ```rust
 PluginMeta {
     name: my_plugin::PLUGIN_NAME,
+    phases: PluginPhases::REQUEST,
     factory: PluginFactory::Plain(my_plugin::create_my_plugin),
     secrets_transform: Some(my_plugin::SECRETS_TRANSFORM),
-    validate: None,
+    validate: my_plugin::validate_my_plugin_config,
     upstream_refs: None,
     upstream_jobs: None,
 },
 ```
+
+`validate` is mandatory: a `fn(&JsonValue) -> ProxyResult<()>` that parses the
+typed config and runs its checks without constructing the plugin — typically
+`PluginConfig::try_from(cfg.clone()).map(|_| ())`.
 
 `SECRETS_TRANSFORM` is a module-level `const` from `#[encrypt_fields(export)]`. Do not add a hand-written wrapper.
 

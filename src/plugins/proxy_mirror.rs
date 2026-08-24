@@ -255,6 +255,15 @@ pub fn create_proxy_mirror_plugin(
     }))
 }
 
+/// `PLUGIN_META::validate` capability: parse the typed config and run its
+/// validators (including the mirror-target parse) WITHOUT constructing the
+/// plugin (no resolver or connector spun up).
+pub fn validate_proxy_mirror_config(cfg: &JsonValue) -> ProxyResult<()> {
+    let config = PluginConfig::try_from(cfg.clone())?;
+    parse_mirror_target(&config.host)?;
+    Ok(())
+}
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 enum PathConcatMode {

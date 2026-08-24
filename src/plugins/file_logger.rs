@@ -2,7 +2,7 @@ use std::{
     fs::{File, OpenOptions},
     io::Write,
     sync::{
-        atomic::{AtomicBool, AtomicU64, Ordering},
+        atomic::{AtomicBool, Ordering},
         mpsc::{self, Receiver, SyncSender, TrySendError},
         Arc,
     },
@@ -23,6 +23,7 @@ use serde_json::Value as JsonValue;
 
 use crate::{
     core::{ProxyContext, ProxyError, ProxyPlugin, ProxyResult},
+    plugins::ctx_keys::next_instance_ctx_key,
     utils::request,
 };
 
@@ -52,18 +53,6 @@ static FILE_LOG_ENTRIES_DROPPED: Lazy<IntCounter> = Lazy::new(|| {
 
 /// APISIX master default for the maximum body size kept for logging.
 const DEFAULT_MAX_BODY_BYTES: u64 = 524_288;
-
-/// Uniquely names every file-logger instance's context buffers. A request can
-/// carry both a global and a route instance, and their body buffers must never
-/// share keys.
-static NEXT_INSTANCE_ID: AtomicU64 = AtomicU64::new(1);
-
-fn context_keys(instance_id: u64) -> (String, String) {
-    (
-        format!("pingsix_file_logger_request_body_{instance_id}"),
-        format!("pingsix_file_logger_response_body_{instance_id}"),
-    )
-}
 
 fn push_escaped(output: &mut String, value: &str) {
     for character in value.chars() {
@@ -101,6 +90,17 @@ pub fn create_file_logger_plugin(
 ) -> ProxyResult<Arc<dyn ProxyPlugin>> {
     let config = PluginConfig::try_from(cfg)?;
     Ok(Arc::new(PluginFileLogger::build(config)?))
+}
+
+/// `PLUGIN_META::validate` capability: parse the typed config and run its
+/// validators WITHOUT constructing the plugin. Deliberately NOT
+/// [`PluginFileLogger::build`]: validation must not open (or create) the
+/// configured log file, so an unwritable path passes validation and only
+/// fails when the route is actually built. Pinned by
+/// `plugins::builtin_phases_tests::plain_validation_does_not_touch_the_file_logger_file`.
+pub fn validate_file_logger_config(cfg: &JsonValue) -> ProxyResult<()> {
+    PluginConfig::try_from(cfg.clone())?;
+    Ok(())
 }
 
 /// Configuration for the file logger plugin.
@@ -270,8 +270,10 @@ impl PluginFileLogger {
             .transpose()?
             .map(FileLogWriter::start)
             .transpose()?;
-        let (request_body_key, response_body_key) =
-            context_keys(NEXT_INSTANCE_ID.fetch_add(1, Ordering::Relaxed));
+        let (request_body_key, response_body_key) = (
+            next_instance_ctx_key("pingsix_file_logger_request_body_"),
+            next_instance_ctx_key("pingsix_file_logger_response_body_"),
+        );
 
         Ok(PluginFileLogger {
             log_format,

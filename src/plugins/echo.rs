@@ -1,10 +1,4 @@
-use std::{
-    collections::HashMap,
-    sync::{
-        atomic::{AtomicU64, Ordering},
-        Arc,
-    },
-};
+use std::{collections::HashMap, sync::Arc};
 
 use async_trait::async_trait;
 use bytes::{Bytes, BytesMut};
@@ -17,6 +11,7 @@ use serde_json::Value as JsonValue;
 use crate::{
     core::{ProxyContext, ProxyError, ProxyPlugin, ProxyResult},
     plugins::config::HeaderValue,
+    plugins::ctx_keys::next_instance_ctx_key,
     plugins::response_rewrite::{
         clear_body_modified_headers, is_informational_response, is_upgraded_session,
     },
@@ -25,19 +20,17 @@ use crate::{
 pub const PLUGIN_NAME: &str = "echo";
 const PRIORITY: i32 = 412;
 
-/// Uniquely names every echo instance's context markers so a global and a
-/// route instance never share request state.
-static NEXT_INSTANCE_ID: AtomicU64 = AtomicU64::new(1);
-
 struct EchoContextKeys {
     skip_body: String,
     before_emitted: String,
 }
 
+#[cfg(test)]
 fn echo_context_keys(instance_id: u64) -> EchoContextKeys {
+    use crate::plugins::ctx_keys::instance_ctx_key;
     EchoContextKeys {
-        skip_body: format!("pingsix_echo_skip_body_{instance_id}"),
-        before_emitted: format!("pingsix_echo_before_emitted_{instance_id}"),
+        skip_body: instance_ctx_key("pingsix_echo_skip_body_", instance_id),
+        before_emitted: instance_ctx_key("pingsix_echo_before_emitted_", instance_id),
     }
 }
 
@@ -47,8 +40,18 @@ pub fn create_echo_plugin(
     _defaults: &crate::config::EffectiveDefaults,
 ) -> ProxyResult<Arc<dyn ProxyPlugin>> {
     let config = PluginConfig::try_from(cfg)?;
-    let keys = echo_context_keys(NEXT_INSTANCE_ID.fetch_add(1, Ordering::Relaxed));
+    let keys = EchoContextKeys {
+        skip_body: next_instance_ctx_key("pingsix_echo_skip_body_"),
+        before_emitted: next_instance_ctx_key("pingsix_echo_before_emitted_"),
+    };
     Ok(Arc::new(PluginEcho { config, keys }))
+}
+
+/// `PLUGIN_META::validate` capability: parse the typed config and run its
+/// validators WITHOUT constructing the plugin.
+pub fn validate_echo_config(cfg: &JsonValue) -> ProxyResult<()> {
+    PluginConfig::try_from(cfg.clone())?;
+    Ok(())
 }
 
 /// Configuration for the Echo plugin.

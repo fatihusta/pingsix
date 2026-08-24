@@ -37,6 +37,14 @@ pub fn create_basic_auth_plugin(
     }))
 }
 
+/// `PLUGIN_META::validate` capability: parse the typed config and run its
+/// validators WITHOUT constructing the plugin. The digests are pure
+/// derivations, so parsing covers the full construction error surface.
+pub fn validate_basic_auth_config(cfg: &JsonValue) -> ProxyResult<()> {
+    PluginConfig::try_from(cfg.clone())?;
+    Ok(())
+}
+
 #[derive(Debug, Serialize, Deserialize, Validate, EncryptFields)]
 #[encrypt_fields(export)]
 struct PluginConfig {

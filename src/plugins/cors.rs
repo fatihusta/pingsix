@@ -34,6 +34,13 @@ pub fn create_cors_plugin(
     }))
 }
 
+/// `PLUGIN_META::validate` capability: parse the typed config and run its
+/// validators (including regex compilation) WITHOUT constructing the plugin.
+pub fn validate_cors_config(cfg: &JsonValue) -> ProxyResult<()> {
+    PluginConfig::try_from(cfg.clone())?.compile_and_optimize()?;
+    Ok(())
+}
+
 #[derive(Debug, Serialize, Deserialize, Default, Validate)]
 #[validate(schema(function = "PluginConfig::validate"))]
 pub struct PluginConfig {
@@ -504,9 +511,15 @@ impl ProxyPlugin for PluginCors {
             if let Some(resp) = self.handle_options_request(session)? {
                 // The preflight answer is bodyless; `headers` carry the full
                 // CORS header set built by the shared helpers.
-                return Ok(FilterVerdict::Reject(Rejection::from_response_header(
-                    &resp,
-                )));
+                let rejection = Rejection::new(resp.status).with_headers(resp.headers.iter().map(
+                    |(name, value)| {
+                        (
+                            name.as_str().to_string(),
+                            String::from_utf8_lossy(value.as_bytes()).into_owned(),
+                        )
+                    },
+                ));
+                return Ok(FilterVerdict::Reject(rejection));
             }
         }
         Ok(FilterVerdict::Continue)
