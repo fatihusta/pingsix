@@ -389,7 +389,10 @@ impl ProxyPlugin for PluginApiBreaker {
             // Unhealthy process (APISIX `_M.log`).
             state.healthy_count = 0;
             state.unhealthy_count += 1;
-            if state.unhealthy_count % self.config.unhealthy.failures.max(1) == 0 {
+            if state
+                .unhealthy_count
+                .is_multiple_of(self.config.unhealthy.failures.max(1))
+            {
                 state.lasttime = Some(Instant::now());
                 log::debug!(
                     "api-breaker: tripped after {} unhealthy responses (status {status})",

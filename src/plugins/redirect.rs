@@ -497,7 +497,7 @@ mod tests {
         headers: Vec<(&'static str, &'static str)>,
     ) -> RequestHeader {
         let mut rh = RequestHeader::build(method, b"/", Some(headers.len())).unwrap();
-        rh.uri = absolute_uri.parse().unwrap();
+        rh.set_uri(absolute_uri.parse().unwrap());
         for (name, value) in headers {
             rh.insert_header(name, value).unwrap();
         }

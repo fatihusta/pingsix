@@ -438,7 +438,7 @@ fn add_optional_services(
             "Configuring Prometheus metrics endpoint on {}",
             prometheus_cfg.address
         );
-        let mut prometheus_service_http = Service::prometheus_http_service();
+        let mut prometheus_service_http = pingora_prometheus::prometheus_http_service();
         prometheus_service_http.add_tcp(&prometheus_cfg.address.to_string());
         server.add_service(prometheus_service_http);
         log::info!(

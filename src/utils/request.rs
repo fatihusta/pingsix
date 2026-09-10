@@ -149,14 +149,20 @@ pub fn remove_cookie_from_header(
         .filter(|value| !value.is_empty())
         .collect::<Vec<_>>();
 
-    req_header.headers.remove(http::header::COOKIE);
+    req_header.remove_header(&http::header::COOKIE);
     for value in retained {
-        let value = value.parse().map_err(|e| {
+        let value: http::HeaderValue = value.parse().map_err(|e| {
             crate::core::ProxyError::validation_error(format!(
                 "Failed to rebuild Cookie header: {e}"
             ))
         })?;
-        req_header.headers.append(http::header::COOKIE, value);
+        req_header
+            .append_header(http::header::COOKIE, value)
+            .map_err(|e| {
+                crate::core::ProxyError::validation_error(format!(
+                    "Failed to rebuild Cookie header: {e}"
+                ))
+            })?;
     }
     Ok(())
 }
@@ -607,7 +613,7 @@ mod tests {
         // The precedence rule lives here, not in any plugin: URI authority
         // wins over the Host header, and the Host header's port is stripped.
         let mut req = RequestHeader::build("GET", b"/", Some(1)).unwrap();
-        req.uri = "http://uri.example:8080/p".parse().unwrap();
+        req.set_uri("http://uri.example:8080/p".parse().unwrap());
         req.insert_header("host", "header.example:9090").unwrap();
         assert_eq!(
             resolve_request_var(&req, false, "host").as_deref(),
@@ -655,8 +661,8 @@ mod tests {
     #[test]
     fn cookie_lookup_and_removal_agree_on_the_same_parser() {
         let mut req = RequestHeader::build("GET", b"/", None).unwrap();
-        req.headers
-            .append(http::header::COOKIE, " a = 1 ; jwt; b=2 ".parse().unwrap());
+        req.append_header(http::header::COOKIE, " a = 1 ; jwt; b=2 ")
+            .unwrap();
         // Key-only cookies are visible to lookup ...
         assert_eq!(get_cookie_value(&req, "jwt"), Some(""));
         assert_eq!(get_cookie_value(&req, "a"), Some("1"));
@@ -675,12 +681,10 @@ mod tests {
     #[test]
     fn removes_named_cookie_from_every_cookie_header() {
         let mut req = RequestHeader::build("GET", b"/", None).unwrap();
-        req.headers
-            .append(http::header::COOKIE, "a=1; jwt=first".parse().unwrap());
-        req.headers.append(
-            http::header::COOKIE,
-            "jwt=second; b=2; jwt=third".parse().unwrap(),
-        );
+        req.append_header(http::header::COOKIE, "a=1; jwt=first")
+            .unwrap();
+        req.append_header(http::header::COOKIE, "jwt=second; b=2; jwt=third")
+            .unwrap();
         remove_cookie_from_header(&mut req, "jwt").unwrap();
         assert_eq!(
             req.headers

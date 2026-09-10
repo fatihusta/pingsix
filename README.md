@@ -1,7 +1,7 @@
 # PingSIX
 
 [![License](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](https://opensource.org/licenses/Apache-2.0)
-[![Rust](https://img.shields.io/badge/rust-1.88%2B-orange.svg)](https://www.rust-lang.org)
+[![Rust](https://img.shields.io/badge/rust-1.98%2B-orange.svg)](https://www.rust-lang.org)
 [![Build Status](https://img.shields.io/github/actions/workflow/status/zhu327/pingsix/rust.yml)](https://github.com/zhu327/pingsix/actions)
 
 > A high-performance, cloud-native API gateway built with Rust
@@ -32,7 +32,7 @@ PingSIX is a modern API gateway designed for cloud-native environments, offering
 
 ### Prerequisites
 
-- Rust stable (MSRV 1.88); local toolchain via `rust-toolchain.toml` (`channel = "1.88.0"`)
+- Rust stable (MSRV 1.98); local toolchain via `rust-toolchain.toml` (`channel = "1.98.0"`)
 - (Optional) etcd for dynamic configuration
 
 ### Installation

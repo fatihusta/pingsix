@@ -1241,7 +1241,7 @@ mod tests {
         let bare = make_plugin(serde_json::json!({
             "rules": [{"count": 3, "time_window": 10, "key": "remote_addr"}]
         }));
-        let mut session = session_with_header("host", "example.com").await;
+        let mut session = session_with_header("x-probe", "v").await;
         assert!(bare.select_limits(&mut session).is_none());
     }
 

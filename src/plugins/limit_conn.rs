@@ -881,7 +881,7 @@ mod tests {
             "default_conn_delay": 0.1,
             "rules": [{"conn": 3, "burst": 1, "key": "remote_addr"}]
         }));
-        let mut session = session_with_header("host", "example.com").await;
+        let mut session = session_with_header("x-probe", "v").await;
         assert!(bare.select_limits(&mut session).is_none());
     }
 

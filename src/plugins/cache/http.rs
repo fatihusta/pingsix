@@ -7,7 +7,7 @@ use http::{
     StatusCode,
 };
 use pingora_cache::{
-    cache_control::{CacheControl, DirectiveMap, DirectiveValue},
+    cache_control::{CacheControl, DirectiveKey, DirectiveMap, DirectiveValue},
     filters::resp_cacheable,
     key::{CacheKey, HashBinary},
     CacheMeta, CacheMetaDefaults, NoCacheReason, RespCacheable, VarianceBuilder,
@@ -252,7 +252,10 @@ pub(crate) fn cache_key(session: &Session, ctx: &ProxyContext) -> CacheKey {
     }) {
         namespace.push_str(&format!("|cc={}", consumer_isolation_component(ctx)));
     }
-    CacheKey::new(namespace, primary, "")
+    // pingora 0.9 removed the `namespace` parameter: only `primary` is hashed.
+    // Concatenating the former namespace and primary bytes preserves the legacy
+    // hash, so cached entries stay addressable across the upgrade.
+    CacheKey::new(format!("{namespace}{primary}"), "")
 }
 
 pub(crate) fn cache_vary(
@@ -363,8 +366,8 @@ fn ensure_max_age(cc: Option<CacheControl>, settings: &CacheSettings) -> Option<
     // private/no-store/no-cache rejection has already run).
     let cc = if settings.cache_control == Some(false) {
         cc.map(|mut control| {
-            control.directives.shift_remove("max-age");
-            control.directives.shift_remove("s-maxage");
+            control.directives.shift_remove(&DirectiveKey::MaxAge);
+            control.directives.shift_remove(&DirectiveKey::SMaxAge);
             control
         })
     } else {
@@ -372,12 +375,14 @@ fn ensure_max_age(cc: Option<CacheControl>, settings: &CacheSettings) -> Option<
     };
     match cc {
         Some(existing) => {
-            let has_max_age = existing.directives.contains_key("max-age");
-            let rewrite_smaxage =
-                settings.respect_s_maxage && existing.directives.contains_key("s-maxage");
-            let add_swr = settings
-                .stale_while_revalidate
-                .is_some_and(|_| !existing.directives.contains_key("stale-while-revalidate"));
+            let has_max_age = existing.directives.contains_key(&DirectiveKey::MaxAge);
+            let rewrite_smaxage = settings.respect_s_maxage
+                && existing.directives.contains_key(&DirectiveKey::SMaxAge);
+            let add_swr = settings.stale_while_revalidate.is_some_and(|_| {
+                !existing
+                    .directives
+                    .contains_key(&DirectiveKey::StaleWhileRevalidate)
+            });
             if has_max_age && !rewrite_smaxage && !add_swr {
                 return Some(existing);
             }
@@ -385,14 +390,15 @@ fn ensure_max_age(cc: Option<CacheControl>, settings: &CacheSettings) -> Option<
             let mut final_has_max_age = false;
             for (key, value) in &existing.directives {
                 let cloned = value.as_ref().map(|v| DirectiveValue(v.0.clone()));
-                if settings.respect_s_maxage && key == "s-maxage" {
+                if settings.respect_s_maxage && *key == DirectiveKey::SMaxAge {
                     if let Some(value) = value {
-                        directives.insert("max-age".into(), Some(DirectiveValue(value.0.clone())));
+                        directives
+                            .insert(DirectiveKey::MaxAge, Some(DirectiveValue(value.0.clone())));
                         final_has_max_age = true;
                     }
                     directives.insert(key.clone(), cloned);
                 } else {
-                    if key == "max-age" {
+                    if *key == DirectiveKey::MaxAge {
                         final_has_max_age = true;
                     }
                     directives.insert(key.clone(), cloned);
@@ -400,7 +406,7 @@ fn ensure_max_age(cc: Option<CacheControl>, settings: &CacheSettings) -> Option<
             }
             if !final_has_max_age {
                 directives.insert(
-                    "max-age".into(),
+                    DirectiveKey::MaxAge,
                     Some(DirectiveValue(
                         settings.ttl.as_secs().to_string().into_bytes(),
                     )),
@@ -408,31 +414,37 @@ fn ensure_max_age(cc: Option<CacheControl>, settings: &CacheSettings) -> Option<
             }
             if let Some(swr) = settings
                 .stale_while_revalidate
-                .filter(|_| !directives.contains_key("stale-while-revalidate"))
+                .filter(|_| !directives.contains_key(&DirectiveKey::StaleWhileRevalidate))
             {
                 directives.insert(
-                    "stale-while-revalidate".into(),
+                    DirectiveKey::StaleWhileRevalidate,
                     Some(DirectiveValue(swr.as_secs().to_string().into_bytes())),
                 );
             }
-            Some(CacheControl { directives })
+            Some(CacheControl {
+                directives,
+                allow_float_seconds: false,
+            })
         }
         None => {
             let mut directives =
                 DirectiveMap::with_capacity(1 + settings.stale_while_revalidate.is_some() as usize);
             directives.insert(
-                "max-age".into(),
+                DirectiveKey::MaxAge,
                 Some(DirectiveValue(
                     settings.ttl.as_secs().to_string().into_bytes(),
                 )),
             );
             if let Some(swr) = settings.stale_while_revalidate {
                 directives.insert(
-                    "stale-while-revalidate".into(),
+                    DirectiveKey::StaleWhileRevalidate,
                     Some(DirectiveValue(swr.as_secs().to_string().into_bytes())),
                 );
             }
-            Some(CacheControl { directives })
+            Some(CacheControl {
+                directives,
+                allow_float_seconds: false,
+            })
         }
     }
 }
@@ -450,10 +462,9 @@ mod tests {
 
     fn test_request() -> RequestHeader {
         let mut req = RequestHeader::build("GET", b"/api/users?q=1&lang=en", None).unwrap();
-        req.headers
-            .insert(http::header::HOST, "example.com".parse().unwrap());
-        req.headers
-            .insert("x-custom-id", "abc-123".parse().unwrap());
+        req.insert_header(http::header::HOST, "example.com")
+            .unwrap();
+        req.insert_header("x-custom-id", "abc-123").unwrap();
         req
     }
 
@@ -517,7 +528,7 @@ mod tests {
         assert!(no_cache_requested(&["$http_x_custom_id".to_string()], &req));
         assert!(!no_cache_requested(&["$arg_missing".to_string()], &req));
 
-        req.headers.remove("x-custom-id");
+        req.remove_header("x-custom-id");
         assert!(!no_cache_requested(
             &["$http_x_custom_id".to_string()],
             &req
@@ -613,7 +624,7 @@ mod tests {
             let control = ensure_max_age(control_for(origin), &settings).unwrap();
             let max_age = control
                 .directives
-                .get("max-age")
+                .get(&DirectiveKey::MaxAge)
                 .and_then(|value| value.as_ref())
                 .unwrap()
                 .parse_as_delta_seconds()
@@ -627,7 +638,7 @@ mod tests {
         assert_eq!(
             control
                 .directives
-                .get("max-age")
+                .get(&DirectiveKey::MaxAge)
                 .and_then(|value| value.as_ref())
                 .unwrap()
                 .parse_as_delta_seconds()
@@ -640,15 +651,13 @@ mod tests {
     fn credential_digest_differs_with_credentials() {
         let anonymous = test_request();
         let mut authorized = test_request();
-        authorized.headers.insert(
-            http::header::AUTHORIZATION,
-            "Bearer token-a".parse().unwrap(),
-        );
+        authorized
+            .insert_header(http::header::AUTHORIZATION, "Bearer token-a")
+            .unwrap();
         let mut other = test_request();
-        other.headers.insert(
-            http::header::AUTHORIZATION,
-            "Bearer token-b".parse().unwrap(),
-        );
+        other
+            .insert_header(http::header::AUTHORIZATION, "Bearer token-b")
+            .unwrap();
 
         assert_eq!(
             credential_cache_key_component(&anonymous),
